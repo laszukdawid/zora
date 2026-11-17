@@ -1,0 +1,15 @@
+# systemd user unit: install with packaging/linux/install.sh, then `systemctl --user enable --now zora`.
+[Unit]
+Description=Zora voice command service
+After=pipewire.service
+
+[Service]
+ExecStart=%h/.local/bin/zorad run
+Restart=on-failure
+RestartSec=5
+# The whole cgroup (core, guards, harness jobs) stops with the service.
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

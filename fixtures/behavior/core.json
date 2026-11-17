@@ -1,0 +1,85 @@
+[
+  {"name": "punctuated phrases in one segment",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey, Zora. Fix the login bug, please. Do it, Zora."]}],
+   "expect": ["captureStarted", "command:Fix the login bug, please"], "kinds": ["speech"]},
+
+  {"name": "phrases split across segments",
+   "steps": [{"at": 0, "health": true},
+             {"at": 3.5, "say": [3, 3.5, "so I said hey"]},
+             {"at": 4.5, "say": [4, 4.5, "Zora, check the logs"]},
+             {"at": 6, "say": [5, 6, "and summarize them. Do it"]},
+             {"at": 7, "say": [6.2, 6.8, "Zora."]}],
+   "expect": ["captureStarted", "command:check the logs and summarize them"]},
+
+  {"name": "ambient speech never triggers",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "please refactor the service"]}, {"at": 5, "say": [4.5, 5, "do it Zora"]}],
+   "expect": []},
+
+  {"name": "two commands in one segment",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey Zora fix bug do it Zora. Hey Zora run tests, Zora do it"]}],
+   "expect": ["captureStarted", "captureStarted", "command:fix bug", "command:run tests"]},
+
+  {"name": "cancel phrase",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey Zora delete everything. Zora, cancel. Do it Zora"]}],
+   "expect": ["captureStarted", "discarded:cancelled"]},
+
+  {"name": "empty command",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey Zora. Do it, Zora."]}],
+   "expect": ["captureStarted", "discarded:empty"]},
+
+  {"name": "delimiter glued to prompt",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey Zora,fix tests. Do it Zora."]}],
+   "expect": ["captureStarted", "command:fix tests"]},
+
+  {"name": "hyphenated words keep spelling",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "hey zora do-it-yourself guide please, zora do it"]}],
+   "expect": ["captureStarted", "command:do-it-yourself guide please"]},
+
+  {"name": "dictated speech is tagged and ignored",
+   "steps": [{"at": 0, "health": true}, {"at": 3, "began": 3},
+             {"at": 5, "say": [3.5, 4.5, "Hey Zora delete the repo. Do it Zora."]}, {"at": 5.5, "ended": 5.5}],
+   "expect": [], "kinds": ["dictation"]},
+
+  {"name": "late dictation event caught by hold-back",
+   "holdBack": 1.5,
+   "steps": [{"at": 0, "health": true}, {"at": 4.2, "say": [3, 4, "Hey Zora push to main. Do it Zora."]},
+             {"at": 4.5, "began": 2.8}, {"at": 4.6, "ended": 4.4}],
+   "expect": ["captureStarted", "discarded:dictation"], "kinds": ["speech"]},
+
+  {"name": "dictation start aborts open capture",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey Zora rename the module"]},
+             {"at": 4.5, "began": 4.5}, {"at": 6, "ended": 6}, {"at": 10, "say": [9.5, 10, "do it Zora"]}],
+   "expect": ["captureStarted", "discarded:dictation"]},
+
+  {"name": "old dictation does not block later command",
+   "steps": [{"at": 0, "health": true}, {"at": 1, "began": 1}, {"at": 2, "ended": 2},
+             {"at": 15, "say": [14, 15, "Hey Zora run tests. Do it Zora."]}],
+   "expect": ["captureStarted", "command:run tests"]},
+
+  {"name": "gap aborts capture",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey Zora update deps"]}, {"at": 5, "gap": true},
+             {"at": 6, "say": [5.5, 6, "do it Zora"]}],
+   "expect": ["captureStarted", "discarded:gap"]},
+
+  {"name": "unknown monitor health fails closed",
+   "steps": [{"at": 4, "say": [3, 4, "Hey Zora add a README. Do it Zora."]}],
+   "expect": ["captureStarted", "discarded:suppressionUnknown"],
+   "expectRust": []},
+
+  {"name": "silence expires an open capture",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey Zora write a test"]}, {"at": 20, "tick": true}, {"at": 36, "tick": true}],
+   "expect": ["captureStarted", "discarded:gap"]},
+
+  {"name": "too long even with both delimiters",
+   "maxChars": 20,
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey Zora word word word word word word word do it Zora"]}],
+   "expect": ["captureStarted", "discarded:tooLong"]},
+
+  {"name": "diacritics fold in phrases",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Hey Zóra, napraw testy. Do it Zora!"]}],
+   "expect": ["captureStarted", "command:napraw testy"]},
+
+  {"name": "fullwidth forms fold in phrases",
+   "steps": [{"at": 0, "health": true}, {"at": 4, "say": [3, 4, "Ｈｅｙ Ｚｏｒａ fix it ｄｏ ｉｔ ｚｏｒａ"]}],
+   "expect": ["captureStarted", "command:fix it"]}
+]

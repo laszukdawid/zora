@@ -1,0 +1,258 @@
+[
+ {
+  "name": "speech before coverage is store-only",
+  "cores": [
+   "rust"
+  ],
+  "steps": [
+   {
+    "at": 0,
+    "health": true
+   },
+   {
+    "at": 1.5,
+    "say": [
+     0.5,
+     1.5,
+     "Hey Zora fix it. Do it Zora."
+    ]
+   }
+  ],
+  "expect": [],
+  "kinds": [
+   "speech"
+  ]
+ },
+ {
+  "name": "monitor stall aborts overlapping capture",
+  "cores": [
+   "rust"
+  ],
+  "steps": [
+   {
+    "at": 0,
+    "health": true
+   },
+   {
+    "at": 4,
+    "say": [
+     3,
+     4,
+     "Hey Zora fix it"
+    ]
+   },
+   {
+    "at": 5,
+    "unknown": [
+     4.2,
+     5
+    ]
+   },
+   {
+    "at": 6,
+    "say": [
+     5.5,
+     6,
+     "do it Zora"
+    ]
+   }
+  ],
+  "expect": [
+   "captureStarted",
+   "discarded:suppressionUnknown"
+  ]
+ },
+ {
+  "name": "stall during hold-back discards pending command",
+  "cores": [
+   "rust"
+  ],
+  "holdBack": 1.5,
+  "steps": [
+   {
+    "at": 0,
+    "health": true
+   },
+   {
+    "at": 4,
+    "say": [
+     3,
+     4,
+     "Hey Zora ship it. Do it Zora."
+    ]
+   },
+   {
+    "at": 4.5,
+    "unknown": [
+     4.1,
+     4.4
+    ]
+   }
+  ],
+  "expect": [
+   "captureStarted",
+   "discarded:suppressionUnknown"
+  ]
+ },
+ {
+  "name": "stale transcript generation is store-only",
+  "cores": [
+   "rust"
+  ],
+  "steps": [
+   {
+    "at": 0,
+    "health": true
+   },
+   {
+    "at": 3,
+    "generation": 2
+   },
+   {
+    "at": 5,
+    "say": [
+     4,
+     5,
+     "Hey Zora fix it. Do it Zora."
+    ],
+    "gen": 1
+   }
+  ],
+  "expect": [],
+  "kinds": [
+   "speech"
+  ]
+ },
+ {
+  "name": "health loss mid-capture aborts and recovery needs fresh coverage",
+  "cores": [
+   "rust"
+  ],
+  "steps": [
+   {
+    "at": 0,
+    "health": true
+   },
+   {
+    "at": 4,
+    "say": [
+     3,
+     4,
+     "Hey Zora fix it"
+    ]
+   },
+   {
+    "at": 5,
+    "health": false
+   },
+   {
+    "at": 6,
+    "health": true
+   },
+   {
+    "at": 7,
+    "say": [
+     6.5,
+     7,
+     "Hey Zora again. Do it Zora."
+    ]
+   },
+   {
+    "at": 12,
+    "say": [
+     11,
+     12,
+     "Hey Zora later. Do it Zora."
+    ]
+   }
+  ],
+  "expect": [
+   "captureStarted",
+   "discarded:suppressionUnknown",
+   "degraded",
+   "captureStarted",
+   "command:later"
+  ]
+ },
+ {
+  "name": "a new wake phrase restarts the capture",
+  "cores": [
+   "rust"
+  ],
+  "steps": [
+   {
+    "at": 0,
+    "health": true
+   },
+   {
+    "at": 4,
+    "say": [
+     3,
+     4,
+     "Hey Zora tell me the progress do resora and then we talked"
+    ]
+   },
+   {
+    "at": 6,
+    "say": [
+     5,
+     6,
+     "about other things. Hey Zora add a board task"
+    ]
+   },
+   {
+    "at": 7,
+    "say": [
+     6.5,
+     7,
+     "Do it, Zora."
+    ]
+   }
+  ],
+  "expect": [
+   "captureStarted",
+   "captureStarted",
+   "command:add a board task"
+  ]
+ },
+ {
+  "name": "stop it, zora cancels quietly and sends nothing",
+  "cores": [
+   "rust"
+  ],
+  "steps": [
+   {
+    "at": 0,
+    "health": true
+   },
+   {
+    "at": 4,
+    "say": [
+     3,
+     4,
+     "Hey Zora, delete the whole repo."
+    ]
+   },
+   {
+    "at": 6,
+    "say": [
+     5,
+     6,
+     "Actually, stop it, Zora."
+    ]
+   },
+   {
+    "at": 9,
+    "say": [
+     8,
+     9,
+     "Do it, Zora."
+    ]
+   }
+  ],
+  "expect": [
+   "captureStarted",
+   "discarded:cancelled"
+  ]
+ }
+]
