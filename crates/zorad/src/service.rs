@@ -494,6 +494,13 @@ fn execute(
                 );
             }
         }
+        Effect::StopRunning => {
+            // "Stop it, Zora" with nothing to forget: stop the latest running job. Its guard reaps the group and
+            // the finish notification reports "stopped". With nothing running it is ordinary speech.
+            if let Some(id) = jobs.cancel_latest() {
+                eprintln!("[zorad] stop requested by voice id={id}");
+            }
+        }
         Effect::Dispatch(cmd) => {
             // Capacity first: only admitted commands are written to the store, so critical store traffic stays
             // bounded by the job queue. Rejections are notifications only.

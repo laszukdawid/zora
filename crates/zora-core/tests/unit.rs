@@ -95,7 +95,7 @@ fn harness_argv_and_summaries() {
             "-p",
             "do x; rm -rf / $(id)",
             "--output-format",
-            "json",
+            "text",
             "--permission-mode",
             "acceptEdits",
             "--allowedTools",
@@ -602,4 +602,53 @@ fn greeting_fused_onto_the_name_still_wakes_zora() {
         ))
         .is_empty()
     );
+}
+
+#[test]
+fn claude_plain_text_answer_is_the_whole_summary() {
+    let spec = HarnessSpec::from_config(
+        "claude",
+        &Harness {
+            workspace: "/tmp".into(),
+            ..Harness::default()
+        },
+        &Config::default(),
+    );
+    assert!(
+        spec.argv("x")
+            .windows(2)
+            .any(|w| w == ["--output-format", "text"])
+    );
+    let r = spec.summarize(0, "I sent \"hi\" to Tyler.\n\nLink: https://example\n", "");
+    assert!(r.success);
+    assert_eq!(
+        r.summary,
+        "I sent \"hi\" to Tyler.\n\nLink: https://example"
+    );
+    let f = spec.summarize(1, "Error: not logged in\n", "");
+    assert!(!f.success && f.summary.starts_with("exit 1: Error"));
+}
+
+#[test]
+fn stop_it_outside_a_capture_targets_the_running_job() {
+    use zora_core::detector::{CommandDetector, DetectorOutput};
+    use zora_core::model::{DiscardReason, Segment};
+    let cfg = Config::default();
+    let seg = |t: &str| Segment {
+        generation: 0,
+        session: 1,
+        start: 0,
+        end: 1_000_000_000,
+        text: t.into(),
+    };
+    let mut d = CommandDetector::new(cfg.detector_config());
+    assert_eq!(
+        d.feed(&seg("Okay, stop it, Nova.")),
+        [DetectorOutput::StopRunning]
+    );
+    // Inside a capture the same phrase only forgets the capture.
+    let mut d = CommandDetector::new(cfg.detector_config());
+    let out = d.feed(&seg("Hey Zora, delete it. Stop it, Zora."));
+    assert!(out.contains(&DetectorOutput::Discarded(DiscardReason::Cancelled)));
+    assert!(!out.contains(&DetectorOutput::StopRunning));
 }

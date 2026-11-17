@@ -49,6 +49,8 @@ struct State {
     queue: VecDeque<Job>,
     busy: HashSet<String>,
     cancels: HashMap<String, mpsc::UnboundedSender<()>>,
+    /// Job ids in start order, for "stop the latest".
+    started: Vec<String>,
     closed: bool,
     blocked: Option<String>,
 }
@@ -141,6 +143,19 @@ impl JobManager {
         Submit::Accepted
     }
 
+    /// Cancels the most recently started running job; returns its id.
+    pub fn cancel_latest(&self) -> Option<String> {
+        let s = self.lock();
+        let id = s
+            .started
+            .iter()
+            .rev()
+            .find(|i| s.cancels.contains_key(*i))?
+            .clone();
+        let _ = s.cancels[&id].send(());
+        Some(id)
+    }
+
     /// Rejects new work and cancels everything in flight.
     pub fn close(&self) {
         let mut s = self.lock();
@@ -186,6 +201,7 @@ impl JobManager {
                 s.busy.insert(job.spec.workspace.clone());
                 let (tx, rx) = mpsc::unbounded_channel();
                 s.cancels.insert(job.id.clone(), tx);
+                s.started.push(job.id.clone());
                 to_start.push((job, rx));
             }
         }
@@ -202,6 +218,7 @@ impl JobManager {
                 {
                     let mut s = me.lock();
                     s.cancels.remove(&job.id);
+                    s.started.retain(|i| i != &job.id);
                     if release {
                         s.busy.remove(&job.spec.workspace);
                     }

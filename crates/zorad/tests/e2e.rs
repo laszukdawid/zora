@@ -532,3 +532,29 @@ fn live_text_notifies_listening_before_the_sentence_is_final() {
         "{err}"
     );
 }
+
+#[test]
+fn stop_it_by_voice_cancels_the_running_job() {
+    let env = Env::new();
+    let cfg = env.config(
+        json!([
+            {"delayMs": 3500, "say": "Hey Zora, long job. Do it, Zora.", "durMs": 500},
+            {"delayMs": 3000, "say": "Stop it, Zora.", "durMs": 500}
+        ]),
+        "sleep 60; echo finished",
+    );
+    let child = env.start(&cfg);
+    let done = wait_for(Duration::from_secs(20), || {
+        env.commands()
+            .into_iter()
+            .find(|c| c.2 == "failed" || c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    let done = done.unwrap_or_else(|| panic!("job not stopped:\n{err}"));
+    assert_eq!(
+        (done.2.as_str(), done.3.as_deref()),
+        ("failed", Some("cancelled")),
+        "{err}"
+    );
+    assert!(err.contains("stop requested by voice"), "{err}");
+}

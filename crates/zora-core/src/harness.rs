@@ -24,7 +24,9 @@ pub struct HarnessResult {
 impl HarnessSpec {
     pub fn from_config(id: &str, h: &Harness, config: &Config) -> HarnessSpec {
         let (args, claude_json) = if h.kind == "claude" {
-            let mut a: Vec<String> = ["-p", "{prompt}", "--output-format", "json"]
+            // Plain text: Claude prints only its final answer. (The JSON format is a long event list whose
+            // shape changes between versions and can exceed the captured output.)
+            let mut a: Vec<String> = ["-p", "{prompt}", "--output-format", "text"]
                 .map(String::from)
                 .to_vec();
             if let Some(mode) = &h.permission_mode {
@@ -98,6 +100,21 @@ impl HarnessSpec {
                     success: ok,
                     exit_code: Some(exit_code),
                     summary,
+                };
+            }
+        }
+        if self.claude_json {
+            // Plain-text answer: the whole reply is the summary; the exit code says whether it worked.
+            let text = stdout.trim();
+            if !text.is_empty() {
+                return HarnessResult {
+                    success: exit_code == 0,
+                    exit_code: Some(exit_code),
+                    summary: if exit_code == 0 {
+                        text.to_string()
+                    } else {
+                        format!("exit {exit_code}: {text}")
+                    },
                 };
             }
         }

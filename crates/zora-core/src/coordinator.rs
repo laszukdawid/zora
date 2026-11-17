@@ -48,6 +48,8 @@ pub enum Effect {
         cutoff: Ns,
     },
     Dispatch(Command),
+    /// Stop the most recently started running job (voice "stop it, Zora" outside a capture).
+    StopRunning,
 }
 
 pub struct Coordinator {
@@ -332,6 +334,11 @@ impl Coordinator {
                         .is_none_or(|t| now - t > 20 * SECOND)
                     {
                         fx.push(Effect::Notify(ZoraEvent::CaptureStarted));
+                    }
+                }
+                DetectorOutput::StopRunning => {
+                    if self.accepting {
+                        fx.push(Effect::StopRunning);
                     }
                 }
                 DetectorOutput::Discarded(reason) => {

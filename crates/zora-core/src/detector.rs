@@ -161,6 +161,35 @@ impl DetectorConfig {
         self
     }
 
+    /// First (earliest) match of any phrase in a token sequence, including fused greeting+name tokens.
+    pub fn find(&self, toks: &[&str], phrases: &[Vec<String>]) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for phrase in phrases {
+            if let Some(i) = toks.iter().position(|t| self.fused_match(t, phrase))
+                && best.is_none_or(|(b, _)| i < b)
+            {
+                best = Some((i, i));
+            }
+            if phrase.len() > toks.len() {
+                continue;
+            }
+            for i in 0..=(toks.len() - phrase.len()) {
+                if best.is_some_and(|(b, _)| i >= b) {
+                    break;
+                }
+                if phrase
+                    .iter()
+                    .enumerate()
+                    .all(|(k, p)| self.token_matches(toks[i + k], p))
+                {
+                    best = Some((i, i + phrase.len() - 1));
+                    break;
+                }
+            }
+        }
+        best
+    }
+
     /// Whether `text` contains any start phrase (used on live, unfinished transcripts for early feedback only).
     pub fn mentions_start(&self, text: &str) -> bool {
         let toks = tokens(text);
@@ -240,9 +269,13 @@ impl DetectorConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetectorOutput {
-    CaptureStarted { at: Ns },
+    CaptureStarted {
+        at: Ns,
+    },
     Command(Command),
     Discarded(DiscardReason),
+    /// A cancel phrase ("stop it, Zora") with no capture open: stop the most recent running job.
+    StopRunning,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +326,22 @@ impl CommandDetector {
             self.units.clear();
         }
         let mut parts = units(&seg.text);
+        // Outside a capture, a cancel phrase said on its own ("Okay, stop it, Nova.") stops the running job.
+        // It must end the utterance with at most two words before it, so ordinary talk ("we should stop Zora
+        // from beeping") is not a stop.
+        if !self.capturing {
+            let norms: Vec<&str> = parts.iter().map(|u| u.norm.as_str()).collect();
+            if let Some((first, last)) = self.config.find(&norms, &self.config.cancel)
+                && last + 1 == norms.len()
+                && first <= 2
+                && self.config.find(&norms, &self.config.start).is_none()
+            {
+                self.units.clear();
+                self.last_activity = self.last_activity.max(seg.end);
+                out.push(DetectorOutput::StopRunning);
+                return out;
+            }
+        }
         if !self.units.is_empty()
             && let Some(first) = parts.first_mut()
             && first.leading.is_empty()

@@ -170,6 +170,10 @@ impl ZoraEvent {
                 ("Zora".into(), format!("Running on {harness}"))
             }
             ZoraEvent::JobSucceeded { summary, .. } => ("Zora: done".into(), summary.clone()),
+            ZoraEvent::JobFailed { reason, .. } if reason == "cancelled" => (
+                "Zora: stopped".into(),
+                "The running command was stopped.".into(),
+            ),
             ZoraEvent::JobFailed { reason, .. } => ("Zora: failed".into(), reason.clone()),
             ZoraEvent::CaptureDiscarded { reason } => {
                 ("Zora: command discarded".into(), reason.as_str().into())
