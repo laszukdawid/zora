@@ -11,7 +11,7 @@ the menu-bar icon. [design.md](design.md) explains the architecture and the deci
 | Path | What |
 |---|---|
 | `crates/zora-core` | Platform-neutral logic: detector, dictation suppression, coordinator, store, config, harness argv |
-| `crates/zorad` | Daemon and CLI: plugin host, job guard/gate, recovery, pause state. `zora-script-plugin` is a reference plugin. |
+| `crates/zorad` | Daemon and CLI: plugin host, job guard/gate, recovery, pause state. `zora-script-plugin` is a reference plugin; `zora-acdc` puts voice commands on the ACDC task board. |
 | `Sources/ZoraMac`, `Sources/zora` | macOS plugin (Swift): SpeechAnalyzer, CoreAudio dictation monitor, notifications, menu bar and Settings window. This is `Zora.app`'s main executable. |
 | `Sources/ZoraCore`, `Tests/ZoraCoreTests` | The v1 Swift core, kept until the Rust port has proven parity |
 | `fixtures/behavior` | Golden behaviour fixtures that both cores must pass |
@@ -51,7 +51,8 @@ dictation tool, set `"dictation": {"monitor": "none"}`.
 | `zorad pause [30m]` / `zorad resume` | Turn listening off (until resumed, or for 1 minute to a week) and on again |
 | `zorad names [add\|remove <name>]` | List or change the names Zora answers to |
 | `zorad settings [set '<json>']` | Read or change the settings the menu bar edits (`wakeNames`, `phrases`, `workspace`) |
-| `zorad transcript --since 30m` | Print the stored transcript |
+| `zorad transcript --since 30m [--last N] [--json]` | Print the stored transcript (the newest N lines with `--last`) |
+| `zorad commands [--since 4h] [--json]` | Voice commands and their jobs, never the transcript |
 | `zorad jobs [cancel\|clear <id>]` | List unfinished jobs; cancel a running one; clear one after checking it by hand |
 | `zorad simulate script.txt` | Feed a scripted transcript through the command logic (dry run) |
 | `zora setup [--project <dir>]` (macOS) | Permissions, speech model, config and project folder |
@@ -116,3 +117,25 @@ Names, phrases, capture limits and the default harness apply live; everything el
   `--dangerously-skip-permissions`).
 - Jobs on the same workspace run one at a time.
 - `plugins.macos.config.sounds: false` turns the menu-bar sounds off.
+
+## ACDC task board
+
+`zora-acdc` is a notify plugin for the [ACDC](https://github.com/osano/acdc) task board on the same machine. Each
+voice command becomes a board task (tag `zora`). Zora claims it while the job runs, then moves it to review with the
+agent's summary, or to blocked with the reason it failed. If Zora stops mid-job, the task is blocked with a note.
+The board's own Zora plugin reads `zorad commands --json` and `zorad transcript --json` and shows the jobs and the
+last 100 transcript lines on a Zora tab. That copies the transcript into the board's database, where agents can read
+it; the plugin's `transcript` setting turns that off.
+
+```json
+"plugins": { "acdc": { "command": ["~/Applications/Zora.app/Contents/MacOS/zora-acdc"],
+                       "config": { "url": "http://127.0.0.1:8787/api", "workspace": null, "onSuccess": "review" } } },
+"notifications": { "acdc": ["commandQueued", "jobStarted", "jobSucceeded", "jobFailed"] }
+```
+
+- On Linux the binary is `~/.local/bin/zora-acdc`.
+- The URL must be `127.0.0.1` or `localhost`, so command text stays on this machine. The board holds it like any
+  task text, and agents on the board can read it.
+- Other settings: `agent` (the name Zora works under, default `zora`), `tags`, `claimMinutes` (default 60),
+  `onSuccess` (`review` or `done`).
+- Notification bodies are cut at 1000 characters, so a longer command shows shortened on its task.

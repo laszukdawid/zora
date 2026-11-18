@@ -120,6 +120,12 @@ Zora keeps about the last 4 hours of what it heard, as text:
 ~/Applications/Zora.app/Contents/MacOS/zorad transcript --since 30m
 ```
 
+### Show tasks on the ACDC board
+
+If you use the [ACDC](https://github.com/osano/acdc) task board, Zora can put each voice task on it and move it to
+review or blocked when the agent finishes. The board's Zora tab also shows recent tasks and transcript lines. See
+[docs/development.md](docs/development.md#acdc-task-board) to turn it on.
+
 ## Privacy and safety
 
 - Speech stays on your Mac. Transcription uses Apple's on-device speech model, and audio is never stored or sent

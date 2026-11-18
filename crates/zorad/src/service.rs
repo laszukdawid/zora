@@ -85,6 +85,8 @@ impl Notifier {
                 kind: event.kind().as_str().into(),
                 title,
                 body,
+                job: event.job_id().map(String::from),
+                harness: event.harness().map(String::from),
             }
             .line();
             if p.tx.try_send(line).is_ok() {
@@ -160,7 +162,10 @@ pub async fn run(config: Config, opts: Options) -> i32 {
     }
 
     // Plugins.
-    let specs: Vec<PluginSpec> = if opts.attached {
+    // On macOS the app is the "macos" plugin (attached); any other configured plugin is spawned beside it but may
+    // only notify, so the app stays the one source of transcript and dictation.
+    let mut specs: Vec<PluginSpec> = Vec::new();
+    if opts.attached {
         let mut cfg = config
             .plugins
             .get("macos")
@@ -173,17 +178,19 @@ pub async fn run(config: Config, opts: Options) -> i32 {
             obj.entry("bundleIDs")
                 .or_insert(json!(config.dictation.bundle_ids));
         }
-        vec![PluginSpec {
+        specs.push(PluginSpec {
             id: "macos".into(),
             connection: Connection::Attached,
             config: cfg,
             listen: listen_rx.clone(),
-        }]
-    } else {
+            allowed: None,
+        });
+    }
+    specs.extend(
         config
             .plugins
             .iter()
-            .filter(|(_, p)| !p.command.is_empty())
+            .filter(|(id, p)| !p.command.is_empty() && !(opts.attached && id.as_str() == "macos"))
             .map(|(id, p)| {
                 let mut cfg = p.config.clone();
                 if let Some(obj) = cfg.as_object_mut() {
@@ -196,10 +203,10 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                     connection: Connection::Spawn(p.command.clone()),
                     config: cfg,
                     listen: listen_rx.clone(),
+                    allowed: opts.attached.then(|| vec!["notify"]),
                 }
-            })
-            .collect()
-    };
+            }),
+    );
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut plugin_tasks = Vec::new();
     for (i, spec) in specs.into_iter().enumerate() {

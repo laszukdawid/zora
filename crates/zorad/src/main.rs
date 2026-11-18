@@ -20,7 +20,10 @@ const USAGE: &str = "usage: zorad <command> [options]
   run [--dry-run]           Run the service (Linux: starts the configured plugins).
   run --attached-plugin     macOS: started by Zora.app, which talks the plugin protocol on fds 3/4.
   status                    Config problems, store, and jobs needing attention.
-  transcript [--since 30m]  Print the stored transcript.
+  transcript [--since 30m] [--last N] [--json]
+                            Print the stored transcript (newest N lines with --last).
+  commands [--since 4h] [--json]
+                            Voice commands and their jobs (never the transcript).
   jobs [cancel|clear <id>]  List unfinished jobs; cancel a running one; clear one after a manual check.
   names [add|remove <name>] List or change the names Zora answers to (applied live, no restart).
   pause [30m|1h|...]        Stop listening: the microphone is released and nothing is transcribed.
@@ -52,6 +55,7 @@ fn main() {
         "run" => cmd_run(config_path, &rest),
         "status" => cmd_status(config_path),
         "transcript" => cmd_transcript(&rest),
+        "commands" => cmd_commands(config_path, &rest),
         "jobs" => cmd_jobs(&rest),
         "names" => cmd_names(config_path, &rest),
         "pause" => cmd_pause(&rest),
@@ -149,24 +153,52 @@ fn cmd_status(path: Option<PathBuf>) -> i32 {
 }
 
 fn cmd_transcript(rest: &[String]) -> i32 {
+    const USAGE_T: &str = "usage: zorad transcript [--since 30m] [--last N] [--json]";
     let mut since = 30.0 * 60.0;
-    if let Some(i) = rest.iter().position(|a| a == "--since")
-        && let Some(v) = rest.get(i + 1).and_then(|s| parse_duration(s))
-    {
-        since = v;
+    if let Some(i) = rest.iter().position(|a| a == "--since") {
+        match rest.get(i + 1).and_then(|s| parse_duration(s)) {
+            Some(v) if v >= 0.0 => since = v,
+            _ => {
+                eprintln!("{USAGE_T}");
+                return 2;
+            }
+        }
     }
-    let db = service::database_path();
-    if !db.exists() {
-        return 0;
+    let mut last = usize::MAX;
+    if let Some(i) = rest.iter().position(|a| a == "--last") {
+        match rest.get(i + 1).and_then(|s| s.parse::<usize>().ok()) {
+            Some(n) if n > 0 => last = n.min(10_000),
+            _ => {
+                eprintln!("{USAGE_T}");
+                return 2;
+            }
+        }
     }
-    let Ok(mut s) = Store::open(&db, true) else {
-        return 1;
-    };
+    let json = rest.iter().any(|a| a == "--json");
     let wall_now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    for seg in s.segments_since(wall_now - since) {
+    let db = service::database_path();
+    let segments = if db.exists() {
+        match Store::open(&db, true).and_then(|s| s.last_segments(wall_now - since, last)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("zorad: cannot read the store at {}: {e}", db.display());
+                return 1;
+            }
+        }
+    } else {
+        vec![]
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"version": 1, "now": wall_now, "segments": segments})
+        );
+        return 0;
+    }
+    for seg in segments {
         let t = seg.start as i64;
         let (h, m, sec) = ((t / 3600) % 24, (t / 60) % 60, t % 60);
         let tag = if seg.kind == "dictation" {
@@ -230,6 +262,60 @@ fn listen_text(l: pause::Listen) -> String {
         (false, Some(t)) => format!("paused until {}", pause::local_hhmm(t)),
         (false, None) => "paused until you resume".into(),
     }
+}
+
+fn cmd_commands(path: Option<PathBuf>, rest: &[String]) -> i32 {
+    let mut since = 4.0 * 3600.0;
+    if let Some(i) = rest.iter().position(|a| a == "--since") {
+        match rest.get(i + 1).and_then(|s| parse_duration(s)) {
+            Some(v) if v >= 0.0 => since = v,
+            _ => {
+                eprintln!("usage: zorad commands [--since 4h] [--json]");
+                return 2;
+            }
+        }
+    }
+    let json = rest.iter().any(|a| a == "--json");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let db = service::database_path();
+    let commands = if db.exists() {
+        match Store::open(&db, true).and_then(|s| s.command_rows(now - since)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("zorad: cannot read the store at {}: {e}", db.display());
+                return 1;
+            }
+        }
+    } else {
+        vec![]
+    };
+    let problems = match load_config(path, false) {
+        Ok(c) => c.validate(),
+        Err(e) => vec![e],
+    };
+    if json {
+        let out = serde_json::json!({
+            "version": 1,
+            "now": now,
+            "config": {"ok": problems.is_empty(), "problems": problems},
+            "commands": commands,
+        });
+        println!("{out}");
+        return 0;
+    }
+    for p in &problems {
+        println!("config: {p}");
+    }
+    for c in &commands {
+        let first = c.text.lines().next().unwrap_or("");
+        let first: String = first.chars().take(80).collect();
+        let short: String = c.id.chars().take(8).collect();
+        println!("{short} {:<11} {:<8} {first}", c.status, c.harness);
+    }
+    0
 }
 
 fn cmd_pause(rest: &[String]) -> i32 {

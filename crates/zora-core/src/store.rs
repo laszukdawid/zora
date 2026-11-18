@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, params};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct StoredSegment {
     pub start: f64,
     pub end: f64,
@@ -21,6 +21,19 @@ pub struct JobRecord {
     pub guard_start: Option<i64>,
     pub job_pgid: Option<i64>,
     pub gate_start: Option<i64>,
+}
+
+/// One voice command and its job, as the `commands` table keeps it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CommandRow {
+    pub id: String,
+    pub captured_at: f64,
+    pub text: String,
+    pub harness: String,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub finished_at: Option<f64>,
+    pub summary: Option<String>,
 }
 
 pub struct Store {
@@ -271,6 +284,36 @@ impl Store {
         .unwrap_or_default()
     }
 
+    /// The newest `limit` segments that ended at or after `since_wall`, oldest first. Read-only: no flush.
+    pub fn last_segments(
+        &self,
+        since_wall: f64,
+        limit: usize,
+    ) -> Result<Vec<StoredSegment>, String> {
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT start_wall,end_wall,text,kind FROM segments WHERE end_wall >= ?1 \
+                 ORDER BY start_wall DESC, id DESC LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![since_wall, limit as i64], |r| {
+                Ok(StoredSegment {
+                    start: r.get(0)?,
+                    end: r.get(1)?,
+                    text: r.get(2)?,
+                    kind: r.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        out.reverse();
+        Ok(out)
+    }
+
     pub fn commands_since(&self, since_wall: f64) -> Vec<(String, String, String, Option<String>)> {
         let Ok(mut stmt) = self.db.prepare("SELECT id,text,status,summary FROM commands WHERE captured_wall >= ?1 ORDER BY captured_wall") else {
             return vec![];
@@ -280,6 +323,33 @@ impl Store {
         })
         .map(|rows| rows.filter_map(Result::ok).collect())
         .unwrap_or_default()
+    }
+
+    /// Commands captured since `since_wall`, plus every unfinished or ambiguous one whatever its age; oldest first.
+    pub fn command_rows(&self, since_wall: f64) -> Result<Vec<CommandRow>, String> {
+        let mut stmt = self
+            .db
+            .prepare(&format!(
+                "SELECT id,captured_wall,text,harness,status,exit_code,finished_wall,summary FROM commands \
+                 WHERE captured_wall >= ?1 OR status IN {NON_FINAL} OR status='ambiguous' ORDER BY captured_wall"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([since_wall], |r| {
+                Ok(CommandRow {
+                    id: r.get(0)?,
+                    captured_at: r.get(1)?,
+                    text: r.get(2)?,
+                    harness: r.get(3)?,
+                    status: r.get(4)?,
+                    exit_code: r.get(5)?,
+                    finished_at: r.get(6)?,
+                    summary: r.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn count(&self, table: &str) -> i64 {

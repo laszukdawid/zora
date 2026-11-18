@@ -8,13 +8,14 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 swift build -c release --product zora
-cargo build --release -p zorad --bin zorad
+cargo build --release -p zorad --bin zorad --bin zora-acdc
 
 app=.build/Zora.app
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Library/LaunchAgents"
 cp .build/release/zora "$app/Contents/MacOS/zora"
 cp target/release/zorad "$app/Contents/MacOS/zorad"
+cp target/release/zora-acdc "$app/Contents/MacOS/zora-acdc"
 cp packaging/macos/Info.plist "$app/Contents/Info.plist"
 cp packaging/macos/dev.zora.agent.plist "$app/Contents/Library/LaunchAgents/"
 
@@ -25,6 +26,7 @@ if [[ -z "$identity" ]]; then
   exit 1
 fi
 codesign --force --options runtime --timestamp=none --sign "$identity" "$app/Contents/MacOS/zorad"
+codesign --force --options runtime --timestamp=none --sign "$identity" "$app/Contents/MacOS/zora-acdc"
 codesign --force --options runtime --timestamp=none \
   --entitlements packaging/macos/Zora.entitlements --sign "$identity" "$app"
 codesign --verify --strict --deep "$app"
