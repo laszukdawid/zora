@@ -51,7 +51,8 @@ Plugins are listed in the config under `"plugins"`, each as a command that speak
 | Command | What it does |
 |---|---|
 | `zorad status` | config problems, store location, jobs that need attention |
-| `zorad transcript --since 30m` | print the stored transcript |
+| `zorad transcript --since 30m [--last N] [--json]` | print the stored transcript (the newest N lines with `--last`) |
+| `zorad commands [--since 4h] [--json]` | voice commands and their jobs, never the transcript |
 | `zorad jobs [clear <id>]` | list unfinished jobs; clear one after checking it by hand |
 | `zorad simulate script.txt` | feed a scripted transcript through the command logic (dry run) |
 | `zora status` (macOS) | permissions, speech model, login item, dictation monitor |

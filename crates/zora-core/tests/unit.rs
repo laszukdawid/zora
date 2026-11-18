@@ -652,3 +652,28 @@ fn stop_it_outside_a_capture_targets_the_running_job() {
     assert!(out.contains(&DetectorOutput::Discarded(DiscardReason::Cancelled)));
     assert!(!out.contains(&DetectorOutput::StopRunning));
 }
+
+#[test]
+fn last_segments_returns_the_newest_lines_oldest_first() {
+    let path = tmp("last.sqlite");
+    let mut s = Store::open(&path, false).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    s.append(1, now - 7200.0, now - 7190.0, "too old", "speech");
+    for i in 0..5 {
+        let t = now - 50.0 + i as f64;
+        s.append(1, t, t + 0.5, &format!("line {i}"), "speech");
+    }
+    s.flush().unwrap();
+    let r = Store::open(&path, true).unwrap();
+    let texts =
+        |v: Vec<zora_core::store::StoredSegment>| v.into_iter().map(|s| s.text).collect::<Vec<_>>();
+    assert_eq!(
+        texts(r.last_segments(now - 3600.0, 3).unwrap()),
+        ["line 2", "line 3", "line 4"]
+    );
+    assert_eq!(texts(r.last_segments(now - 3600.0, 100).unwrap()).len(), 5);
+    assert_eq!(texts(r.last_segments(0.0, 100).unwrap())[0], "too old");
+}
