@@ -57,7 +57,7 @@ public struct ZoraConfig: Codable, Sendable, Equatable {
     public var jobs = Jobs()
     /// Notifier id -> event kinds ("*" = all).
     public var notifications: [String: [String]] = [
-        "macos": ["commandQueued", "jobSucceeded", "jobFailed", "captureDiscarded", "degraded"],
+        "macos": ["captureStarted", "commandQueued", "jobStarted", "jobSucceeded", "jobFailed", "captureDiscarded", "degraded"],
         "log": ["*"],
     ]
 

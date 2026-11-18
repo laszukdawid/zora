@@ -1,9 +1,10 @@
 import AppKit
 
 /// Menu-bar icon that always shows what Zora is doing, plus optional short sounds, so feedback does not depend
-/// on how macOS presents notification banners (Focus, banner style).
+/// on how macOS presents notification banners (Focus, banner style). Its menu pauses and resumes listening and
+/// opens Settings.
 @MainActor
-final class StatusIndicator {
+final class StatusIndicator: NSObject, NSMenuDelegate {
     enum State {
         case idle, listening, running, done, failed, degraded
 
@@ -40,26 +41,77 @@ final class StatusIndicator {
         }
     }
 
+    private let cli: ZoradCLI
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let stateLine = NSMenuItem(title: State.idle.label, action: nil, keyEquivalent: "")
+    private let pauseItem = NSMenuItem(title: "Pause Listening", action: nil, keyEquivalent: "")
+    private let pauseHourItem = NSMenuItem(title: "Pause for 1 Hour", action: nil, keyEquivalent: "")
+    private let historyAnchor = NSMenuItem.separator()
     private var history: [NSMenuItem] = []
     private let menu = NSMenu()
     private var resetTask: Task<Void, Never>?
+    private var pendingTask: Task<Void, Never>?
+    /// A pause or resume request is running; the items stay disabled until it finishes, so an older request's
+    /// result can never undo a newer one.
+    private var requestInFlight = false
+    private var state = State.idle
+    /// As last reported by the core; nil until it has said.
+    private var listening: Bool?
+    private var pausedUntil: Date?
+    /// Shown instead of the state line until the core next reports its listening state.
+    private var notice: String?
+    private lazy var settings = SettingsWindow(cli: cli)
     var soundsEnabled = true
 
-    init() {
+    private let pauseMic: () -> Void
+    private let restoreMic: () -> Void
+
+    /// `pauseMic` releases the microphone right away when the user pauses from the menu; `restoreMic` ends
+    /// that local pause (the pause could not be saved, or the user resumed) and shows the core's state again.
+    init(cli: ZoradCLI, pauseMic: @escaping () -> Void, restoreMic: @escaping () -> Void) {
+        self.cli = cli
+        self.pauseMic = pauseMic
+        self.restoreMic = restoreMic
+        super.init()
         stateLine.isEnabled = false
         menu.addItem(stateLine)
         menu.addItem(.separator())
+        for (entry, action) in [(pauseItem, #selector(togglePause)), (pauseHourItem, #selector(pauseForHour))] {
+            entry.target = self
+            entry.action = action
+            menu.addItem(entry)
+        }
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+        menu.addItem(historyAnchor)
+        menu.addItem(.separator())
         let quit = NSMenuItem(title: "Restart Zora", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
         menu.addItem(quit)
+        menu.delegate = self
+        menu.autoenablesItems = false
         item.menu = menu
-        set(.idle)
+        render()
+    }
+
+    /// The core's listening state (`start` and `listening` messages, docs/protocol.md).
+    func setListening(_ on: Bool, until: Date?) {
+        listening = on
+        pausedUntil = on ? nil : until
+        pendingTask?.cancel()
+        pendingTask = nil
+        notice = nil
+        if !requestInFlight { setEnabled() }
+        if !on {
+            resetTask?.cancel()
+            state = .idle
+        }
+        render()
     }
 
     /// Maps a core event kind (docs/protocol.md `notify.kind`) to a state.
     func handle(kind: String, title: String, body: String) {
-        let state: State? = switch kind {
+        let next: State? = switch kind {
         case "captureStarted": .listening
         case "commandQueued", "jobStarted": .running
         case "jobSucceeded": .done
@@ -67,32 +119,122 @@ final class StatusIndicator {
         case "degraded": .degraded
         default: nil
         }
-        guard let state else { return }
-        if kind == "captureDiscarded" && body == "cancelled" {
-            // Cancelled by voice: back to idle, silently.
+        guard let next else { return }
+        if kind == "captureDiscarded" && (body == "cancelled" || listening == false) {
+            // Cancelled by voice, or cut off by a pause: back to idle, silently.
             resetTask?.cancel()
             set(.idle)
             return
         }
-        set(state)
-        if state != .listening { remember(title: title, body: body) }
-        if soundsEnabled, let name = state.sound { NSSound(named: NSSound.Name(name))?.play() }
+        set(next)
+        if next != .listening { remember(title: title, body: body) }
+        if soundsEnabled, let name = next.sound { NSSound(named: NSSound.Name(name))?.play() }
         // Finished states fall back to idle after a while; listening and running stay until the next event.
         resetTask?.cancel()
-        if [.done, .failed, .degraded].contains(state) {
+        // A capture ends within its 3-minute limit, so a "heard you" that nothing followed up on expires too.
+        let after: Double? = switch next {
+        case .done, .failed: 20
+        case .degraded: 60
+        case .listening: 200
+        default: nil
+        }
+        if let after {
             resetTask = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(state == .degraded ? 60 : 20))
+                try? await Task.sleep(for: .seconds(after))
                 if !Task.isCancelled { self?.set(.idle) }
             }
         }
     }
 
-    private func set(_ state: State) {
-        let image = NSImage(systemSymbolName: state.symbol, accessibilityDescription: state.label)
+    // MARK: Menu actions
+
+    @objc private func togglePause() {
+        change(listening == false ? ["resume"] : ["pause"])
+    }
+
+    @objc private func pauseForHour() {
+        change(["pause", "1h"])
+    }
+
+    @objc private func openSettings() {
+        settings.show()
+    }
+
+    /// Asks `zorad` for the change; the icon only moves when the core confirms it, so it never claims the mic
+    /// is off while it is still on.
+    private func change(_ args: [String]) {
+        let wantListening = args.first == "resume"
+        if !wantListening { pauseMic() }
+        pauseItem.isEnabled = false
+        pauseHourItem.isEnabled = false
+        requestInFlight = true
+        Task {
+            let result = await cli.run(args)
+            requestInFlight = false
+            guard result.ok else {
+                if !wantListening && result.timedOut {
+                    // It may or may not have been saved. The mic stays closed and the menu shows a pause, so
+                    // Resume is offered and undoes it either way.
+                    setListening(false, until: nil)
+                    notice = "Zora: paused here; the core didn't confirm it"
+                    render()
+                } else if !wantListening {
+                    restoreMic() // surely not saved
+                }
+                setEnabled()
+                alert(wantListening ? "Zora couldn't resume listening" : "Zora couldn't pause listening", result.message)
+                return
+            }
+            if wantListening { restoreMic() } // ends a pause held only here, if any
+            if listening == wantListening { return setEnabled() } // the core already confirmed it
+            // The core picks the change up within a second. If it doesn't answer (stopped or restarting), the
+            // saved state still applies when it starts; say so instead of leaving the menu greyed out.
+            pendingTask?.cancel()
+            pendingTask = Task {
+                try? await Task.sleep(for: .seconds(4))
+                guard !Task.isCancelled else { return }
+                setEnabled()
+                notice = "Zora: change saved; it applies when Zora's core is running"
+                render()
+            }
+        }
+    }
+
+    private func setEnabled() {
+        pauseItem.isEnabled = true
+        pauseHourItem.isEnabled = true
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        render() // refreshes "paused until …"
+    }
+
+    // MARK: Display
+
+    private func set(_ next: State) {
+        state = next
+        render()
+    }
+
+    private func render() {
+        let paused = listening == false
+        let symbol: String
+        let label: String
+        if paused && state == .idle {
+            symbol = "mic.slash"
+            label = pausedUntil.map { "Zora: paused until \($0.formatted(date: .omitted, time: .shortened))" }
+                ?? "Zora: paused (not listening)"
+        } else {
+            symbol = state.symbol
+            label = state.label
+        }
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
         image?.isTemplate = true
         item.button?.image = image
-        item.button?.toolTip = state.label
-        stateLine.title = state.label
+        item.button?.toolTip = label
+        stateLine.title = notice ?? label
+        pauseItem.title = paused ? "Resume Listening" : "Pause Listening"
+        pauseHourItem.isHidden = paused
     }
 
     private func remember(title: String, body: String) {
@@ -101,7 +243,16 @@ final class StatusIndicator {
         entry.toolTip = String(body.prefix(1000))
         entry.isEnabled = false
         history.insert(entry, at: 0)
-        menu.insertItem(entry, at: 2)
+        menu.insertItem(entry, at: menu.index(of: historyAnchor) + 1)
         if history.count > 5, let old = history.popLast() { menu.removeItem(old) }
+    }
+
+    private func alert(_ title: String, _ text: String) {
+        NSApp.activate()
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.alertStyle = .warning
+        a.runModal()
     }
 }

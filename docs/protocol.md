@@ -25,7 +25,7 @@ The domains must match.
 ```
 core → hello{protocol:1, generation, clock, now_ns, config}
 plugin → ready{protocol:1, generation, capabilities:[...], clock, now_ns}
-core → start
+core → start{listening, until?}
 ... events / requests ...
 core → stop
 plugin → stopped        (after finalizing transcript audio; deadline 5 s)
@@ -35,6 +35,7 @@ plugin exits on stdin/fd EOF
 - `generation` is assigned by the core and increments with every (re)start of the plugin connection. Every plugin message carries it. A message from an older generation is store-only (segments) or ignored (everything else).
 - Every plugin message carries a strictly increasing `seq`. A gap or reorder is a protocol error.
 - **Protocol errors:** malformed JSON, an unknown `t`, a line over 64 KiB (enforced while reading), a timestamp out of range, or a seq violation. On error, the core treats the connection as broken: it records a transcript gap and sets dictation health to unknown, kills the plugin, and restarts it with backoff (1 s, 2 s, 4 s … 60 s). In attached mode, `zorad` exits and the app restarts it.
+- A plugin ignores core messages it does not know, so new ones can be added within version 1.
 - At most 1 MiB of plugin output may be queued in the core. If control messages overflow, the core sets health to unknown and restarts the plugin.
 
 ## Capabilities and messages
@@ -79,6 +80,24 @@ Rules:
 | `ack` (plugin → core) | `seq, generation, id, ok, error?` |
 
 At most 16 notifications may be awaiting an ack. The core never waits for an ack while processing policy.
+
+### Listening on/off (core → plugin)
+
+| Message | Fields |
+|---|---|
+| `start` | `listening, until?` |
+| `listening` | `listening, until?` |
+
+`listening: false` means the user paused Zora (`zorad pause`, or the tray). `until` is the end of a timed pause in
+Unix seconds; it is absent for a pause that lasts until resumed. The state is also sent with `start`, so a plugin
+never opens the microphone just to close it again.
+
+- A `transcript` plugin must release the microphone while paused and must not start it before `start` says
+  `listening: true`. It should drop audio heard but not yet transcribed rather than finish it.
+- Whatever a plugin still sends while paused, the core drops: segments and partial text are neither stored nor
+  matched, and an open capture ends. Commands completed before the pause still run.
+- Dictation monitoring continues while paused; it never records audio.
+- Trays use the same messages to show the paused state.
 
 ### Clock probe
 

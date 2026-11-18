@@ -171,7 +171,9 @@ impl Default for Config {
         notifications.insert(
             "macos".into(),
             [
+                "captureStarted",
                 "commandQueued",
+                "jobStarted",
                 "jobSucceeded",
                 "jobFailed",
                 "captureDiscarded",
@@ -237,9 +239,37 @@ impl Config {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let data = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+        // Unique per writer, so concurrent saves never write into the same temp file.
+        let tmp = path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // Private from the first byte (it may hold harness env values); a replaced file keeps its own mode.
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| e.to_string())?;
+            f.write_all(&data).map_err(|e| e.to_string())?;
+        }
+        if let Ok(meta) = std::fs::metadata(path)
+            && let Err(e) = std::fs::set_permissions(&tmp, meta.permissions())
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })
     }
 
     pub fn detector_config(&self) -> DetectorConfig {
@@ -282,7 +312,7 @@ impl Config {
             let t = crate::detector::tokens(n);
             if t.len() != 1 || t[0].chars().count() < 3 {
                 problems.push(format!(
-                    "wakeNames entry '{n}' must be one word of at least 3 letters"
+                    "name '{n}' must be one word of at least 3 letters (wakeNames)"
                 ));
             }
         }

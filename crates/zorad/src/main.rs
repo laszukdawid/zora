@@ -2,6 +2,7 @@ mod guard;
 mod host;
 mod jobs;
 mod os;
+mod pause;
 mod queue;
 mod service;
 mod store_thread;
@@ -22,6 +23,11 @@ const USAGE: &str = "usage: zorad <command> [options]
   transcript [--since 30m]  Print the stored transcript.
   jobs [cancel|clear <id>]  List unfinished jobs; cancel a running one; clear one after a manual check.
   names [add|remove <name>] List or change the names Zora answers to (applied live, no restart).
+  pause [30m|1h|...]        Stop listening: the microphone is released and nothing is transcribed.
+                            Without a duration, stays paused (also across restarts) until `resume`.
+  resume                    Start listening again.
+  settings [set <json>]     Print, or change, the settings the menu bar edits, as JSON: wakeNames,
+                            phrases {start,end,cancel} and workspace (of the default harness).
   simulate <script>         Feed a scripted transcript through the command logic (dry run).
 
   --config <path>           Config file (default ~/.config/zora/config.json).";
@@ -48,6 +54,9 @@ fn main() {
         "transcript" => cmd_transcript(&rest),
         "jobs" => cmd_jobs(&rest),
         "names" => cmd_names(config_path, &rest),
+        "pause" => cmd_pause(&rest),
+        "resume" => cmd_resume(),
+        "settings" => cmd_settings(config_path, &rest),
         "simulate" => cmd_simulate(config_path, &rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
@@ -125,6 +134,8 @@ fn cmd_status(path: Option<PathBuf>) -> i32 {
         }
         Err(e) => println!("config: {e}"),
     }
+    let l = pause::read(&pause::path(), pause::wall_now());
+    println!("listening: {}", listen_text(l));
     let db = service::database_path();
     println!("store: {}", db.display());
     if db.exists()
@@ -213,15 +224,181 @@ fn cmd_names(path: Option<PathBuf>, rest: &[String]) -> i32 {
     0
 }
 
-fn parse_duration(s: &str) -> Option<f64> {
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
-    let n: f64 = num.parse().ok()?;
-    match unit {
-        "s" => Some(n),
-        "m" => Some(n * 60.0),
-        "h" => Some(n * 3600.0),
-        _ => s.parse().ok(),
+fn listen_text(l: pause::Listen) -> String {
+    match (l.listening, l.until) {
+        (true, _) => "on".into(),
+        (false, Some(t)) => format!("paused until {}", pause::local_hhmm(t)),
+        (false, None) => "paused until you resume".into(),
     }
+}
+
+fn cmd_pause(rest: &[String]) -> i32 {
+    let until = match rest.first() {
+        None => None,
+        Some(d) => match parse_duration(d) {
+            // A minute to a week: the service checks once a second, and a longer pause is better left open-ended.
+            Some(secs) if (60.0..=7.0 * 86400.0).contains(&secs) => Some(pause::wall_now() + secs),
+            _ => {
+                eprintln!("usage: zorad pause [duration from 1m to a week, e.g. 30m or 1h]");
+                return 2;
+            }
+        },
+    };
+    if let Err(e) = pause::pause(&pause::path(), until) {
+        eprintln!("zorad: {e}");
+        return 1;
+    }
+    let l = pause::Listen {
+        listening: false,
+        until,
+    };
+    println!(
+        "Pause saved ({}). A running Zora applies it within a second.",
+        listen_text(l).trim_start_matches("paused ")
+    );
+    0
+}
+
+fn cmd_resume() -> i32 {
+    if let Err(e) = pause::resume(&pause::path()) {
+        eprintln!("zorad: {e}");
+        return 1;
+    }
+    println!("Resume saved. A running Zora starts listening within a second.");
+    0
+}
+
+/// The part of the config the menu bar edits. Unknown keys are rejected so a typo is never silently ignored.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SettingsChange {
+    wake_names: Option<Vec<String>>,
+    phrases: Option<PhrasesChange>,
+    workspace: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhrasesChange {
+    start: Option<Vec<String>>,
+    end: Option<Vec<String>>,
+    cancel: Option<Vec<String>>,
+}
+
+fn settings_json(config: &Config, path: &std::path::Path) -> serde_json::Value {
+    let workspace = config
+        .harnesses
+        .get(&config.default_harness)
+        .map(|h| h.workspace.clone())
+        .unwrap_or_default();
+    serde_json::json!({
+        "wakeNames": config.wake_names,
+        "phrases": config.phrases,
+        "harness": config.default_harness,
+        "workspace": workspace,
+        "configPath": path,
+        "problems": config.validate(),
+    })
+}
+
+/// Trimmed, lowercased, single-spaced, without empties or repeats (first one wins).
+fn clean_list(items: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for i in items {
+        let i = i
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if !i.is_empty() && !out.contains(&i) {
+            out.push(i);
+        }
+    }
+    out
+}
+
+fn cmd_settings(path: Option<PathBuf>, rest: &[String]) -> i32 {
+    let path = path.unwrap_or_else(Config::default_path);
+    let mut config = match load_config(Some(path.clone()), true) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("zorad: {e}");
+            return 1;
+        }
+    };
+    match (rest.first().map(String::as_str), rest.get(1)) {
+        (None, _) => {}
+        (Some("set"), Some(json)) => {
+            let change: SettingsChange = match serde_json::from_str(json) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("settings: {e}");
+                    return 2;
+                }
+            };
+            let before = config.validate();
+            if let Some(names) = change.wake_names {
+                config.wake_names = clean_list(names);
+            }
+            if let Some(p) = change.phrases {
+                let ph = &mut config.phrases;
+                for (new, old) in [
+                    (p.start, &mut ph.start),
+                    (p.end, &mut ph.end),
+                    (p.cancel, &mut ph.cancel),
+                ] {
+                    if let Some(new) = new {
+                        *old = clean_list(new);
+                    }
+                }
+            }
+            if let Some(ws) = change.workspace {
+                let id = config.default_harness.clone();
+                match config.harnesses.get_mut(&id) {
+                    Some(h) => h.workspace = ws.trim().to_string(),
+                    None => {
+                        eprintln!("settings: defaultHarness '{id}' is not defined in harnesses");
+                        return 2;
+                    }
+                }
+            }
+            // Only problems this change introduces block it; an unrelated, older problem must not stop a rename.
+            let new: Vec<String> = config
+                .validate()
+                .into_iter()
+                .filter(|p| !before.contains(p))
+                .collect();
+            if !new.is_empty() {
+                new.iter().for_each(|p| eprintln!("{p}"));
+                return 2;
+            }
+            if let Err(e) = config.write(&path) {
+                eprintln!("zorad: {e}");
+                return 1;
+            }
+        }
+        _ => {
+            eprintln!("usage: zorad settings [set '<json>']");
+            return 2;
+        }
+    }
+    println!("{}", settings_json(&config, &path));
+    0
+}
+
+/// "90", "90s", "30m" or "2h" in seconds; finite and non-negative only.
+fn parse_duration(s: &str) -> Option<f64> {
+    let (num, scale) = if let Some(n) = s.strip_suffix('s') {
+        (n, 1.0)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60.0)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600.0)
+    } else {
+        (s, 1.0)
+    };
+    let v = num.parse::<f64>().ok()? * scale;
+    (v.is_finite() && v >= 0.0).then_some(v)
 }
 
 fn cmd_jobs(rest: &[String]) -> i32 {

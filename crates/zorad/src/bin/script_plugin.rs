@@ -4,7 +4,7 @@
 //! config: {
 //!   "capabilities": ["transcript", "dictation", "notify"],
 //!   "heartbeat": true,                      // dictation heartbeats every 2 s (healthy, not capturing)
-//!   "steps": [ {"delayMs": 500, "say": "Hey Zora ...", "durMs": 1000},
+//!   "steps": [ {"delayMs": 500, "say": "Hey Zora ...", "durMs": 1000},   // "agoMs": ended that long ago
 //!              {"delayMs": 0, "raw": "{not json"},           // inject a raw line
 //!              {"delayMs": 0, "began": true} / {"ended": true},
 //!              {"delayMs": 0, "quietEnd": true}, {"delayMs": 0, "skipSeq": true},
@@ -104,7 +104,7 @@ fn main() {
             for step in steps {
                 std::thread::sleep(Duration::from_millis(step["delayMs"].as_u64().unwrap_or(0)));
                 if let Some(text) = step["say"].as_str() {
-                    let end = now_ns();
+                    let end = now_ns() - step["agoMs"].as_i64().unwrap_or(0) * MILLI;
                     let start = end - step["durMs"].as_i64().unwrap_or(1000) * MILLI;
                     out.send(json!({"t": "segment", "session": 1, "start_ns": start, "end_ns": end, "text": text}));
                 } else if let Some(text) = step["partial"].as_str() {
@@ -156,6 +156,9 @@ fn main() {
             Some("notify") => {
                 eprintln!("notify kind={}", msg["kind"].as_str().unwrap_or(""));
                 out.send(json!({"t": "ack", "id": msg["id"], "ok": true}));
+            }
+            Some("start") | Some("listening") => {
+                eprintln!("listening={}", msg["listening"].as_bool().unwrap_or(true));
             }
             Some("clock") => out.send(json!({"t": "clock", "id": msg["id"], "now_ns": now_ns()})),
             Some("stop") => {

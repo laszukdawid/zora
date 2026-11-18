@@ -141,13 +141,23 @@ pub async fn run(config: Config, opts: Options) -> i32 {
         notifier.notify(&ZoraEvent::Degraded { reason }, &mut plugins);
     }
 
-    let harness = HarnessSpec::from_config(
+    let mut harness = HarnessSpec::from_config(
         &config.default_harness,
         &config.harnesses[&config.default_harness],
         &config,
     );
     let mut coordinator = Coordinator::new(&config, now_ns());
     let no_monitor = config.dictation.monitor == "none";
+
+    // Listening on/off (paused state survives restarts).
+    let pause_path = crate::pause::path();
+    let mut listen = crate::pause::read(&pause_path, crate::pause::wall_now());
+    // Speech that started before the last resume was heard while paused, however late it arrives.
+    let mut listening_since: Ns = Ns::MIN;
+    let (listen_tx, listen_rx) = tokio::sync::watch::channel(listen);
+    if !listen.listening {
+        eprintln!("[zorad] starting paused");
+    }
 
     // Plugins.
     let specs: Vec<PluginSpec> = if opts.attached {
@@ -167,6 +177,7 @@ pub async fn run(config: Config, opts: Options) -> i32 {
             id: "macos".into(),
             connection: Connection::Attached,
             config: cfg,
+            listen: listen_rx.clone(),
         }]
     } else {
         config
@@ -184,6 +195,7 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                     id: id.clone(),
                     connection: Connection::Spawn(p.command.clone()),
                     config: cfg,
+                    listen: listen_rx.clone(),
                 }
             })
             .collect()
@@ -239,8 +251,10 @@ pub async fn run(config: Config, opts: Options) -> i32 {
     );
     let retention = config.retention_hours * 3600.0;
     let mut last_maintenance = Instant::now();
-    let mut config_mtime = modified(&opts.config_path);
+    // None: the first check always reloads, so a save between the startup read and here is never missed.
+    let mut config_mtime = None;
     let mut last_config_check = Instant::now();
+    let mut last_pause_check = Instant::now();
     let failure_check = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut notices: HashMap<String, Instant> = HashMap::new();
     let mut shutting_down: Option<(Instant, HashSet<String>)> = None;
@@ -263,7 +277,42 @@ pub async fn run(config: Config, opts: Options) -> i32 {
         };
         queue.consumed(&item);
         let now = now_ns();
+        // Pause is applied before the item, so speech arriving with a due pause is already dropped.
+        if last_pause_check.elapsed() >= Duration::from_secs(1) {
+            last_pause_check = Instant::now();
+            let next = crate::pause::read(&pause_path, crate::pause::wall_now());
+            if next != listen && shutting_down.is_none() {
+                if !next.listening {
+                    // Anything half-heard is forgotten: an open capture ends here.
+                    for fx in coordinator.handle(Input::Gap, now) {
+                        execute(
+                            fx,
+                            now,
+                            no_monitor,
+                            &store,
+                            &jobs,
+                            &harness,
+                            &queue,
+                            &mut notifier,
+                            &mut plugins,
+                        );
+                    }
+                }
+                eprintln!(
+                    "[zorad] listening {}",
+                    if next.listening { "resumed" } else { "paused" }
+                );
+                if next.listening {
+                    listening_since = now_ns();
+                }
+                listen = next;
+                let _ = listen_tx.send(listen);
+            }
+        }
         let effects = match item {
+            // While paused nothing heard is kept or matched, including results the plugin finalizes late.
+            Item::Core(Input::Segment(_) | Input::Partial { .. }) if !listen.listening => vec![],
+            Item::Core(Input::Segment(s)) if s.start < listening_since => vec![],
             Item::Core(input) => coordinator.handle(input, now),
             Item::Loss => coordinator.handle(Input::Gap, now),
             Item::PluginUp {
@@ -361,6 +410,12 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                         let problems = new.validate();
                         if problems.is_empty() {
                             coordinator.reload_detector(new.detector_config());
+                            // Jobs already queued keep the harness they were submitted with.
+                            harness = HarnessSpec::from_config(
+                                &new.default_harness,
+                                &new.harnesses[&new.default_harness],
+                                &new,
+                            );
                             eprintln!("[zorad] config reloaded: wake names {:?}", new.wake_names);
                         } else {
                             notifier.notify(

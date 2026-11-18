@@ -39,7 +39,13 @@ final class Bridge: @unchecked Sendable {
 
     @MainActor
     func startIndicator() {
-        indicator = StatusIndicator()
+        let args = options.coreArgs
+        let config = args.firstIndex(of: "--config").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+        indicator = StatusIndicator(
+            cli: ZoradCLI(path: options.zorad, configPath: config),
+            pauseMic: { [weak self] in self?.setLocalPause(true) },
+            restoreMic: { [weak self] in self?.setLocalPause(false) }
+        )
     }
 
     func run() {
@@ -95,6 +101,7 @@ final class Bridge: @unchecked Sendable {
             }
             // A clean exit with status 0 outside a stop means the core refused to run (e.g. bad config).
             let exitedCleanly = (status & 0x7f) == 0 && ((status >> 8) & 0xff) == 0
+            coreLost()
             log.error("zorad exited (status \(status)); restarting")
             if exitedCleanly && Date().timeIntervalSince(startedAt) < 5 {
                 FileHandle.standardError.write(Data("zora: zorad exited at startup; check `zorad status`\n".utf8))
@@ -137,12 +144,17 @@ final class Bridge: @unchecked Sendable {
         let rc = posix_spawn(&pid, options.zorad, &actions, &attr, argv, environ)
         close(coreRead); close(coreWrite)
         guard rc == 0 else { close(ourRead); close(ourWrite); return nil }
-        lock.withLock { corePID = pid; writeFD = ourWrite; ready = false }
-        Thread.detachNewThread { [self] in readLoop(fd: ourRead) }
+        let conn: UInt64 = lock.withLock {
+            corePID = pid; writeFD = ourWrite; ready = false
+            connection += 1
+            return connection
+        }
+        Thread.detachNewThread { [self] in readLoop(fd: ourRead, pid: pid, conn: conn) }
         return pid
     }
 
-    private func readLoop(fd: Int32) {
+    /// `conn` identifies this core connection: messages still buffered from a core that has gone are ignored.
+    private func readLoop(fd: Int32, pid myPID: pid_t, conn: UInt64) {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 16 * 1024)
         while true {
@@ -153,13 +165,14 @@ final class Bridge: @unchecked Sendable {
             while let nl = buffer.firstIndex(of: 0x0A) {
                 let line = buffer[buffer.startIndex..<nl]
                 buffer.removeSubrange(buffer.startIndex...nl)
-                if let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] { handle(obj) }
+                if let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any] { handle(obj, conn: conn) }
             }
             if buffer.count > 64 * 1024 { break } // protocol limit
         }
         close(fd)
-        // A reader that stopped while the core still runs leaves a half-open channel: restart the core.
-        let pid: pid_t = lock.withLock { stopping ? 0 : corePID }
+        // A reader that stopped while its core still runs leaves a half-open channel: restart that core (never a
+        // newer one).
+        let pid: pid_t = lock.withLock { stopping || corePID != myPID ? 0 : myPID }
         if pid > 0 {
             log.error("protocol channel from core closed; restarting it")
             kill(pid, SIGKILL)
@@ -168,7 +181,9 @@ final class Bridge: @unchecked Sendable {
 
     // MARK: Protocol
 
-    private func handle(_ msg: [String: Any]) {
+    private func handle(_ msg: [String: Any], conn: UInt64) {
+        // Lines still buffered from a core that has gone must not touch the mic or the new connection.
+        guard lock.withLock({ conn == connection }) else { return }
         switch msg["t"] as? String {
         case "hello":
             let gen = (msg["generation"] as? NSNumber)?.uint64Value ?? 0
@@ -185,7 +200,10 @@ final class Bridge: @unchecked Sendable {
             lock.withLock { ready = true }
             if isRestart { pipeline?.markDiscontinuity() } // sessions are scoped to a generation
         case "start":
+            listeningChanged(msg, conn: conn)
             startCapabilities()
+        case "listening":
+            listeningChanged(msg, conn: conn)
         case "sync":
             let id = msg["id"] as? NSNumber ?? 0
             monitor?.sync(reply: { [weak self] o in
@@ -221,8 +239,10 @@ final class Bridge: @unchecked Sendable {
         case "clock":
             send(["t": "clock", "id": msg["id"] as? NSNumber ?? 0, "now_ns": HostClock.nowNanos()])
         case "stop":
-            Task { [weak self] in
+            onMic { [weak self] in
                 guard let self else { return }
+                micReady = false
+                micRunning = false
                 await pipeline?.stop()
                 monitor?.stop()
                 send(["t": "stopped"])
@@ -239,6 +259,88 @@ final class Bridge: @unchecked Sendable {
     }
 
     private var pendingConfig: [String: Any] = [:]
+
+    // MARK: Microphone on/off
+
+    /// Start, pause, resume and stop of the microphone run one after another in this chain, in message order,
+    /// so a late resume can never reopen the mic after a pause or a stop.
+    private var micTail: Task<Void, Never>?
+    // Under `lock`, and set the moment an event arrives (not when the chain gets to it), so a slow start-up
+    // in the chain can never open the mic after a pause or a disconnect. The mic is open only while a core is
+    // connected and says "listening", and no pause from the menu is waiting for the core to confirm it.
+    /// nil while no core is connected (exited, restarting), so a pause saved meanwhile is never ignored.
+    private var coreListening: Bool?
+    private var coreUntil: Date?
+    private var localPause = false
+    /// Counts core connections; see `readLoop`.
+    private var connection: UInt64 = 0
+    private var micWanted: Bool { lock.withLock { coreListening == true && !localPause } }
+    // Touched only inside the chain.
+    private var micReady = false
+    private var micRunning = false
+
+    private func onMic(_ work: @escaping @Sendable () async -> Void) {
+        lock.withLock {
+            let previous = micTail
+            micTail = Task { await previous?.value; await work() }
+        }
+    }
+
+    private func listeningChanged(_ msg: [String: Any], conn: UInt64) {
+        let on = msg["listening"] as? Bool ?? true
+        let until = (msg["until"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+        let current: Bool = lock.withLock {
+            guard conn == connection else { return false }
+            coreListening = on
+            coreUntil = until
+            if !on { localPause = false } // the core has it now
+            return true
+        }
+        guard current else { return }
+        log.info("listening \(on ? "on" : "paused", privacy: .public)")
+        Task { @MainActor [weak self] in self?.indicator?.setListening(on, until: until) }
+        onMic { [weak self] in await self?.applyMic() }
+    }
+
+    /// The menu's "Pause" closes the mic at once, without waiting for the core (which may be restarting), and
+    /// keeps it closed until the core confirms; `false` withdraws it (the pause surely wasn't saved, or the user
+    /// resumed).
+    private func setLocalPause(_ on: Bool) {
+        let core: (Bool?, Date?) = lock.withLock {
+            localPause = on
+            return (coreListening, coreUntil)
+        }
+        // Withdrawn: the menu shows the core's state again (it may have shown a pause the core never got).
+        if !on, let listening = core.0 {
+            Task { @MainActor [weak self] in self?.indicator?.setListening(listening, until: core.1) }
+        }
+        onMic { [weak self] in await self?.applyMic() }
+    }
+
+    /// The core connection ended: close the mic until a new core says to listen.
+    private func coreLost() {
+        lock.withLock {
+            coreListening = nil
+            connection += 1
+        }
+        onMic { [weak self] in await self?.applyMic() }
+    }
+
+    /// Runs in the mic chain.
+    private func applyMic() async {
+        guard micReady, let pipeline else { return }
+        if micWanted && !micRunning {
+            do {
+                try pipeline.startMicrophone()
+                micRunning = true
+            } catch {
+                send(["t": "status", "ready": false, "reason": "\(error)"])
+            }
+        } else if !micWanted && micRunning {
+            await pipeline.pauseMicrophone()
+            micRunning = false
+        }
+    }
     /// Last capture state published by the monitor (began/ended); only touched on the monitor's queue.
     private var dictating = false
     private var pendingWrites = 0
@@ -284,26 +386,37 @@ final class Bridge: @unchecked Sendable {
             log.info("early wake enabled")
         }
         self.pipeline = pipeline
-        Task { [weak self] in
-            do {
-                try await pipeline.prepare()
-                self?.send(["t": "status", "ready": true, "reason": "speech ready"])
-                if let file = self?.options.audioFile {
+        if let file = options.audioFile {
+            // File mode is for testing and ignores pause.
+            Task { [weak self] in
+                do {
+                    try await pipeline.prepare()
+                    self?.send(["t": "status", "ready": true, "reason": "speech ready"])
                     try await pipeline.transcribeFile(file)
-                    // File mode is for testing: give hold-back and sync time, then stop the service.
+                    // Give hold-back and sync time, then stop the service.
                     try await Task.sleep(for: .seconds(5))
                     self?.requestStop()
-                } else {
-                    // First run from launchd: the prompts belong to Zora.app itself, which is what TCC remembers.
-                    if Microphone.status == "not determined" { _ = await Microphone.request() }
-                    if let mac = self?.notifier, mac.isAvailable, await mac.authorizationDescription() == "not determined" {
-                        _ = await mac.requestAuthorization()
-                    }
-                    guard Microphone.granted else { throw SpeechPipelineError.microphoneUnavailable("access is \(Microphone.status); allow Zora in System Settings → Privacy & Security → Microphone") }
-                    try pipeline.startMicrophone()
+                } catch {
+                    self?.send(["t": "status", "ready": false, "reason": "\(error)"])
                 }
+            }
+            return
+        }
+        onMic { [weak self] in
+            guard let self else { return }
+            do {
+                try await pipeline.prepare()
+                send(["t": "status", "ready": true, "reason": "speech ready"])
+                // First run from launchd: the prompts belong to Zora.app itself, which is what TCC remembers.
+                if Microphone.status == "not determined" { _ = await Microphone.request() }
+                if notifier.isAvailable, await notifier.authorizationDescription() == "not determined" {
+                    _ = await notifier.requestAuthorization()
+                }
+                guard Microphone.granted else { throw SpeechPipelineError.microphoneUnavailable("access is \(Microphone.status); allow Zora in System Settings → Privacy & Security → Microphone") }
+                micReady = true
+                await applyMic()
             } catch {
-                self?.send(["t": "status", "ready": false, "reason": "\(error)"])
+                send(["t": "status", "ready": false, "reason": "\(error)"])
             }
         }
     }

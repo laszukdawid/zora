@@ -156,6 +156,63 @@ fn spoken_command_runs_and_service_stops_cleanly() {
     );
 }
 
+impl Env {
+    fn zorad(&self, args: &[&str]) {
+        let ok = Command::new(ZORAD)
+            .args(args)
+            .env("HOME", &self.home)
+            .env_remove("XDG_STATE_HOME")
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "zorad {args:?} failed");
+    }
+}
+
+#[test]
+fn nothing_is_heard_while_paused_and_resume_listens_again() {
+    let env = Env::new();
+    env.zorad(&["pause"]);
+    let cfg = env.config(
+        json!([
+            {"delayMs": 3500, "say": "Hey Zora, secret. Do it, Zora.", "durMs": 300},
+            {"delayMs": 5500, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 300}
+        ]),
+        "echo \"ran: $1\"",
+    );
+    let child = env.start(&cfg);
+    // Resume between the two sentences.
+    std::thread::sleep(Duration::from_millis(4500));
+    env.zorad(&["resume"]);
+    let done = wait_for(Duration::from_secs(20), || {
+        env.commands().into_iter().find(|c| c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    assert!(
+        err.contains("listening=false") && err.contains("listening=true"),
+        "plugin was not told about the pause; stderr:\n{err}"
+    );
+    let commands = env.commands();
+    assert!(
+        done.is_some(),
+        "no command after resume; {commands:?}; stderr:\n{err}"
+    );
+    assert_eq!(
+        commands.len(),
+        1,
+        "a command heard while paused ran: {commands:?}"
+    );
+    assert_eq!(commands[0].1, "say hi");
+    let mut s = Store::open(&env.db(), true).unwrap();
+    assert!(
+        s.segments_since(0.0)
+            .iter()
+            .all(|x| !x.text.contains("secret")),
+        "speech heard while paused was stored"
+    );
+}
+
 #[test]
 fn dictated_command_never_runs() {
     let env = Env::new();
@@ -557,4 +614,65 @@ fn stop_it_by_voice_cancels_the_running_job() {
         "{err}"
     );
     assert!(err.contains("stop requested by voice"), "{err}");
+}
+
+#[test]
+fn a_new_project_folder_applies_without_restart() {
+    let env = Env::new();
+    let cfg = env.config(
+        json!([{"delayMs": 6000, "say": "Hey Zora, where. Do it, Zora.", "durMs": 800}]),
+        "pwd",
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_secs(2));
+    let other = env.home.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let change = json!({"workspace": other}).to_string();
+    let out = Command::new(ZORAD)
+        .args(["settings", "set", &change, "--config"])
+        .arg(&cfg)
+        .env("HOME", &env.home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let done = wait_for(Duration::from_secs(20), || {
+        env.commands().into_iter().find(|c| c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    let summary = done.and_then(|c| c.3).unwrap_or_default();
+    let ran_in = std::fs::canonicalize(summary.trim()).unwrap_or_default();
+    assert_eq!(ran_in, std::fs::canonicalize(&other).unwrap(), "{err}");
+}
+
+#[test]
+fn speech_from_the_pause_that_arrives_after_resume_is_dropped() {
+    let env = Env::new();
+    env.zorad(&["pause"]);
+    let cfg = env.config(
+        json!([
+            // Spoken at about 2.7-3 s after the plugin starts, while paused (resume comes at 6 s, leaving room for a
+            // slow start under load); delivered at 10 s, after the resume.
+            {"delayMs": 10000, "say": "Hey Zora, secret. Do it, Zora.", "durMs": 300, "agoMs": 7000},
+            {"delayMs": 1000, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 300}
+        ]),
+        "echo \"ran: $1\"",
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(3500));
+    env.zorad(&["resume"]);
+    let done = wait_for(Duration::from_secs(20), || {
+        env.commands().into_iter().find(|c| c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    let commands = env.commands();
+    assert!(
+        done.is_some(),
+        "no command after resume; {commands:?}; stderr:\n{err}"
+    );
+    assert_eq!(commands.len(), 1, "speech from the pause ran: {commands:?}");
+    assert_eq!(commands[0].1, "say hi");
 }

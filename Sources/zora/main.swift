@@ -13,7 +13,8 @@ usage: zora <command> [options]
 
   run [--dry-run] [--file <audio>]  Run Zora (starts the core, zorad). --file feeds an audio file instead of
                                     the microphone and stops afterwards (testing).
-  setup                      Grant microphone + notification access, install the speech model, write config.
+  setup [--project <dir>]    Grant microphone + notification access, install the speech model, write config,
+                             and set the project folder your coding agent works in (asks if not given).
   install | uninstall        Start/stop Zora at login (SMAppService; run from Zora.app).
   status                     Show permissions, speech model, login item and the dictation monitor.
 
@@ -103,7 +104,7 @@ case "run":
 
 case "setup":
     runMain {
-        let config = try loadConfig(configPath, createIfMissing: true)
+        var config = try loadConfig(configPath, createIfMissing: true)
         print("microphone:", await Microphone.request() ? "granted" : "denied")
         let mac = MacNotifier()
         print("notifications:", mac.isAvailable ? (await mac.requestAuthorization() ? "authorized" : "denied") : "unavailable (run from Zora.app)")
@@ -112,6 +113,23 @@ case "setup":
             FileHandle.standardError.write(Data(String(format: "\r  %3.0f%%", p * 100).utf8))
         }
         print("\nspeech model: installed (\(locale.identifier))")
+        var dir: String?
+        if let i = rest.firstIndex(of: "--project"), i + 1 < rest.count { dir = rest[i + 1] }
+        if dir != nil || config.validate().contains(where: { $0.contains("workspace") }) {
+            if dir == nil, isatty(STDIN_FILENO) != 0 {
+                print("Project folder for your coding agent (it runs there and can change files): ", terminator: "")
+                dir = readLine()?.trimmingCharacters(in: .whitespaces)
+            }
+            if let dir, !dir.isEmpty {
+                let path = URL(fileURLWithPath: expandTilde(dir)).standardizedFileURL.path
+                let change = String(decoding: try JSONSerialization.data(withJSONObject: ["workspace": path]), as: UTF8.self)
+                // Saved through the core, which validates it the same way the menu bar's Settings does.
+                let r = await ZoradCLI(path: zoradPath(), configPath: configPath).run(["settings", "set", change])
+                guard r.ok else { print("project folder:", r.message); return 1 }
+                print("project folder:", path)
+                config = try loadConfig(configPath, createIfMissing: false)
+            }
+        }
         let problems = config.validate()
         problems.forEach { print("config:", $0) }
         return problems.isEmpty ? 0 : 1

@@ -53,6 +53,12 @@ public final class SpeechPipeline: @unchecked Sendable {
     private var consumer: Task<Void, Never>?
     private let dropped = OSAllocatedUnfairLock(initialState: false)
     private var configObserver: NSObjectProtocol?
+    /// Serializes engine start, restart (device changes arrive on any thread), pause and stop.
+    private let engineLock = NSLock()
+    /// Under `engineLock`: the microphone should be open. A late device-change restart checks it.
+    private var micOn = false
+    /// Set while pausing: buffered audio is skipped and the open session is thrown away, not finalized.
+    private let discarding = OSAllocatedUnfairLock(initialState: false)
 
     // Consumer-task state.
     private var session: Session?
@@ -115,18 +121,47 @@ public final class SpeechPipeline: @unchecked Sendable {
 
     public func startMicrophone() throws {
         startConsumer()
-        try installTapAndStart()
-        configObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
-        ) { [weak self] _ in self?.restartMicrophone(reason: "audio configuration changed") }
+        try engineLock.withLock {
+            try installTapAndStart()
+            micOn = true
+        }
+        if configObserver == nil {
+            configObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+            ) { [weak self] _ in self?.restartMicrophone(reason: "audio configuration changed") }
+        }
+    }
+
+    /// Releases the microphone (the system's mic indicator goes off) and throws away what was heard but not yet
+    /// transcribed, so nothing from before the pause arrives later. `startMicrophone()` resumes.
+    public func pauseMicrophone() async {
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        configObserver = nil
+        closeEngine()
+        discarding.withLock { $0 = true }
+        chunks?.finish()
+        await consumer?.value
+        chunks = nil
+        consumer = nil
+        lastEnd = nil
+        restartRequested.withLock { $0 = false }
+        dropped.withLock { $0 = false }
+        discarding.withLock { $0 = false }
     }
 
     public func stop() async {
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        closeEngine()
         chunks?.finish()
         await consumer?.value
+    }
+
+    private func closeEngine() {
+        engineLock.withLock {
+            micOn = false
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
     }
 
     /// Ends the current analyzer session and reports a gap (sleep/wake, device change).
@@ -135,12 +170,17 @@ public final class SpeechPipeline: @unchecked Sendable {
     }
 
     private func restartMicrophone(reason: String) {
-        log.info("restarting microphone: \(reason, privacy: .public)")
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        markDiscontinuity()
-        do { try installTapAndStart() } catch {
-            onEvent(.gap(reason: "microphone restart failed: \(error)", at: HostClock.now()))
+        engineLock.withLock {
+            // A change notice that was already on its way when the mic was paused or stopped must not reopen it.
+            guard micOn else { return }
+            log.info("restarting microphone: \(reason, privacy: .public)")
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            markDiscontinuity()
+            do { try installTapAndStart() } catch {
+                micOn = false
+                onEvent(.gap(reason: "microphone restart failed: \(error)", at: HostClock.now()))
+            }
         }
     }
 
@@ -160,7 +200,11 @@ public final class SpeechPipeline: @unchecked Sendable {
             }
         }
         engine.prepare()
-        try engine.start()
+        do { try engine.start() } catch {
+            // Leave no tap behind: installing a second one on the same bus raises an exception.
+            input.removeTap(onBus: 0)
+            throw error
+        }
     }
 
     // MARK: File (integration testing through the same path)
@@ -198,11 +242,12 @@ public final class SpeechPipeline: @unchecked Sendable {
         chunks = cont
         consumer = Task.detached(priority: .utility) { [self] in
             for await chunk in stream { await self.process(chunk) }
-            await self.endSession()
+            if self.discarding.withLock({ $0 }) { await self.discardSession() } else { await self.endSession() }
         }
     }
 
     private func process(_ chunk: Chunk) async {
+        if discarding.withLock({ $0 }) { return }
         let lostAudio = dropped.withLock { v in defer { v = false }; return v }
         let restart = restartRequested.withLock { v in defer { v = false }; return v }
         var gapReason: String?

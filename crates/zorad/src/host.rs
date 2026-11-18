@@ -1,5 +1,6 @@
 //! Plugin host: implements docs/protocol.md for one plugin (spawned child on Linux, attached fds on macOS).
 
+use crate::pause::Listen;
 use crate::queue::{Class, Classify, InputQueue};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -117,7 +118,17 @@ pub enum ToPlugin {
         now_ns: Ns,
         config: Value,
     },
-    Start,
+    Start {
+        listening: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<f64>,
+    },
+    /// Listening was paused or resumed. Plugins with `transcript` release or reopen the microphone.
+    Listening {
+        listening: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        until: Option<f64>,
+    },
     Sync {
         id: u64,
         cutoff_ns: Ns,
@@ -203,6 +214,8 @@ pub struct PluginSpec {
     pub id: String,
     pub connection: Connection,
     pub config: Value,
+    /// Listening on/off, forwarded to the plugin as `start` and `listening` messages.
+    pub listen: tokio::sync::watch::Receiver<Listen>,
 }
 
 #[derive(Debug)]
@@ -539,7 +552,15 @@ async fn connected(
     mut stop: tokio::sync::watch::Receiver<bool>,
     mut broken: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), ProtocolError> {
-    out.send(&ToPlugin::Start).await?;
+    let mut listen = spec.listen.clone();
+    let initial = *listen.borrow_and_update();
+    out.send(&ToPlugin::Start {
+        listening: initial.listening,
+        until: initial.until,
+    })
+    .await?;
+    let mut listen_open = true;
+    let mut pending_listen: Option<Listen> = None;
     let control = |item: Item| {
         queue
             .send(item)
@@ -556,10 +577,26 @@ async fn connected(
     }
     let mut lease = tokio::time::Instant::now() + Duration::from_nanos(HEARTBEAT_LEASE as u64);
     loop {
+        if let Some(l) = pending_listen.take() {
+            out.send(&ToPlugin::Listening {
+                listening: l.listening,
+                until: l.until,
+            })
+            .await?;
+        }
         let msg = tokio::select! {
             m = read_message(lines, Duration::from_secs(24 * 3600)) => m?,
             _ = stop.wait_for(|s| *s) => return Err(ProtocolError("service shutdown".into())),
             _ = &mut broken => return Err(ProtocolError("plugin input closed".into())),
+            changed = listen.changed(), if listen_open => {
+                if changed.is_err() {
+                    listen_open = false;
+                    continue;
+                }
+                // Sent at the top of the loop: nothing may be awaited while the select output is alive.
+                pending_listen = Some(*listen.borrow_and_update());
+                continue;
+            }
             _ = tokio::time::sleep_until(lease), if dictation && st.healthy => {
                 // Missed heartbeats: suppression state is unknown from the last confirmed observation, and the
                 // core closes any open dictation, so a later healthy report must reopen it.
