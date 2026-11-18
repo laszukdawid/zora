@@ -5,7 +5,7 @@ Plugins are separate executables. They exchange **newline-delimited JSON** (one 
 - **Linux:** `zorad` starts each configured plugin, using the plugin's stdin and stdout for the protocol.
 - **macOS (inverted launch):** `Zora.app`'s main executable *is* the macOS plugin. It starts `zorad --attached-plugin`, handing over a pipe pair on file descriptors **3** (core reads) and **4** (core writes). This keeps microphone, speech and notification permissions with the app's own identity.
 
-Everything else is the same in both modes.
+Everything else is the same in both modes. In attached mode `zorad` also starts every other configured plugin as in Linux mode, but those may declare only `notify`: the app stays the one source of transcript and dictation.
 
 ## Clock
 
@@ -75,8 +75,10 @@ Rules:
 
 | Message | Fields |
 |---|---|
-| `notify` | `id, kind, title, body` |
+| `notify` | `id, kind, title, body`, and `job, harness` when the event is about a job |
 | `ack` (plugin → core) | `seq, generation, id, ok, error?` |
+
+`job` (the job id) is set for `commandQueued`, `jobStarted`, `jobSucceeded` and `jobFailed`, so a notifier can follow one command through its life; `harness` for the first two. Plugins ignore fields they don't know.
 
 At most 16 notifications may be awaiting an ack. The core never waits for an ack while processing policy.
 

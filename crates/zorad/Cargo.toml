@@ -12,6 +12,11 @@ path = "src/main.rs"
 name = "zora-script-plugin"
 path = "src/bin/script_plugin.rs"
 
+# Notify plugin that puts voice commands on the ACDC task board.
+[[bin]]
+name = "zora-acdc"
+path = "src/bin/zora-acdc/main.rs"
+
 [dependencies]
 zora-core = { path = "../zora-core" }
 serde.workspace = true

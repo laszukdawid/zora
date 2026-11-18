@@ -127,6 +127,10 @@ pub enum ToPlugin {
         kind: String,
         title: String,
         body: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        job: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        harness: Option<String>,
     },
     Clock {
         id: u64,
@@ -203,6 +207,8 @@ pub struct PluginSpec {
     pub id: String,
     pub connection: Connection,
     pub config: Value,
+    /// Capabilities this plugin may declare; `None` allows all. A plugin declaring others is rejected.
+    pub allowed: Option<Vec<&'static str>>,
 }
 
 #[derive(Debug)]
@@ -433,6 +439,13 @@ async fn session(
     if protocol != PROTOCOL || g != generation || clock != CLOCK_DOMAIN {
         return Err(ProtocolError(format!(
             "incompatible plugin (protocol {protocol}, clock {clock})"
+        )));
+    }
+    if let Some(allowed) = &spec.allowed
+        && let Some(c) = capabilities.iter().find(|c| !allowed.contains(&c.as_str()))
+    {
+        return Err(ProtocolError(format!(
+            "capability {c} is not allowed for this plugin"
         )));
     }
     let mut last_seq = 0u64;

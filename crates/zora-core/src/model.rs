@@ -149,6 +149,26 @@ impl ZoraEvent {
         }
     }
 
+    /// The job this event is about, for notifiers that track a command through its life.
+    pub fn job_id(&self) -> Option<&str> {
+        match self {
+            ZoraEvent::CommandQueued { id, .. }
+            | ZoraEvent::JobStarted { id, .. }
+            | ZoraEvent::JobSucceeded { id, .. }
+            | ZoraEvent::JobFailed { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn harness(&self) -> Option<&str> {
+        match self {
+            ZoraEvent::CommandQueued { harness, .. } | ZoraEvent::JobStarted { harness, .. } => {
+                Some(harness)
+            }
+            _ => None,
+        }
+    }
+
     /// Human-facing title and body (may contain prompt or summary text; never logged).
     pub fn display(&self) -> (String, String) {
         match self {

@@ -9,6 +9,7 @@ use zora_core::store::Store;
 
 const ZORAD: &str = env!("CARGO_BIN_EXE_zorad");
 const PLUGIN: &str = env!("CARGO_BIN_EXE_zora-script-plugin");
+const ACDC: &str = env!("CARGO_BIN_EXE_zora-acdc");
 
 struct Env {
     home: PathBuf,
@@ -557,4 +558,128 @@ fn stop_it_by_voice_cancels_the_running_job() {
         "{err}"
     );
     assert!(err.contains("stop requested by voice"), "{err}");
+}
+
+/// Requests the fake board saw: (path, Host header, JSON body).
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
+
+/// A stand-in for the ACDC board that records each request and answers like the board.
+fn fake_board() -> (u16, Seen) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            let (mut host, mut len) = (String::new(), 0usize);
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+                let lower = h.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("host:") {
+                    host = v.trim().into();
+                }
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            let _ = reader.read_exact(&mut body);
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let answer = if path == "/api/tasks" {
+                json!({"ok": true, "id": "task-1"})
+            } else {
+                json!({"ok": true})
+            }
+            .to_string();
+            log.lock().unwrap().push((path, host, body));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{answer}",
+                answer.len()
+            );
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn acdc_plugin_puts_the_command_on_the_board() {
+    let (port, seen) = fake_board();
+    let env = Env::new();
+    let path = env.config(
+        json!([{"delayMs": 3500, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 800}]),
+        "echo \"ran: $1\"",
+    );
+    let mut cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    cfg["plugins"]["acdc"] = json!({"command": [ACDC],
+                                    "config": {"url": format!("http://127.0.0.1:{port}/api"), "workspace": "w-test"}});
+    cfg["notifications"]["acdc"] =
+        json!(["commandQueued", "jobStarted", "jobSucceeded", "jobFailed"]);
+    std::fs::write(&path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+
+    let child = env.start(&path);
+    let reviewed = wait_for(Duration::from_secs(20), || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|(p, _, b)| p == "/api/tasks/task-1/status" && b["status"] == "review")
+            .then_some(())
+    });
+    let (code, err) = term_and_collect(child);
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        reviewed.is_some(),
+        "no review status; requests: {seen:#?}\nstderr:\n{err}"
+    );
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    let paths: Vec<&str> = seen
+        .iter()
+        .map(|(p, _, _)| p.as_str())
+        .filter(|p| *p != "/api/sources/poke")
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "/api/agents/zora",
+            "/api/tasks",
+            "/api/tasks/task-1/claim",
+            "/api/tasks/task-1/status",
+            "/api/agents/zora/bye"
+        ],
+        "{seen:#?}\nstderr:\n{err}"
+    );
+    let create = &seen.iter().find(|(p, _, _)| p == "/api/tasks").unwrap().2;
+    assert_eq!(create["title"], "say hi");
+    assert_eq!(create["workspace"], "w-test");
+    let status = &seen
+        .iter()
+        .find(|(p, _, _)| p.ends_with("/status"))
+        .unwrap()
+        .2;
+    assert!(
+        status["note"].as_str().unwrap().contains("ran: say hi"),
+        "{status}"
+    );
+    // The board only accepts its own Host header.
+    assert!(
+        seen.iter()
+            .all(|(_, h, _)| *h == format!("127.0.0.1:{port}"))
+    );
+    assert!(
+        !err.contains("say hi"),
+        "command text leaked into logs:\n{err}"
+    );
 }
