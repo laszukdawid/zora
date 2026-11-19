@@ -449,7 +449,7 @@ mod early_listening {
     use zora_core::clock::{SECOND, secs};
     use zora_core::config::Config;
     use zora_core::coordinator::{Coordinator, Effect, Input};
-    use zora_core::model::{Segment, ZoraEvent};
+    use zora_core::model::{DiscardReason, Segment, ZoraEvent};
     use zora_core::suppression::DictationSignal;
 
     fn listening(fx: &[Effect]) -> usize {
@@ -503,6 +503,56 @@ mod early_listening {
         let fx = c.handle(Input::Segment(seg), now + 3 * SECOND);
         assert_eq!(listening(&fx), 0, "{fx:?}");
         assert!(c.is_capturing());
+    }
+
+    #[test]
+    fn live_text_before_coverage_announces_nothing() {
+        let (mut c, t0) = setup();
+        let fx = c.handle(
+            Input::Partial {
+                text: "Hey Zora".into(),
+            },
+            t0 + SECOND,
+        );
+        assert_eq!(listening(&fx), 0, "{fx:?}");
+    }
+
+    #[test]
+    fn an_announced_capture_that_cannot_be_matched_is_reported_discarded() {
+        let (mut c, t0) = setup();
+        let now = t0 + 10 * SECOND;
+        assert_eq!(
+            listening(&c.handle(
+                Input::Partial {
+                    text: "Hey Zora".into()
+                },
+                now
+            )),
+            1
+        );
+        c.handle(Input::Dictation(DictationSignal::Began(now)), now);
+        c.handle(
+            Input::Dictation(DictationSignal::Ended(now + SECOND)),
+            now + SECOND,
+        );
+        let seg = Segment {
+            generation: 0,
+            session: 1,
+            start: now - SECOND,
+            end: now + SECOND,
+            text: "Hey Zora, say hi.".into(),
+        };
+        let fx = c.handle(Input::Segment(seg), now + 2 * SECOND);
+        assert!(
+            fx.iter().any(|e| matches!(
+                e,
+                Effect::Notify(ZoraEvent::CaptureDiscarded {
+                    reason: DiscardReason::Dictation
+                })
+            )),
+            "{fx:?}"
+        );
+        assert!(!c.is_capturing());
     }
 
     #[test]
