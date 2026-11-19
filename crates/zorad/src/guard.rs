@@ -217,7 +217,9 @@ pub fn guard_main() -> i32 {
         }
     };
     if let Err(why) = released {
-        group.kill();
+        if group.leader_waitable() {
+            group.kill();
+        }
         // Bounded: a leader that survives the kill leaves the job unverified, not the guard stuck.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -263,7 +265,9 @@ pub fn guard_main() -> i32 {
         }
         if kill_at.is_some_and(|t| std::time::Instant::now() >= t) {
             kill_at = None;
-            group.kill();
+            if group.leader_waitable() {
+                group.kill();
+            }
         }
         let from_core = matches!(
             rx.try_recv(),
@@ -275,7 +279,9 @@ pub fn guard_main() -> i32 {
                 // `zorad jobs cancel`: the core arms its cleanup deadline as for its own cancel.
                 send(&out, &GuardMsg::Cancelling);
             }
-            group.term();
+            if group.leader_waitable() {
+                group.term();
+            }
             kill_at = Some(std::time::Instant::now() + grace);
         }
     };

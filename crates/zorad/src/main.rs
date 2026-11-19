@@ -42,6 +42,8 @@ const USAGE: &str = "usage: zorad <command> [options]
                             %APPDATA%\\Zora\\config.json).";
 
 fn main() {
+    #[cfg(unix)]
+    os::default_sigchld();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("__guard") => std::process::exit(guard::guard_main()),

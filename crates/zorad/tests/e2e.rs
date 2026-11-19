@@ -615,6 +615,48 @@ fn shutdown_reaps_plugin_process_group() {
     assert_eq!(code, Some(0), "{err}");
 }
 
+/// Children are reaped by zorad, not the kernel, even when zorad inherits SIGCHLD ignored: only an unreaped
+/// leader keeps a group id from being reused, so the plugin's group is still cleaned up.
+#[cfg(unix)]
+#[test]
+fn shutdown_reaps_plugin_process_group_with_sigchld_ignored() {
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    let pidfile = env.home.join("plugin-child.pid");
+    let cfg = env.config_with(
+        json!([{"delayMs": 200, "spawnStubborn": pidfile.display().to_string()}]),
+        sh("echo ok", &["print", "ok"]),
+        json!({"lingerAfterStop": true}),
+    );
+    let mut c = env.cmd();
+    c.args(["run", "--config"])
+        .arg(&cfg)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: only an async-signal-safe call between fork and exec.
+    unsafe {
+        c.pre_exec(|| {
+            libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let child = c.spawn().unwrap();
+    let pid: i32 = wait_for(Duration::from_secs(10), || {
+        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+    })
+    .expect("plugin child not started");
+    let (code, err) = term_and_collect(child);
+    let gone = wait_for(Duration::from_secs(2), || (!alive(pid)).then_some(()));
+    if gone.is_none() {
+        sys::kill(pid);
+    }
+    assert!(
+        gone.is_some(),
+        "plugin descendant {pid} outlived zorad:\n{err}"
+    );
+    assert_eq!(code, Some(0), "{err}");
+}
+
 #[test]
 fn shutdown_during_negotiation_reaps_plugin_group() {
     let env = Env::new();
