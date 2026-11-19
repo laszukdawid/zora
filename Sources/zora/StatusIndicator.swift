@@ -343,13 +343,16 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         } else if listening == nil && state == .idle {
             symbol = "ellipsis"
             label = "Zora: starting…"
+        } else if paused && confirmed == false {
+            // A timeout wins over Pausing…: the warning matters most while the microphone is still open.
+            symbol = "exclamationmark.triangle"
+            label = "Zora: pause not confirmed"
+            detail = micOpen
+                ? "Zora's microphone is still open."
+                : "A transcript plugin didn't confirm that it closed its microphone."
         } else if pausing {
             symbol = "mic.badge.xmark"
             label = "Zora: pausing…"
-        } else if paused && confirmed == false {
-            symbol = "exclamationmark.triangle"
-            label = "Zora: pause not confirmed"
-            detail = "A transcript plugin didn't confirm that it closed its microphone."
         } else if !paused && micFailure != nil && state == .idle {
             symbol = "mic.slash.circle"
             label = "Zora: microphone unavailable"
