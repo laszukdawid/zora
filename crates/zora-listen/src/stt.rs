@@ -107,7 +107,8 @@ fn manifest(dir: &Path) -> Result<Option<Manifest>, String> {
         let [name, size, sum] = f[..] else {
             return Err(bad());
         };
-        let size: u64 = size.parse().map_err(|_| bad())?;
+        // Every model file has content, so a zero size can only be damage.
+        let size: u64 = size.parse().ok().filter(|n| *n > 0).ok_or_else(bad)?;
         let valid_sum = sum.len() == 64 && sum.bytes().all(|b| b.is_ascii_hexdigit());
         // Exactly one entry for each model file, and nothing else.
         if !valid_sum || !FILES.contains(&name) || entries.contains_key(name) {
@@ -601,6 +602,19 @@ mod tests {
         std::fs::write(live.join(MANIFEST), conflicting).unwrap();
         assert!(model_status(&live).unwrap_err().contains("damaged"));
         assert!(verify(&live).is_err());
+        // A zero-byte entry is damaged, even if the file on disk is empty to match.
+        let zeroed: String = good
+            .lines()
+            .map(|l| match l.split(' ').collect::<Vec<_>>()[..] {
+                [n, _, s] if n == name => format!("{n} 0 {s}\n"),
+                _ => format!("{l}\n"),
+            })
+            .collect();
+        std::fs::write(live.join(MANIFEST), zeroed).unwrap();
+        std::fs::write(live.join(name), b"").unwrap();
+        assert!(model_status(&live).is_err());
+        assert!(verify(&live).is_err());
+        assert!(prune(&serde_json::json!({"model": live})).is_err());
         // An entry for a file the model doesn't have is damaged too.
         std::fs::write(
             live.join(MANIFEST),

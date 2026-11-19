@@ -143,7 +143,12 @@ or turn the monitor off (below).
   running, when the connection drops or a round trip goes unanswered for 3 s (it reconnects every second), and when
   observations stall for more than 1.5 s. A node counts as unknown from its discovery until its properties show
   what it is; a capture stream that never names its app stays unknown for as long as it exists, so no command runs
-  meanwhile. A pure PulseAudio or ALSA system is not supported and stays unknown, so no command runs there.
+  meanwhile. A running dictation stream that disappears still counts as capturing (with health unknown) for 10 s,
+  because PipeWire also "removes" a node it merely hides from this client; if it comes back, even under another
+  name, it is still the dictation stream. A pure PulseAudio or ALSA system is not supported and stays unknown, so
+  no command runs there.
+- **Gate: dictation must be visible.** A capture stream that PipeWire permissions (a portal or permission manager)
+  hide from Zora can't be detected at all. The dictation tool must stay visible to the user's session.
 - **Speech model.** `zora-listen setup` installs into `<models>/versions/` (marked as setup's own) and points
   `<models>/<model>` at the new version with one atomic link rename, holding a lock so only one setup runs at a time.
   Setup never deletes a version. `zora-listen prune` removes all but the current one from that directory (and

@@ -205,10 +205,13 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                     .as_ref()
                     .and_then(|p| p.get("object.serial"))
                     .and_then(|v| v.parse().ok());
-                shared
-                    .borrow_mut()
-                    .graph
-                    .discovered(id, class, serial, now_ns());
+                {
+                    let sh = &mut *shared.borrow_mut();
+                    let msgs = sh.graph.discovered(id, class, serial, now_ns());
+                    if sh.broken.is_none() {
+                        sh.send(msgs);
+                    }
+                }
                 let Ok(node) = reg.bind::<Node, _>(obj) else {
                     eprintln!("zora-dictation: cannot bind node {id}");
                     return;
@@ -358,7 +361,8 @@ pub fn run(
             {
                 sh.fail(&format!("PipeWire round trip failed: {e}"), now);
             }
-            let msgs = sh.graph.monitor.tick(now);
+            let mut msgs = sh.graph.expire(now);
+            msgs.extend(sh.graph.monitor.tick(now));
             sh.send(msgs);
         })
     };
