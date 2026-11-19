@@ -270,7 +270,9 @@ impl JobManager {
             capture_limit: 64 * 1024,
             kill_grace_ms: self.kill_grace.as_millis() as u64,
             name: job.id.clone(),
-            cancel_marker: cancel_marker(&job.id).to_string_lossy().into_owned(),
+            cancel_marker: cancel_marker(&job.id)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         };
 
         let exe_self = std::env::current_exe().unwrap_or_else(|_| "zorad".into());
@@ -336,6 +338,10 @@ impl JobManager {
                         Ok(m @ GuardMsg::Exited { .. }) => exited = Some(m),
                         Ok(GuardMsg::Cleaned { ok }) => { cleaned = Some(ok); break; }
                         Ok(GuardMsg::Failed { error }) => failed = Some(error),
+                        Ok(GuardMsg::Cancelling) => {
+                            cancel_sent = true;
+                            give_up.get_or_insert(tokio::time::Instant::now() + stop_limit);
+                        }
                         Err(_) => {}
                     }
                 }
@@ -366,8 +372,7 @@ impl JobManager {
             if let Some(gp) = guard_pid {
                 os::kill_detached(gp);
             }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.kill()).await;
         }
 
         let cleanup_ok = match (cleaned, registration) {
@@ -396,7 +401,9 @@ impl JobManager {
             let _ = self.events.send(JobEvent::AdmissionClosed { reason });
         }
 
-        let _ = std::fs::remove_file(cancel_marker(&job.id));
+        if cleanup_ok {
+            remove_cancel_marker(&job.id);
+        }
         let result = match exited {
             _ if failed.is_some() => fail(failed.unwrap_or_default()),
             _ if timed_out => fail(format!("timed out after {}s", self.timeout.as_secs())),
@@ -418,9 +425,36 @@ impl JobManager {
     }
 }
 
-/// The file `zorad jobs cancel` creates to tell a Unix guard its job was cancelled.
-pub fn cancel_marker(id: &str) -> std::path::PathBuf {
-    crate::service::database_path().with_file_name(format!("cancel-{id}"))
+fn cancel_dir() -> std::path::PathBuf {
+    crate::service::database_path().with_file_name("cancel")
+}
+
+/// The file `zorad jobs cancel` creates to ask a Unix guard to cancel job `id` (Windows uses a named event).
+pub fn cancel_marker(id: &str) -> Option<std::path::PathBuf> {
+    let plain = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    plain.then(|| cancel_dir().join(id))
+}
+
+pub fn remove_cancel_marker(id: &str) {
+    if let Some(p) = cancel_marker(id) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Removes markers of jobs that are not live in the store.
+fn prune_cancel_markers(live: &HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(cancel_dir()) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !live.contains(&name) && e.file_type().is_ok_and(|t| !t.is_dir()) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 async fn send_guard(stdin: &mut Option<ChildStdin>, msg: CoreMsg) {
@@ -437,10 +471,14 @@ pub async fn recover(store: &StoreHandle) -> Result<usize, String> {
         .call(|s| s.non_final_jobs())
         .await
         .ok_or("store unavailable")??;
+    prune_cancel_markers(&jobs.iter().map(|j| j.id.clone()).collect());
     let mut recovered = 0;
     for job in jobs {
         let id = job.id.clone();
         let mark = |status: &'static str| {
+            if status == "interrupted" {
+                remove_cancel_marker(&id);
+            }
             let id = id.clone();
             store.send_critical(move |s| s.set_status(&id, status));
         };

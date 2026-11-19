@@ -1026,63 +1026,110 @@ fn an_invalid_config_exits_with_ex_config_and_settings_lists_the_problem() {
     assert_eq!(std::fs::read(&cfg).unwrap(), before);
 }
 
-#[test]
-fn a_job_cancelled_before_go_never_starts() {
-    use std::io::{BufRead, BufReader, Write};
-    let env = Env::new();
-    let started = env.home.join("started");
-    let marker = env.home.join("cancel-marker");
-    let name = uuid::Uuid::new_v4().to_string();
-    let argv: Vec<String> = if cfg!(windows) {
-        vec![
-            env!("CARGO_BIN_EXE_zora-test-harness").into(),
-            "touch".into(),
-            started.display().to_string(),
-        ]
-    } else {
-        vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            format!("echo started > {}", started.display()),
-        ]
-    };
-    let mut guard = Command::new(ZORAD)
-        .arg("__guard")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut to_guard = guard.stdin.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel::<Value>();
-    let from_guard = BufReader::new(guard.stdout.take().unwrap());
-    std::thread::spawn(move || {
-        for line in from_guard.lines().map_while(Result::ok) {
-            let _ = tx.send(serde_json::from_str(&line).unwrap_or(Value::Null));
-        }
-    });
-    let spec = json!({"t": "spec", "argv": argv, "cwd": env.home.join("ws"),
-                      "env": std::env::vars().collect::<Vec<_>>(), "capture_limit": 4096,
-                      "kill_grace_ms": 1000, "name": name, "cancel_marker": marker});
-    writeln!(to_guard, "{spec}").unwrap();
-    let registered = rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    assert_eq!(registered["t"], "registered", "{registered}");
+/// `zorad __guard` driven directly, as the core drives it.
+struct DirectGuard {
+    child: Child,
+    to: std::process::ChildStdin,
+    from: std::sync::mpsc::Receiver<Value>,
+    name: String,
+    marker: PathBuf,
+}
 
-    sys::request_cancel(&name, &marker);
-    writeln!(to_guard, "{}", json!({"t": "go"})).unwrap();
-    let mut seen = vec![];
-    while let Ok(m) = rx.recv_timeout(Duration::from_secs(10)) {
-        let done = m["t"] == "cleaned";
-        seen.push(m);
-        if done {
-            break;
+impl DirectGuard {
+    /// Starts a guard for a harness that creates `started` and then, with `wait`, keeps running.
+    fn start(env: &Env, started: &Path, wait: bool, pause_ms: Option<u64>) -> DirectGuard {
+        use std::io::{BufRead, BufReader, Write};
+        let argv: Vec<String> = if cfg!(windows) {
+            let mode = if wait { "touch-wait" } else { "touch" };
+            vec![
+                env!("CARGO_BIN_EXE_zora-test-harness").into(),
+                mode.into(),
+                started.display().to_string(),
+            ]
+        } else {
+            let then = if wait { "; sleep 30" } else { "" };
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("echo started > {}{then}", started.display()),
+            ]
+        };
+        let mut cmd = Command::new(ZORAD);
+        cmd.arg("__guard")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if let Some(ms) = pause_ms {
+            cmd.env("ZORA_TEST_PAUSE_BEFORE_RELEASE_MS", ms.to_string());
+        }
+        let mut child = cmd.spawn().unwrap();
+        let mut to = child.stdin.take().unwrap();
+        let (tx, from) = std::sync::mpsc::channel::<Value>();
+        let lines = BufReader::new(child.stdout.take().unwrap());
+        std::thread::spawn(move || {
+            for line in lines.lines().map_while(Result::ok) {
+                let _ = tx.send(serde_json::from_str(&line).unwrap_or(Value::Null));
+            }
+        });
+        let name = uuid::Uuid::new_v4().to_string();
+        let marker = env.home.join("cancel").join(&name);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let spec = json!({"t": "spec", "argv": argv, "cwd": env.home.join("ws"),
+                          "env": std::env::vars().collect::<Vec<_>>(), "capture_limit": 4096,
+                          "kill_grace_ms": 1000, "name": name, "cancel_marker": marker});
+        writeln!(to, "{spec}").unwrap();
+        let registered = from.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(registered["t"], "registered", "{registered}");
+        DirectGuard {
+            child,
+            to,
+            from,
+            name,
+            marker,
         }
     }
-    let _ = guard.wait();
+
+    fn go(&mut self) {
+        use std::io::Write;
+        writeln!(self.to, "{}", json!({"t": "go"})).unwrap();
+    }
+
+    fn cancel(&self) {
+        sys::request_cancel(&self.name, &self.marker);
+    }
+
+    /// Every message until `cleaned`.
+    fn finish(mut self) -> Vec<Value> {
+        let mut seen = vec![];
+        while let Ok(m) = self.from.recv_timeout(Duration::from_secs(20)) {
+            let done = m["t"] == "cleaned";
+            seen.push(m);
+            if done {
+                break;
+            }
+        }
+        let _ = self.child.wait();
+        seen
+    }
+}
+
+fn count(seen: &[Value], t: &str) -> usize {
+    seen.iter().filter(|m| m["t"] == t).count()
+}
+
+#[test]
+fn a_job_cancelled_before_go_never_starts() {
+    let env = Env::new();
+    let started = env.home.join("started");
+    let mut g = DirectGuard::start(&env, &started, false, None);
+    g.cancel();
+    g.go();
+    let seen = g.finish();
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         !started.exists(),
         "the harness ran after a cancel: {seen:?}"
     );
+    assert_eq!(count(&seen, "exited"), 1, "{seen:?}");
     assert!(
         seen.iter()
             .any(|m| m["t"] == "exited" && m["cancelled"] == true),
@@ -1092,4 +1139,57 @@ fn a_job_cancelled_before_go_never_starts() {
         seen.iter().any(|m| m["t"] == "cleaned" && m["ok"] == true),
         "{seen:?}"
     );
+}
+
+#[test]
+fn a_cancel_racing_the_release_has_one_outcome() {
+    let env = Env::new();
+    let started = env.home.join("started");
+    // The guard checks for a cancel, then pauses before releasing; the cancel lands in that pause.
+    let mut g = DirectGuard::start(&env, &started, true, Some(1500));
+    let t0 = Instant::now();
+    g.go();
+    std::thread::sleep(Duration::from_millis(500));
+    g.cancel();
+    let seen = g.finish();
+    // Released, then stopped by the guard itself: one exit, recorded cancelled, group gone, well before the
+    // harness's 30 s.
+    assert_eq!(count(&seen, "exited"), 1, "{seen:?}");
+    assert!(
+        seen.iter()
+            .any(|m| m["t"] == "exited" && m["cancelled"] == true),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|m| m["t"] == "cleaned" && m["ok"] == true),
+        "{seen:?}"
+    );
+    assert_eq!(count(&seen, "cancelling"), 1, "{seen:?}");
+    assert!(t0.elapsed() < Duration::from_secs(15), "{seen:?}");
+}
+
+#[test]
+fn clear_and_recovery_remove_cancel_markers() {
+    let env = Env::new();
+    let dir = env.db().parent().unwrap().join("cancel");
+    {
+        let mut s = Store::open(&env.db(), false).unwrap();
+        s.record_command("old", "x", "sh", "queued");
+        s.set_job_owner("old", "some-earlier-boot", 1, 1, 999_999, 1)
+            .unwrap();
+        s.record_command("stuck", "y", "sh", "queued");
+        s.set_status("stuck", "ambiguous");
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    for id in ["old", "stuck", "orphan"] {
+        std::fs::write(dir.join(id), b"").unwrap();
+    }
+    env.zorad(&["jobs", "clear", "stuck"]);
+    assert!(!dir.join("stuck").exists(), "jobs clear left its marker");
+    let child = env.start(&env.config(json!([]), sh("echo ok", &["print", "ok"])));
+    let recovered = wait_for(Duration::from_secs(15), || {
+        (!dir.join("old").exists() && !dir.join("orphan").exists()).then_some(())
+    });
+    let (_, err) = term_and_collect(child);
+    assert!(recovered.is_some(), "markers left after recovery:\n{err}");
 }

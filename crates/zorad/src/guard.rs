@@ -52,6 +52,8 @@ pub enum GuardMsg {
     Failed {
         error: String,
     },
+    /// A cancel request (`zorad jobs cancel`) reached the guard, which is stopping the job.
+    Cancelling,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -189,11 +191,30 @@ pub fn guard_main() -> i32 {
         },
     );
 
-    // Fence: nothing executes until the core has committed ownership and says go, and nobody has cancelled.
-    let released = match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Some(CoreMsg::Go)) if group.cancel_requested() => Err(Unreleased::Cancelled),
-        Ok(Some(CoreMsg::Go)) => held.release().map_err(Unreleased::Failed),
-        _ => Err(Unreleased::NoGo),
+    // Fence: nothing executes until the core has committed ownership and says go, and nobody has cancelled. This
+    // thread alone moves the job from held to released or cancelled; a cancel that comes after the release is
+    // handled below by stopping the running job.
+    let fence_end = std::time::Instant::now() + Duration::from_secs(5);
+    let released = loop {
+        if group.cancel_requested() {
+            break Err(Unreleased::Cancelled);
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Some(CoreMsg::Go)) => {
+                if group.cancel_requested() {
+                    break Err(Unreleased::Cancelled);
+                }
+                pause_before_release();
+                break held.release().map_err(Unreleased::Failed);
+            }
+            Ok(Some(CoreMsg::Cancel)) => break Err(Unreleased::Cancelled),
+            Ok(Some(CoreMsg::Spec(_))) => {}
+            Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break Err(Unreleased::NoGo),
+            Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() >= fence_end => {
+                break Err(Unreleased::NoGo);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
     };
     if let Err(why) = released {
         group.kill();
@@ -233,12 +254,16 @@ pub fn guard_main() -> i32 {
         if let Ok(s) = done_rx.recv_timeout(Duration::from_millis(100)) {
             break s;
         }
-        let stop = matches!(
+        let from_core = matches!(
             rx.try_recv(),
             Ok(Some(CoreMsg::Cancel)) | Ok(None) | Err(mpsc::TryRecvError::Disconnected)
-        ) || group.cancel_requested();
-        if stop && !cancelled {
+        );
+        if (from_core || group.cancel_requested()) && !cancelled {
             cancelled = true;
+            if !from_core {
+                // `zorad jobs cancel`: the core arms its cleanup deadline as for its own cancel.
+                send(&out, &GuardMsg::Cancelling);
+            }
             group.term();
             let (killer, killer_grace) = (group.clone(), grace);
             std::thread::spawn(move || {
@@ -274,6 +299,16 @@ pub fn guard_main() -> i32 {
     );
     send(&out, &GuardMsg::Cleaned { ok });
     if ok { 0 } else { 1 }
+}
+
+/// Tests only: widens the window between the guard's last cancel check and the release.
+fn pause_before_release() {
+    if let Some(ms) = std::env::var("ZORA_TEST_PAUSE_BEFORE_RELEASE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
 }
 
 /// Why the guard never released its job.
