@@ -149,7 +149,7 @@ impl Out {
     /// behind another write is dropped if it has gone stale meanwhile (a pause, say).
     pub fn send_if(&self, mut v: Value, still: impl FnOnce() -> bool) -> bool {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if st.broken || !still() {
+        if st.broken {
             return false;
         }
         let seq = st.seq + 1;
@@ -157,11 +157,17 @@ impl Out {
             o.insert("seq".into(), json!(seq));
             o.insert("generation".into(), json!(st.generation));
         }
-        if v.to_string().len() >= MAX_LINE {
+        let mut line = v.to_string();
+        if line.len() >= MAX_LINE {
+            return false;
+        }
+        line.push('\n');
+        // Last check before the bytes go out; only a write that blocks on a full pipe can still outlast it.
+        if !still() {
             return false;
         }
         st.seq = seq;
-        write_line(&mut st, &v)
+        write_bytes(&mut st, line.as_bytes())
     }
 
     pub fn is_broken(&self) -> bool {
@@ -175,7 +181,11 @@ fn write_line(st: &mut OutState, v: &Value) -> bool {
         return false;
     }
     line.push('\n');
-    if st.w.write_all(line.as_bytes()).is_err() || st.w.flush().is_err() {
+    write_bytes(st, line.as_bytes())
+}
+
+fn write_bytes(st: &mut OutState, bytes: &[u8]) -> bool {
+    if st.w.write_all(bytes).is_err() || st.w.flush().is_err() {
         st.broken = true;
         return false;
     }

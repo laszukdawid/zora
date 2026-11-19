@@ -63,6 +63,7 @@ impl AudioInput for CpalInput {
             .ok_or("no default input device")?;
         let supported = device.default_input_config().map_err(|e| e.to_string())?;
         let config: cpal::StreamConfig = supported.config();
+        let current = sink.clone();
         let stream = match supported.sample_format() {
             SampleFormat::F32 => build::<f32>(&device, config, sink),
             SampleFormat::I16 => build::<i16>(&device, config, sink),
@@ -72,6 +73,10 @@ impl AudioInput for CpalInput {
             f => return Err(format!("unsupported sample format {f}")),
         }
         .map_err(|e| e.to_string())?;
+        // A pause or a lost core since this open was asked for: never start the device.
+        if !current.current() {
+            return Ok(());
+        }
         stream.play().map_err(|e| e.to_string())?;
         eprintln!(
             "zora-listen: microphone open ({:?} host, {} Hz, {} ch)",

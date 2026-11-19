@@ -163,9 +163,16 @@ impl AudioSink {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
+
+    /// Whether the open that made this sink is still wanted: no pause, stop or lost core since.
+    pub fn current(&self) -> bool {
+        self.live.current(self.epoch)
+    }
 }
 
-/// A capture device. Implementations must stop delivering audio once `close` returns.
+/// A capture device. `open` builds the stream stopped and starts it only if `sink.current()` still holds right
+/// before starting; otherwise it returns `Ok` without starting (the controller closes it). Implementations must
+/// stop delivering audio once `close` returns.
 pub trait AudioInput {
     fn open(&mut self, sink: AudioSink) -> Result<(), String>;
     fn close(&mut self);
@@ -393,6 +400,10 @@ mod tests {
             if self.revoke_during_open.swap(false, Ordering::SeqCst) {
                 self.live.lock().unwrap().clone().unwrap().revoke();
             }
+            if !sink.current() {
+                self.log.lock().unwrap().push("built, not started".into());
+                return Ok(());
+            }
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 self.log.lock().unwrap().push("open failed".into());
                 return Err("no device".into());
@@ -503,7 +514,7 @@ mod tests {
         c.handle(MicEvent::Ready);
         c.handle(MicEvent::Start(true));
         assert!(!c.is_running());
-        assert_eq!(log(&input), ["open 1", "close at epoch 2"]);
+        assert_eq!(log(&input), ["built, not started", "close at epoch 2"]);
     }
 
     #[test]

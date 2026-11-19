@@ -386,6 +386,9 @@ impl FileInput {
 
 impl AudioInput for FileInput {
     fn open(&mut self, sink: AudioSink) -> Result<(), String> {
+        if !sink.current() {
+            return Ok(());
+        }
         let flag = Arc::new(AtomicBool::new(true));
         let (f, frames, pos) = (flag.clone(), self.frames.clone(), self.pos.clone());
         let (ch, rate) = (self.channels as usize, self.rate);
