@@ -873,6 +873,97 @@ fn speech_from_the_pause_that_arrives_after_resume_is_dropped() {
     assert_eq!(commands[0].1, "say hi");
 }
 
+impl Env {
+    /// `zorad settings set <change>` on `cfg`: exit code and stderr.
+    fn settings_set(&self, cfg: &Path, change: Value) -> (Option<i32>, String) {
+        let out = self
+            .cmd()
+            .args(["settings", "set", &change.to_string(), "--config"])
+            .arg(cfg)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn settings_set_changes_only_the_requested_keys() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let mut doc = read_json(&cfg);
+    doc["futureKey"] = json!({"from": "a newer zorad"});
+    std::fs::write(&cfg, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let (code, err) = env.settings_set(&cfg, json!({"wakeNames": ["Zora", "Jarvis"]}));
+    assert_eq!(code, Some(0), "{err}");
+    let after = read_json(&cfg);
+    assert_eq!(after["wakeNames"], json!(["zora", "jarvis"]));
+    doc["wakeNames"] = after["wakeNames"].clone();
+    assert_eq!(after, doc, "keys other than wakeNames changed");
+}
+
+#[test]
+fn a_settings_change_based_on_stale_values_is_refused() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let before = std::fs::read(&cfg).unwrap();
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"wakeNames": ["zora", "jarvis"], "expect": {"wakeNames": ["zora"]}}),
+    );
+    assert_eq!(code, Some(3), "{err}");
+    assert!(err.contains("wakeNames changed"), "{err}");
+    assert_eq!(
+        std::fs::read(&cfg).unwrap(),
+        before,
+        "a refused change wrote"
+    );
+    // The values actually loaded go through.
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"wakeNames": ["zora", "jarvis"], "expect": {"wakeNames": ["zora", "nova"]}}),
+    );
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(read_json(&cfg)["wakeNames"], json!(["zora", "jarvis"]));
+}
+
+#[test]
+fn concurrent_config_writers_do_not_lose_changes() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let names: Vec<String> = (0..8)
+        .map(|i| format!("name{}", "abcdefgh".as_bytes()[i] as char))
+        .collect();
+    let children: Vec<Child> = names
+        .iter()
+        .map(|n| {
+            env.cmd()
+                .args(["names", "add", n, "--config"])
+                .arg(&cfg)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut c in children {
+        assert!(c.wait().unwrap().success());
+    }
+    let have = read_json(&cfg)["wakeNames"].clone();
+    for n in &names {
+        assert!(
+            have.as_array().unwrap().contains(&json!(n)),
+            "{n} lost: {have}"
+        );
+    }
+}
+
 #[test]
 fn live_text_from_before_a_pause_does_not_notify_after_resume() {
     let env = Env::new();

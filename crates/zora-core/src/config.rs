@@ -302,34 +302,106 @@ impl Config {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        let data = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
-        // Unique per writer, so concurrent saves never write into the same temp file.
-        let tmp = path.with_extension(format!(
-            "json.{}.{}.tmp",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        // Private from the first byte (it may hold harness env values); a replaced file keeps its own mode.
-        {
-            use std::io::Write;
-            let mut f = create_private_file(&tmp).map_err(|e| e.to_string())?;
-            f.write_all(&data).map_err(|e| e.to_string())?;
-        }
-        if let Ok(meta) = std::fs::metadata(path)
-            && let Err(e) = std::fs::set_permissions(&tmp, meta.permissions())
-        {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.to_string());
-        }
-        std::fs::rename(&tmp, path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            e.to_string()
-        })
+        write_file(
+            path,
+            &serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?,
+        )
     }
 
+    /// Changes the config file in place: `edit` patches the file's own JSON, so keys it doesn't touch (including
+    /// ones this version doesn't know) are kept. `accept` sees the config before and after and may refuse. An
+    /// exclusive lock on `<config>.lock` is held from the read to the rename, so concurrent writers serialize.
+    pub fn update(
+        path: &Path,
+        edit: impl FnOnce(&mut serde_json::Value, &Config) -> Result<(), UpdateError>,
+        accept: impl FnOnce(&Config, &Config) -> Result<(), UpdateError>,
+    ) -> Result<Config, UpdateError> {
+        let io = |e: std::io::Error| UpdateError::Io(e.to_string());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(io)?;
+        }
+        let lock_path = path.with_extension("json.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(io)?;
+        lock.lock().map_err(io)?;
+        let mut doc = match std::fs::read(path) {
+            Ok(data) => serde_json::from_slice(&data)
+                .map_err(|e| UpdateError::Io(format!("cannot parse {}: {e}", path.display())))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::to_value(Config::default())
+                    .map_err(|e| UpdateError::Io(e.to_string()))?
+            }
+            Err(e) => {
+                return Err(UpdateError::Io(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+        if !doc.is_object() {
+            return Err(UpdateError::Io(format!(
+                "{} is not a JSON object",
+                path.display()
+            )));
+        }
+        let before: Config = serde_json::from_value(doc.clone())
+            .map_err(|e| UpdateError::Io(format!("cannot parse {}: {e}", path.display())))?;
+        edit(&mut doc, &before)?;
+        let after: Config = serde_json::from_value(doc.clone())
+            .map_err(|e| UpdateError::Invalid(vec![e.to_string()]))?;
+        accept(&before, &after)?;
+        let data = serde_json::to_vec_pretty(&doc).map_err(|e| UpdateError::Io(e.to_string()))?;
+        write_file(path, &data).map_err(UpdateError::Io)?;
+        drop(lock);
+        Ok(after)
+    }
+}
+
+/// Why `Config::update` changed nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateError {
+    /// The file no longer holds the values the caller expected (someone else changed it).
+    Conflict(String),
+    /// The change would make the config invalid.
+    Invalid(Vec<String>),
+    Io(String),
+}
+
+/// Writes through a private temp file and an atomic rename; a replaced file keeps its own mode.
+fn write_file(path: &Path, data: &[u8]) -> Result<(), String> {
+    // Unique per writer, so concurrent saves never write into the same temp file.
+    let tmp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    // Private from the first byte (it may hold harness env values); a replaced file keeps its own mode.
+    {
+        use std::io::Write;
+        let mut f = create_private_file(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(data).map_err(|e| e.to_string())?;
+    }
+    if let Ok(meta) = std::fs::metadata(path)
+        && let Err(e) = std::fs::set_permissions(&tmp, meta.permissions())
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
+impl Config {
     pub fn detector_config(&self) -> DetectorConfig {
         DetectorConfig::new(
             &self.phrases.start,
@@ -470,4 +542,51 @@ pub fn policy_problems(name: &str, h: &Harness) -> Vec<String> {
         )),
     }
     problems
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn update_patches_the_file_and_keeps_what_it_does_not_know() {
+        let dir = std::env::temp_dir().join(format!("zora-config-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"futureKey": {"a": 1}, "wakeNames": ["zora"], "retentionHours": 2}"#,
+        )
+        .unwrap();
+        let after = Config::update(
+            &path,
+            |doc, _| {
+                doc["wakeNames"] = json!(["zora", "nova"]);
+                Ok(())
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(after.wake_names, ["zora", "nova"]);
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc,
+            json!({"futureKey": {"a": 1}, "wakeNames": ["zora", "nova"], "retentionHours": 2})
+        );
+        // A refused change writes nothing.
+        let before = std::fs::read(&path).unwrap();
+        let refused = Config::update(
+            &path,
+            |doc, _| {
+                doc["wakeNames"] = json!([]);
+                Ok(())
+            },
+            |_, _| Err(UpdateError::Invalid(vec!["no".into()])),
+        );
+        assert!(refused.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

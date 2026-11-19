@@ -10,7 +10,7 @@ mod store_thread;
 
 use std::path::PathBuf;
 use zora_core::clock::{now_ns, secs};
-use zora_core::config::Config;
+use zora_core::config::{Config, UpdateError};
 use zora_core::coordinator::{Coordinator, Effect, Input};
 use zora_core::model::{Segment, ZoraEvent};
 use zora_core::store::Store;
@@ -34,6 +34,7 @@ const USAGE: &str = "usage: zorad <command> [options]
   settings [set <json>] [--dry-run]
                             Print, or change, the settings the menu bar edits, as JSON: wakeNames,
                             phrases {start,end,cancel} and workspace (of the default harness).
+                            An `expect` object with the values you loaded refuses (exit 3) if they changed.
                             --dry-run lists problems as `run --dry-run` sees them.
   simulate <script>         Feed a scripted transcript through the command logic (dry run).
 
@@ -227,42 +228,48 @@ fn cmd_transcript(rest: &[String]) -> i32 {
 
 fn cmd_names(path: Option<PathBuf>, rest: &[String]) -> i32 {
     let path = path.unwrap_or_else(Config::default_path);
-    let mut config = match load_config(Some(path.clone()), true) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("zorad: {e}");
-            return 1;
-        }
-    };
     let name = rest.get(1).map(|n| n.trim().to_lowercase());
-    match (rest.first().map(String::as_str), name) {
-        (None | Some("list"), _) => {}
-        (Some("add"), Some(n)) => {
-            if !config.wake_names.contains(&n) {
-                config.wake_names.push(n);
-            }
-        }
-        (Some("remove"), Some(n)) => config.wake_names.retain(|x| x != &n),
+    let change = match (rest.first().map(String::as_str), name) {
+        (None | Some("list"), _) => None,
+        (Some("add"), Some(n)) => Some((true, n)),
+        (Some("remove"), Some(n)) => Some((false, n)),
         _ => {
             eprintln!("usage: zorad names [list | add <name> | remove <name>]");
             return 2;
         }
-    }
-    if rest.first().is_some_and(|c| c != "list") {
-        let problems = config
-            .validate()
-            .into_iter()
-            .filter(|p| p.contains("wakeNames"))
-            .collect::<Vec<_>>();
-        if !problems.is_empty() {
-            problems.iter().for_each(|p| eprintln!("{p}"));
-            return 2;
-        }
-        if let Err(e) = config.write(&path) {
-            eprintln!("zorad: {e}");
-            return 1;
-        }
-    }
+    };
+    let config = match change {
+        None => load_config(Some(path.clone()), true).map_err(UpdateError::Io),
+        Some((add, n)) => Config::update(
+            &path,
+            |doc, before| {
+                let mut names = before.wake_names.clone();
+                if !add {
+                    names.retain(|x| x != &n);
+                } else if !names.contains(&n) {
+                    names.push(n);
+                }
+                doc["wakeNames"] = serde_json::json!(names);
+                Ok(())
+            },
+            |_, after| {
+                let problems: Vec<String> = after
+                    .validate()
+                    .into_iter()
+                    .filter(|p| p.contains("wakeNames"))
+                    .collect();
+                if problems.is_empty() {
+                    Ok(())
+                } else {
+                    Err(UpdateError::Invalid(problems))
+                }
+            },
+        ),
+    };
+    let config = match config {
+        Ok(c) => c,
+        Err(e) => return report_update_error("names", e),
+    };
     println!("Zora answers to: {}", config.wake_names.join(", "));
     println!(
         "Say \"Hey <name> … Do it <name>\". Changes apply within a second; no restart needed."
@@ -375,6 +382,77 @@ struct SettingsChange {
     wake_names: Option<Vec<String>>,
     phrases: Option<PhrasesChange>,
     workspace: Option<String>,
+    /// The values the editor loaded for the fields it changes; the change is refused if the file differs.
+    expect: Option<SettingsExpect>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct SettingsExpect {
+    wake_names: Option<Vec<String>>,
+    phrases: Option<PhrasesChange>,
+    workspace: Option<String>,
+}
+
+/// Exit code of `settings set` when the file changed since the caller loaded it.
+const EXIT_CONFLICT: i32 = 3;
+
+fn report_update_error(what: &str, e: UpdateError) -> i32 {
+    match e {
+        UpdateError::Conflict(fields) => {
+            eprintln!(
+                "{what}: {fields} changed since the settings were loaded; nothing was saved. Load them again and retry."
+            );
+            EXIT_CONFLICT
+        }
+        UpdateError::Invalid(problems) => {
+            problems.iter().for_each(|p| eprintln!("{p}"));
+            2
+        }
+        UpdateError::Io(e) => {
+            eprintln!("zorad: {e}");
+            1
+        }
+    }
+}
+
+fn workspace_of(config: &Config) -> Option<&String> {
+    config
+        .harnesses
+        .get(&config.default_harness)
+        .map(|h| &h.workspace)
+}
+
+/// The fields whose current value differs from what the caller expected.
+fn conflicts(expect: &SettingsExpect, current: &Config) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if expect
+        .wake_names
+        .as_ref()
+        .is_some_and(|n| *n != current.wake_names)
+    {
+        out.push("wakeNames");
+    }
+    if let Some(p) = &expect.phrases {
+        let ph = &current.phrases;
+        for (name, want, have) in [
+            ("phrases.start", &p.start, &ph.start),
+            ("phrases.end", &p.end, &ph.end),
+            ("phrases.cancel", &p.cancel, &ph.cancel),
+        ] {
+            if want.as_ref().is_some_and(|w| w != have) {
+                out.push(name);
+            }
+        }
+    }
+    if expect
+        .workspace
+        .as_ref()
+        .is_some_and(|w| Some(w) != workspace_of(current))
+    {
+        out.push("workspace");
+    }
+    out
 }
 
 #[derive(serde::Deserialize)]
@@ -424,18 +502,11 @@ fn clean_list(items: Vec<String>) -> Vec<String> {
 fn cmd_settings(path: Option<PathBuf>, rest: &[String]) -> i32 {
     let original_len = rest.len();
     let path = path.unwrap_or_else(Config::default_path);
-    let mut config = match load_config(Some(path.clone()), true) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("zorad: {e}");
-            return 1;
-        }
-    };
     // `--dry-run`: report problems the way `zorad run --dry-run` sees them.
     let rest: Vec<&String> = rest.iter().filter(|a| *a != "--dry-run").collect();
     let dry_run = rest.len() < original_len;
-    match (rest.first().map(|a| a.as_str()), rest.get(1)) {
-        (None, _) => {}
+    let config = match (rest.first().map(|a| a.as_str()), rest.get(1)) {
+        (None, _) => load_config(Some(path.clone()), true).map_err(UpdateError::Io),
         (Some("set"), Some(json)) => {
             let change: SettingsChange = match serde_json::from_str(json) {
                 Ok(c) => c,
@@ -444,54 +515,79 @@ fn cmd_settings(path: Option<PathBuf>, rest: &[String]) -> i32 {
                     return 2;
                 }
             };
-            let before = config.validate();
-            if let Some(names) = change.wake_names {
-                config.wake_names = clean_list(names);
-            }
-            if let Some(p) = change.phrases {
-                let ph = &mut config.phrases;
-                for (new, old) in [
-                    (p.start, &mut ph.start),
-                    (p.end, &mut ph.end),
-                    (p.cancel, &mut ph.cancel),
-                ] {
-                    if let Some(new) = new {
-                        *old = clean_list(new);
+            Config::update(
+                &path,
+                |doc, before| apply_settings(change, doc, before),
+                |before, after| {
+                    // Only problems this change introduces block it; an older, unrelated one must not stop a rename.
+                    let old = before.validate();
+                    let new: Vec<String> = after
+                        .validate()
+                        .into_iter()
+                        .filter(|p| !old.contains(p))
+                        .collect();
+                    if new.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(UpdateError::Invalid(new))
                     }
-                }
-            }
-            if let Some(ws) = change.workspace {
-                let id = config.default_harness.clone();
-                match config.harnesses.get_mut(&id) {
-                    Some(h) => h.workspace = ws.trim().to_string(),
-                    None => {
-                        eprintln!("settings: defaultHarness '{id}' is not defined in harnesses");
-                        return 2;
-                    }
-                }
-            }
-            // Only problems this change introduces block it; an unrelated, older problem must not stop a rename.
-            let new: Vec<String> = config
-                .validate()
-                .into_iter()
-                .filter(|p| !before.contains(p))
-                .collect();
-            if !new.is_empty() {
-                new.iter().for_each(|p| eprintln!("{p}"));
-                return 2;
-            }
-            if let Err(e) = config.write(&path) {
-                eprintln!("zorad: {e}");
-                return 1;
-            }
+                },
+            )
         }
         _ => {
             eprintln!("usage: zorad settings [set '<json>']");
             return 2;
         }
+    };
+    match config {
+        Ok(config) => {
+            println!("{}", settings_json(&config, &path, dry_run));
+            0
+        }
+        Err(e) => report_update_error("settings", e),
     }
-    println!("{}", settings_json(&config, &path, dry_run));
-    0
+}
+
+/// Writes the requested fields into the config file's JSON, after checking `expect` against the current file.
+fn apply_settings(
+    change: SettingsChange,
+    doc: &mut serde_json::Value,
+    before: &Config,
+) -> Result<(), UpdateError> {
+    use serde_json::json;
+    if let Some(expect) = &change.expect {
+        let changed = conflicts(expect, before);
+        if !changed.is_empty() {
+            return Err(UpdateError::Conflict(changed.join(", ")));
+        }
+    }
+    if let Some(names) = change.wake_names {
+        doc["wakeNames"] = json!(clean_list(names));
+    }
+    if let Some(p) = change.phrases {
+        if !doc["phrases"].is_object() {
+            doc["phrases"] = json!(before.phrases);
+        }
+        for (key, new) in [("start", p.start), ("end", p.end), ("cancel", p.cancel)] {
+            if let Some(new) = new {
+                doc["phrases"][key] = json!(clean_list(new));
+            }
+        }
+    }
+    if let Some(ws) = change.workspace {
+        let id = before.default_harness.clone();
+        if workspace_of(before).is_none() {
+            return Err(UpdateError::Invalid(vec![format!(
+                "settings: defaultHarness '{id}' is not defined in harnesses"
+            )]));
+        }
+        // Harnesses that come from the defaults are written out, so the patched one keeps its other settings.
+        if !doc["harnesses"][&id].is_object() {
+            doc["harnesses"] = json!(before.harnesses);
+        }
+        doc["harnesses"][&id]["workspace"] = json!(ws.trim());
+    }
+    Ok(())
 }
 
 /// "90", "90s", "30m" or "2h" in seconds; finite and non-negative only.
