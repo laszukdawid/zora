@@ -160,6 +160,8 @@ pub struct PauseTracker {
     pending: Option<Pending>,
     waiting: BTreeSet<String>,
     unreaped: BTreeSet<(String, u64)>,
+    /// Waiting because they reported the microphone open while paused.
+    reopened: BTreeSet<String>,
     confirmed: Option<bool>,
 }
 
@@ -185,12 +187,14 @@ impl PauseTracker {
             reported: BTreeSet::new(),
         });
         self.waiting = transcript.into_iter().collect();
+        self.reopened.clear();
         self.confirmed = None;
     }
 
     pub fn resume(&mut self) {
         self.pending = None;
         self.waiting.clear();
+        self.reopened.clear();
         self.confirmed = None;
     }
 
@@ -204,15 +208,27 @@ impl PauseTracker {
     /// `mic{open: false}` for the current pause.
     pub fn closed(&mut self, id: &str) {
         self.waiting.remove(id);
+        self.reopened.remove(id);
+    }
+
+    /// `mic{open: true}` during the pause: unconfirmed at once, and reported again.
+    pub fn opened(&mut self, id: &str, now: Instant) {
+        if let Some(p) = &mut self.pending {
+            p.deadline = p.deadline.min(now);
+            p.reported.remove(id);
+            self.waiting.insert(id.to_string());
+            self.reopened.insert(id.to_string());
+        }
     }
 
     /// A connection ended. Only a verified reap counts as closed; otherwise a group that may hold a microphone is
     /// counted until `reaped`.
     pub fn down(&mut self, id: &str, generation: u64, reaped: bool, may_record: bool) {
-        if reaped {
+        if reaped || may_record {
             self.waiting.remove(id);
-        } else if may_record {
-            self.waiting.remove(id);
+            self.reopened.remove(id);
+        }
+        if !reaped && may_record {
             self.unreaped.insert((id.to_string(), generation));
         }
     }
@@ -229,10 +245,12 @@ impl PauseTracker {
             .waiting
             .iter()
             .map(|id| {
-                (
-                    id.clone(),
-                    format!("plugin {id} did not confirm its microphone is off"),
-                )
+                let reason = if self.reopened.contains(id) {
+                    format!("plugin {id} opened its microphone while paused")
+                } else {
+                    format!("plugin {id} did not confirm its microphone is off")
+                };
+                (id.clone(), reason)
             })
             .chain(self.unreaped.iter().map(|(id, g)| {
                 (
@@ -299,6 +317,24 @@ mod tests {
             t.evaluate(now + Duration::from_secs(7)),
             Some((true, vec![]))
         );
+    }
+
+    #[test]
+    fn a_microphone_reopened_while_paused_unconfirms_at_once_until_closed_again() {
+        let now = Instant::now();
+        let mut t = tracker_at(now + Duration::from_secs(5));
+        t.closed("macos");
+        t.closed("listen");
+        assert_eq!(t.evaluate(now), Some((true, vec![])));
+        t.opened("listen", now);
+        let (confirmed, report) = t.evaluate(now).unwrap();
+        assert!(!confirmed);
+        assert_eq!(report, ["plugin listen opened its microphone while paused"]);
+        t.closed("listen");
+        assert_eq!(t.evaluate(now), Some((true, vec![])));
+        // A second reopen is reported again.
+        t.opened("listen", now);
+        assert_eq!(t.evaluate(now).unwrap().1.len(), 1);
     }
 
     #[test]

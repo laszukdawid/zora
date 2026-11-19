@@ -173,6 +173,12 @@ impl Group {
         reap_group_blocking(self.0, grace)
     }
 
+    /// For a group that already failed to reap: only checks whether it is gone, never signals it, since its
+    /// number may since belong to an unrelated group.
+    pub fn retry_reap(&self) -> bool {
+        group_empty(self.0)
+    }
+
     /// Whether `zorad jobs cancel` left this job's cancel marker.
     pub fn cancel_requested(&self) -> bool {
         self.1.as_deref().is_some_and(marker_present)

@@ -22,7 +22,7 @@ const HEARTBEAT_LEASE: Ns = 6 * SECOND;
 const PAUSED_OUT: &str = "stopped while paused";
 /// A spawned transcript plugin that hasn't confirmed a pause by then is stopped, however its connection is doing.
 /// Longer than the service's 5 s, so the service reports it first.
-const PAUSE_STOP: Duration = Duration::from_secs(7);
+const PAUSE_STOP: Duration = Duration::from_secs(8);
 /// A plugin that doesn't take a message within this long isn't reading its input.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -414,7 +414,7 @@ pub async fn run_plugin(
     }
 }
 
-/// Keeps trying to reap a group that outlived its plugin; the pause counts it until this succeeds.
+/// Keeps checking a group that outlived its plugin; the pause counts it until it is gone.
 async fn reap_later(
     group: crate::os::Group,
     id: String,
@@ -430,7 +430,7 @@ async fn reap_later(
         }
         let Some(g) = group.take() else { return };
         let Ok((g, ok)) = tokio::task::spawn_blocking(move || {
-            let ok = g.reap_blocking(Duration::ZERO);
+            let ok = g.retry_reap();
             (g, ok)
         })
         .await
@@ -765,8 +765,6 @@ async fn connected(
     }
     // The listening epoch of this connection (docs/protocol.md): 1 in `start`, +1 per on/off transition.
     let mut epoch = 1u64;
-    // The plugin reported its microphone closed in the current epoch.
-    let mut mic_closed = false;
     out.send(&ToPlugin::Start {
         listening: sent.listen.listening,
         until: sent.listen.until,
@@ -802,7 +800,6 @@ async fn connected(
         if let Some(next) = pending_listen.take() {
             let (new_epoch, msg) = listening_update(&sent, &next, epoch);
             if new_epoch != epoch {
-                mic_closed = false;
                 // The deadline runs from here, whether or not the plugin takes the message.
                 stop_at = (enforce && !next.listen.listening)
                     .then(|| tokio::time::Instant::now() + PAUSE_STOP);
@@ -817,14 +814,8 @@ async fn connected(
             } else {
                 out.send(&msg).await?;
             }
-            if !sent.listen.listening {
-                if stop_when_paused {
-                    return paused_out();
-                }
-                // The core gave up waiting (and notified the user); a spawned plugin is stopped.
-                if transcript && sent.confirmed == Some(false) && !mic_closed && !attached {
-                    return Err(ProtocolError(PAUSED_OUT.into()));
-                }
+            if !sent.listen.listening && stop_when_paused {
+                return paused_out();
             }
         }
         let msg = tokio::select! {
@@ -949,18 +940,12 @@ async fn connected(
                         open,
                     })?;
                     if !sent.listen.listening {
-                        mic_closed = !open;
-                        if mic_closed {
+                        if !open {
                             stop_at = None;
                         }
-                        if open {
-                            control(Item::Notice(format!(
-                                "plugin {} opened its microphone while paused",
-                                spec.id
-                            )))?;
-                            if !attached {
-                                return Err(ProtocolError(PAUSED_OUT.into()));
-                            }
+                        // The service reports it and un-confirms the pause.
+                        if open && !attached {
+                            return Err(ProtocolError(PAUSED_OUT.into()));
                         }
                     }
                 }

@@ -121,8 +121,10 @@ invalidates everything before it, so a plugin still listening under an older epo
   dropped. The attached macOS app can't be stopped; it must close its engine on its own on a pause or when the
   connection is lost, and the core only reports a missing confirmation. Each failure sends a `degraded`
   notification naming the plugin. Confirmations and timeouts for an epoch that is no longer current are ignored. A
-  `mic{open: true}` for a paused epoch is a failure too: a spawned plugin is stopped until resume. The core stops a
-  spawned plugin that hasn't confirmed within a few seconds even if the plugin isn't reading its input. Only a
+  `mic{open: true}` for a paused epoch is a failure too: the core repeats `confirmed: false` at once and reports it,
+  a spawned plugin is stopped until resume, and an attached app's later `mic{open: false}` confirms the pause again.
+  The core stops a spawned plugin on its own deadline of a few seconds (also if it isn't reading its input), not on
+  the 5 s report, so a late confirmation keeps it running. Only a
   confirmation or a verified reap of the plugin's processes counts as closed; an attached app that disconnects, or
   a plugin whose processes couldn't be reaped, leaves the pause unconfirmed (`confirmed: false` and `degraded`). A
   group that couldn't be reaped keeps counting, in later pauses too, until it is verified gone; a new connection of
