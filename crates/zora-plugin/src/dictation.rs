@@ -172,6 +172,8 @@ impl Msg {
 }
 
 pub const STALL: Ns = 1500 * MILLI;
+/// How long a running dictation stream that disappeared still counts as capturing.
+pub const VANISH_LIMIT: Ns = 10 * SECOND;
 pub const HEARTBEAT: Ns = 2 * SECOND;
 
 /// Health and capture state. Starts unknown (unhealthy) and becomes healthy only after a complete snapshot.
@@ -336,6 +338,10 @@ pub struct Graph {
     serials: std::collections::HashMap<u32, u64>,
     /// The server those serials belong to.
     server: Option<String>,
+    /// Running dictation streams that disappeared (PipeWire also removes a node it merely hides from this client),
+    /// with their serial and since when: still capturing and a blind spot until they return or `VANISH_LIMIT`
+    /// passes.
+    vanished: Vec<(Option<u64>, Ns)>,
     /// Blind spots opened by an identity change on a running node: they close when it stops or goes away.
     until_stopped: std::collections::HashSet<u32>,
 }
@@ -351,6 +357,7 @@ impl Graph {
             matched_serials: Default::default(),
             serials: Default::default(),
             server: None,
+            vanished: Vec::new(),
             until_stopped: Default::default(),
         }
     }
@@ -368,15 +375,48 @@ impl Graph {
     }
 
     /// A node appeared. `media_class` and `serial` (`object.serial`) are from its registry entry.
-    pub fn discovered(&mut self, id: u32, media_class: Option<&str>, serial: Option<u64>, now: Ns) {
+    pub fn discovered(
+        &mut self,
+        id: u32,
+        media_class: Option<&str>,
+        serial: Option<u64>,
+        now: Ns,
+    ) -> Vec<Msg> {
+        let mut out = vec![];
         if let Some(serial) = serial {
             self.serials.insert(id, serial);
+            // A vanished recorder is back: the time it was hidden is unknown.
+            if let Some(i) = self.vanished.iter().position(|(s, _)| *s == Some(serial)) {
+                let (_, since) = self.vanished.remove(i);
+                out.push(Msg::Unknown {
+                    from_ns: since,
+                    to_ns: now,
+                });
+            }
         }
         let node = self.streams.entry(id).or_default();
         node.global_class = media_class.map(String::from);
         if node.effective(&self.apps) != Class::Irrelevant {
             self.blind.insert(id, now);
         }
+        out
+    }
+
+    /// Ends vanished recorders that stayed away for `VANISH_LIMIT`: unknown for that time, then `ended`.
+    pub fn expire(&mut self, now: Ns) -> Vec<Msg> {
+        let mut out = vec![];
+        self.vanished.retain(|(_, since)| {
+            if now - since < VANISH_LIMIT {
+                return true;
+            }
+            out.push(Msg::Unknown {
+                from_ns: *since,
+                to_ns: now,
+            });
+            false
+        });
+        out.extend(self.edges(now));
+        out
     }
 
     /// Whether the node has delivered info before (its first info carries every property).
@@ -445,13 +485,18 @@ impl Graph {
         out
     }
 
+    /// The node is gone from this client's view. That may be a permission change rather than its end, so a
+    /// recorder that was running is kept as vanished (still capturing) instead of ending at once, and its serial
+    /// keeps matching for the server's lifetime.
     pub fn removed(&mut self, id: u32, now: Ns) -> Vec<Msg> {
         let driver = self.streams.get(&id).is_some_and(StreamNode::is_driver);
+        let was_dictating = self.dictating(id);
         let mut out = self.close_blind(id, driver, now);
         self.streams.remove(&id);
         self.sticky.remove(&id);
-        if let Some(serial) = self.serials.remove(&id) {
-            self.matched_serials.remove(&serial);
+        let serial = self.serials.remove(&id);
+        if was_dictating {
+            self.vanished.push((serial, now));
         }
         out.extend(self.edges(now));
         out
@@ -469,7 +514,7 @@ impl Graph {
     }
 
     pub fn complete(&self) -> bool {
-        self.blind.is_empty()
+        self.blind.is_empty() && self.vanished.is_empty()
     }
 
     /// The node is running and is (or once was) a configured dictation app's capture stream.
@@ -491,7 +536,7 @@ impl Graph {
     }
 
     pub fn capturing(&self) -> bool {
-        self.streams.keys().any(|id| self.dictating(*id))
+        !self.vanished.is_empty() || self.streams.keys().any(|id| self.dictating(*id))
     }
 
     pub fn node(&self, id: u32) -> Option<&StreamNode> {
@@ -595,7 +640,7 @@ mod tests {
 
     impl Graph {
         fn discovered_t(&mut self, id: u32, class: Option<&str>, now: Ns) {
-            self.discovered(id, class, None, now);
+            let _ = self.discovered(id, class, None, now);
         }
     }
 
@@ -843,8 +888,9 @@ mod tests {
                 ..
             }
         ));
-        // Removal forgets it; a new node with the generic name alone is not matching.
+        // Removal (after the vanish limit) forgets it; a new node with the generic name alone is not matching.
         g.removed(1, later + 300 * MILLI);
+        g.expire(later + 300 * MILLI + VANISH_LIMIT);
         g.discovered_t(2, Some(CAPTURE_CLASS), later);
         g.info(2, Some(generic), true, later + 400 * MILLI);
         assert!(!g.capturing());
@@ -863,25 +909,25 @@ mod tests {
         ];
         let mut g = graph(t);
         g.server("pipewire-0:1234");
-        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t);
+        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t);
         g.info(5, Some(rec), true, t);
         assert!(g.capturing());
         // The connection drops and comes back to the same server; the node now shows only a generic name.
         g.clear();
         g.server("pipewire-0:1234");
-        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 5 * SECOND);
+        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 5 * SECOND);
         g.info(5, Some(generic), true, t + 5 * SECOND);
         assert!(g.capturing(), "still the recorder");
         // A restarted server reuses nothing: the same serial there is another node.
         g.clear();
         g.server("pipewire-0:9999");
-        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 9 * SECOND);
+        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 9 * SECOND);
         g.info(5, Some(generic), true, t + 9 * SECOND);
         assert!(!g.capturing());
         // The serial can also come from the info properties.
         let mut g = graph(t);
         g.server("s");
-        g.discovered(1, Some(CAPTURE_CLASS), None, t);
+        let _ = g.discovered(1, Some(CAPTURE_CLASS), None, t);
         let with_serial = [
             ("media.class", CAPTURE_CLASS),
             ("application.process.binary", REC),
@@ -890,8 +936,52 @@ mod tests {
         g.info(1, Some(with_serial), true, t);
         g.clear();
         g.server("s");
-        g.discovered(1, Some(CAPTURE_CLASS), Some(42), t + SECOND);
+        let _ = g.discovered(1, Some(CAPTURE_CLASS), Some(42), t + SECOND);
         g.info(1, Some(generic), true, t + SECOND);
+        assert!(g.capturing());
+    }
+
+    #[test]
+    fn a_running_recorder_hidden_and_shown_again_keeps_capturing() {
+        let t = 10 * SECOND;
+        let rec = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.process.binary", REC),
+        ];
+        let generic = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.name", "Recorder"),
+        ];
+        let mut g = graph(t);
+        g.server("s");
+        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t);
+        g.info(5, Some(rec), true, t);
+        // PipeWire hides it (global_remove): no `ended`, still capturing, health unknown.
+        let out = g.removed(5, t + SECOND);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(g.capturing() && !g.complete());
+        assert!(g.expire(t + 5 * SECOND).is_empty());
+        // Shown again with only a generic name: the hidden time is unknown, and it still counts.
+        let out = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 6 * SECOND);
+        assert_eq!(out, [unknown(t + SECOND, t + 6 * SECOND)]);
+        g.info(5, Some(generic), true, t + 6 * SECOND);
+        assert!(g.capturing() && g.complete());
+        // Hidden again and never back: after the limit, unknown for that time, then ended.
+        g.removed(5, t + 7 * SECOND);
+        assert!(g.expire(t + 16 * SECOND).is_empty());
+        let out = g.expire(t + 17 * SECOND);
+        assert_eq!(out[0], unknown(t + 7 * SECOND, t + 17 * SECOND));
+        assert_eq!(
+            out.last(),
+            Some(&Msg::Dictation {
+                began: false,
+                at_ns: t + 17 * SECOND
+            })
+        );
+        assert!(!g.capturing() && g.complete());
+        // Its serial still matches for the server's lifetime.
+        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 20 * SECOND);
+        g.info(5, Some(generic), true, t + 20 * SECOND);
         assert!(g.capturing());
     }
 
@@ -954,13 +1044,12 @@ mod tests {
         assert!(g.complete() && g.known(3));
         let out = g.info(3, NONE, true, t + SECOND);
         assert!(matches!(out[0], Msg::Dictation { began: true, .. }));
-        let out = g.removed(3, t + 1200 * MILLI);
-        assert_eq!(
-            out,
-            [Msg::Dictation {
-                began: false,
-                at_ns: t + 1200 * MILLI
-            }]
+        // Removed while running: it may only be hidden, so it ends after the vanish limit.
+        assert!(g.removed(3, t + 1200 * MILLI).is_empty());
+        let out = g.expire(t + 1200 * MILLI + VANISH_LIMIT);
+        assert!(
+            matches!(out.last(), Some(Msg::Dictation { began: false, .. })),
+            "{out:?}"
         );
     }
 
