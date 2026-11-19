@@ -365,7 +365,7 @@ final class Bridge: @unchecked Sendable {
             let wanted = coreListening == true && !localPause
             return (micToken, wanted ? CaptureTag(connection: connection, epoch: coreEpoch ?? 0) : nil, self.pipeline)
         }
-        // Outside `lock`: the pipeline may hold its engine lock while calling back into the bridge.
+        // Outside `lock`, which is never held while calling into the pipeline.
         pipeline?.setGrant(grant, seq: token)
         return token
     }
@@ -386,21 +386,23 @@ final class Bridge: @unchecked Sendable {
         let until = (msg["until"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
         let epoch = (msg["epoch"] as? NSNumber)?.uint64Value
         let confirmed = msg["confirmed"] as? Bool
-        let current: Bool = lock.withLock {
-            guard conn == connection else { return false }
+        let (current, changed): (Bool, Bool) = lock.withLock {
+            guard conn == connection else { return (false, false) }
+            let changed = coreListening != on || coreEpoch != epoch
             coreListening = on
             coreUntil = until
             coreEpoch = epoch
             if !on { localPause = false } // the core has it now
-            return true
+            return (true, changed)
         }
         guard current else { return }
         log.info("listening \(on ? "on" : "paused", privacy: .public) epoch \(epoch.map(String.init) ?? "-", privacy: .public)")
         Task { @MainActor [weak self] in
             self?.indicator?.setListening(on, until: until, connection: conn, epoch: epoch, confirmed: confirmed)
         }
-        // A confirmation repeats a state the chain already has.
-        if confirmed == nil { requestMic() }
+        // Only a true repeat (a confirmation, or a new `until`) needs no mic work. A confirmation can also be the
+        // first message of its epoch, when the core coalesced the pause with its timeout.
+        if changed { requestMic() }
     }
 
     /// The menu's "Pause" closes the mic at once, without waiting for the core (which may be restarting), and

@@ -60,14 +60,18 @@ public final class SpeechPipeline: @unchecked Sendable {
     private let engineLock = NSLock()
     /// Under `engineLock`: the microphone should be open. A late device-change restart checks it.
     private var micOn = false
-    /// Under `engineLock`: the tag the engine may open under; see `setGrant`.
-    private var grant: CaptureTag?
-    private var grantSeq: UInt64 = 0
     /// Set while pausing: buffered audio is skipped and the open session is thrown away, not finalized.
     private let discarding = OSAllocatedUnfairLock(initialState: false)
-    /// The tag new microphone audio is captured under; nil while paused (the tap drops audio and no partial
-    /// text goes out).
-    private let live = OSAllocatedUnfairLock<CaptureTag?>(initialState: nil)
+    private struct Gate {
+        /// The tag the engine may open under; see `setGrant`.
+        var grant: CaptureTag?
+        var seq: UInt64 = 0
+        /// The tag new microphone audio is captured under; nil while paused (the tap drops audio and no partial
+        /// text goes out). Only ever equal to `grant` or nil.
+        var live: CaptureTag?
+    }
+    /// Never held across engine work, so a revocation never waits for a slow start.
+    private let gate = OSAllocatedUnfairLock(initialState: Gate())
 
     // Consumer-task state.
     private var session: Session?
@@ -131,15 +135,16 @@ public final class SpeechPipeline: @unchecked Sendable {
 
     // MARK: Microphone
 
-    /// Which tag the engine may open under (nil: none). A pause or disconnect revokes it here, synchronously, so
-    /// neither a start already on its way nor a device-change restart can open the engine afterwards; audio and
-    /// partial text under another tag stop at once. A `seq` older than the last one is ignored.
+    /// Which tag the engine may open under (nil: none). A pause or disconnect revokes it here at once, without
+    /// waiting for engine work: a start or device-change restart that hasn't opened the device yet won't, one that
+    /// is opening it closes it as soon as `engine.start()` returns, and audio and partial text under another tag
+    /// stop now. A `seq` older than the last one is ignored.
     public func setGrant(_ tag: CaptureTag?, seq: UInt64) {
-        engineLock.withLock {
-            guard seq >= grantSeq else { return }
-            grantSeq = seq
-            grant = tag
-            live.withLock { if $0 != tag { $0 = nil } }
+        gate.withLock { g in
+            guard seq >= g.seq else { return }
+            g.seq = seq
+            g.grant = tag
+            if g.live != tag { g.live = nil }
         }
     }
 
@@ -167,7 +172,7 @@ public final class SpeechPipeline: @unchecked Sendable {
     /// transcribed, so nothing from before the pause arrives later. `startMicrophone()` resumes.
     public func pauseMicrophone() async {
         // First, so partial text still on its way from the analyzer is dropped.
-        live.withLock { $0 = nil }
+        gate.withLock { $0.live = nil }
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
         configObserver = nil
         closeEngine()
@@ -206,7 +211,7 @@ public final class SpeechPipeline: @unchecked Sendable {
         engineLock.withLock {
             // A change notice that was already on its way when the mic was paused or stopped must not reopen it.
             guard micOn else { return }
-            let tag = live.withLock { $0 }
+            let tag = gate.withLock { $0.live }
             log.info("restarting microphone: \(reason, privacy: .public)")
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
@@ -219,7 +224,7 @@ public final class SpeechPipeline: @unchecked Sendable {
                 micOn = false
             } catch {
                 micOn = false
-                live.withLock { $0 = nil }
+                gate.withLock { $0.live = nil }
                 log.error("microphone restart failed: \(String(describing: error), privacy: .public)")
                 onEvent(.gap(reason: "microphone restart failed: \(error)", at: HostClock.now()))
                 onMicLost?(tag, "\(error)")
@@ -237,7 +242,7 @@ public final class SpeechPipeline: @unchecked Sendable {
         // ~100 ms blocks keep wakeups low without adding much latency.
         let frames = AVAudioFrameCount(format.sampleRate / 10)
         input.installTap(onBus: 0, bufferSize: frames, format: format) { [weak self] buffer, when in
-            guard let self, let tag = self.live.withLock({ $0 }), let copy = Self.copy(buffer) else { return }
+            guard let self, let tag = self.gate.withLock({ $0.live }), let copy = Self.copy(buffer) else { return }
             let host = when.isHostTimeValid ? HostClock.seconds(fromHostTime: when.hostTime) : HostClock.now()
             if case .dropped = self.chunks?.yield(Chunk(buffer: copy, host: host, wall: Date(), tag: tag)) {
                 self.dropped.withLock { $0 = true }
@@ -245,15 +250,24 @@ public final class SpeechPipeline: @unchecked Sendable {
         }
         engine.prepare()
         do {
-            // The last check before the device opens; `setGrant` can't change it while we hold `engineLock`.
-            guard grant == tag else { throw SpeechPipelineError.revoked }
+            // Checked last thing before the device opens, and again once it has: a revocation that landed during
+            // the start closes it straight away.
+            guard gate.withLock({ $0.grant == tag }) else { throw SpeechPipelineError.revoked }
             try engine.start()
+            let granted = gate.withLock { g in
+                guard g.grant == tag else { return false }
+                g.live = tag
+                return true
+            }
+            if !granted {
+                engine.stop()
+                throw SpeechPipelineError.revoked
+            }
         } catch {
             // Leave no tap behind: installing a second one on the same bus raises an exception.
             input.removeTap(onBus: 0)
             throw error
         }
-        live.withLock { $0 = tag }
     }
 
     // MARK: File (integration testing through the same path)
@@ -369,7 +383,7 @@ public final class SpeechPipeline: @unchecked Sendable {
                         let now = HostClock.now()
                         // Only while capturing under the session's own tag: a pause or restart stops it at once.
                         if let self, let onPartial = self.onPartial, text != lastPartial, now - lastPartialAt >= 0.25,
-                           tag == nil || self.live.withLock({ $0 }) == tag {
+                           tag == nil || self.gate.withLock({ $0.live }) == tag {
                             lastPartial = text
                             lastPartialAt = now
                             onPartial(id, text, tag)
