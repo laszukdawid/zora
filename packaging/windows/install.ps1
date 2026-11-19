@@ -61,8 +61,18 @@ if (Test-Path -LiteralPath $config) {
     }
     # UTF-8 without a BOM (zorad's JSON parser rejects one), written beside the config and moved into place
     # without replacing anything: a config that appeared meanwhile is kept.
-    $tmp = "$config.$PID.tmp"
-    [System.IO.File]::WriteAllText($tmp, ($c | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding $false))
+    # The temp file is new (CreateNew, unique name), so only a file this run made is ever removed.
+    $tmp = "$config.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+    $bytes = (New-Object System.Text.UTF8Encoding $false).GetBytes(($c | ConvertTo-Json -Depth 6))
+    $stream = [System.IO.File]::Open($tmp, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+    } catch {
+        $stream.Dispose()
+        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
+        throw
+    }
+    $stream.Dispose()
     try {
         [System.IO.File]::Move($tmp, $config)
         Write-Host "wrote $config"
