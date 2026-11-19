@@ -145,6 +145,10 @@ fn main() {
                         .as_u64()
                         .unwrap_or_else(|| epoch.load(Ordering::SeqCst));
                     out.send(json!({"t": "partial", "session": 1, "text": text, "epoch": e}));
+                } else if let Some(open) = step["mic"].as_bool() {
+                    // Report the microphone opening or closing on its own, in the current epoch.
+                    let e = epoch.load(Ordering::SeqCst);
+                    out.send(json!({"t": "mic", "epoch": e, "open": open}));
                 } else if let Some(raw) = step["raw"].as_str() {
                     out.raw(raw);
                 } else if step["began"].as_bool() == Some(true) {
@@ -196,6 +200,7 @@ fn main() {
                             let out = out.clone();
                             std::thread::spawn(move || {
                                 std::thread::sleep(Duration::from_millis(ms));
+                                eprintln!("late mic epoch={e}");
                                 out.send(json!({"t": "mic", "epoch": e, "open": on}));
                             });
                         }

@@ -1072,32 +1072,73 @@ fn a_plugin_without_pause_support_is_stopped_while_paused_and_restarted_on_resum
     assert_eq!(done.map(|c| c.1).as_deref(), Some("say hi"), "{err}");
 }
 
+/// Asserts that the needles appear in `err` in this order.
+fn in_order(err: &str, needles: &[&str]) {
+    let mut from = 0;
+    for n in needles {
+        match err[from..].find(n) {
+            Some(i) => from += i + n.len(),
+            None => panic!("{n:?} missing or out of order in:\n{err}"),
+        }
+    }
+}
+
 #[test]
 fn a_late_confirmation_clears_pause_not_confirmed() {
     let env = Env::new();
+    // Confirms after the 5 s report but before the 8 s stop deadline.
     let cfg = env.config_with(
         json!([]),
         sh("true", &["print", "ok"]),
-        json!({"confirmDelayMs": 6000}),
+        json!({"confirmDelayMs": 6500}),
     );
     let child = env.start(&cfg);
     std::thread::sleep(Duration::from_millis(1500));
     env.zorad(&["pause"]);
     std::thread::sleep(Duration::from_millis(9000));
+    env.zorad(&["resume"]);
+    std::thread::sleep(Duration::from_millis(2000));
     let (_, err) = term_and_collect(child);
-    let unconfirmed = err.find("pause confirmed=false");
-    let confirmed = err.find("pause confirmed=true");
-    assert!(
-        unconfirmed.is_some() && confirmed > unconfirmed,
-        "the timeout is reported, then the late confirmation clears it:\n{err}"
+    in_order(
+        &err,
+        &[
+            "pause confirmed=false",
+            "late mic epoch=2",
+            "pause confirmed=true",
+            // The same connection carries on: a restarted one would start again at epoch 1.
+            "listening=true epoch=3 ",
+        ],
     );
     assert_eq!(
         err.matches("did not confirm its microphone is off").count(),
         1,
         "{err}"
     );
-    // The plugin confirmed in time for the stop deadline, so it kept running.
     assert_eq!(err.matches("listening=true epoch=1 ").count(), 1, "{err}");
+}
+
+#[test]
+fn a_microphone_reopened_while_paused_unconfirms_the_pause() {
+    let env = Env::new();
+    let cfg = env.config(
+        json!([{"delayMs": 6000, "mic": true}]),
+        sh("true", &["print", "ok"]),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(7000));
+    let (_, err) = term_and_collect(child);
+    // Confirmed, reopened (reported at once), then closed again when the plugin is stopped and reaped.
+    in_order(
+        &err,
+        &[
+            "pause confirmed=true",
+            "plugin script opened its microphone while paused",
+            "pause confirmed=false",
+            "pause confirmed=true",
+        ],
+    );
 }
 
 #[test]
@@ -1111,17 +1152,21 @@ fn a_plugin_that_never_confirms_a_pause_is_stopped_and_reported() {
     let child = env.start(&cfg);
     std::thread::sleep(Duration::from_millis(1500));
     env.zorad(&["pause"]);
-    // The 5 s deadline, plus up to a second each to notice the pause and the timeout.
-    std::thread::sleep(Duration::from_millis(9000));
+    // The 8 s stop deadline, plus up to a second to notice the pause and time to reap.
+    std::thread::sleep(Duration::from_millis(11000));
     env.zorad(&["resume"]);
     std::thread::sleep(Duration::from_millis(3000));
     let (_, err) = term_and_collect(child);
-    assert!(
-        err.contains("plugin script did not confirm its microphone is off"),
-        "{err}"
+    // Reported at 5 s; stopped on the plugin's own deadline, and the verified reap confirms the pause.
+    in_order(
+        &err,
+        &[
+            "plugin script did not confirm its microphone is off",
+            "pause confirmed=false",
+            "pause confirmed=true",
+        ],
     );
-    assert!(err.contains("pause confirmed=false"), "{err}");
-    // Stopped on the timeout, started again on resume.
+    // Stopped, started again on resume.
     assert_eq!(err.matches("listening=true epoch=1 ").count(), 2, "{err}");
 }
 

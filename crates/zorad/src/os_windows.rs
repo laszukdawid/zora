@@ -288,6 +288,12 @@ impl Group {
         let _ = self.job.terminate();
     }
 
+    /// For a group that already failed to reap. The job handle can't name another process, so it is safe to
+    /// terminate again.
+    pub fn retry_reap(&self) -> bool {
+        self.reap_blocking(Duration::ZERO)
+    }
+
     /// Ctrl+Break, wait `grace`, terminate the job, wait up to 2 s. True once the job is empty. Blocking.
     pub fn reap_blocking(&self, grace: Duration) -> bool {
         if self.job.empty() {

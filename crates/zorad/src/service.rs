@@ -370,8 +370,12 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                 }
             }
             Item::Mic { id, turn, open } => {
-                if turn == listen_state.turn && !open {
-                    tracker.closed(&id);
+                if turn == listen_state.turn && !listen.listening {
+                    if open {
+                        tracker.opened(&id, Instant::now());
+                    } else {
+                        tracker.closed(&id);
+                    }
                 }
                 vec![]
             }
