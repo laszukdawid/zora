@@ -1,6 +1,6 @@
 use zora_core::config::{Config, Harness};
 use zora_core::detector::{tokens, units};
-use zora_core::harness::{HarnessSpec, last_line_summary};
+use zora_core::harness::{HarnessSpec, last_line_summary, npm_shim_target};
 use zora_core::store::Store;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -27,7 +27,7 @@ fn normalizer() {
 
 #[test]
 fn config_defaults_fill_missing_keys_and_v1_files_load() {
-    let c: Config = serde_json::from_str(r#"{"capture":{"maxChars":10},"harnesses":{"c":{"workspace":"/tmp"}},"defaultHarness":"c"}"#).unwrap();
+    let c: Config = serde_json::from_value(serde_json::json!({"capture":{"maxChars":10},"harnesses":{"c":{"workspace":std::env::temp_dir()}},"defaultHarness":"c"})).unwrap();
     assert_eq!(c.capture.max_chars, 10);
     assert_eq!(c.capture.hold_back_seconds, 1.5);
     assert_eq!(c.harnesses["c"].executable, "claude");
@@ -114,6 +114,17 @@ fn harness_argv_and_summaries() {
 }
 
 #[test]
+fn npm_shim_target_is_the_script_it_starts() {
+    let shim = "@ECHO off\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n)\r\n\
+                endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli.js\" %*\r\n";
+    assert_eq!(
+        npm_shim_target(shim).as_deref(),
+        Some("node_modules\\@anthropic-ai\\claude-code\\cli.js")
+    );
+    assert_eq!(npm_shim_target("@echo off\r\nrun.exe %*\r\n"), None);
+}
+
+#[test]
 fn store_batches_prunes_both_tables_and_keeps_live_jobs() {
     let path = tmp("z.sqlite");
     let mut s = Store::open(&path, false).unwrap();
@@ -138,19 +149,22 @@ fn store_batches_prunes_both_tables_and_keeps_live_jobs() {
     // Finished commands are pruned; a running job is kept until it is final.
     assert_eq!(s.count("commands"), 1);
     assert!(s.take_failure().is_none());
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(
-        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert_eq!(
-        std::fs::metadata(path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
 }
 
 #[test]

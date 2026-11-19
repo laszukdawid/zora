@@ -1,6 +1,7 @@
 mod guard;
 mod host;
 mod jobs;
+#[cfg_attr(windows, path = "os_windows.rs")]
 mod os;
 mod pause;
 mod queue;
@@ -18,7 +19,8 @@ use zora_core::suppression::DictationSignal;
 const USAGE: &str = "usage: zorad <command> [options]
 
   run [--dry-run]           Run the service (Linux: starts the configured plugins).
-  run --attached-plugin     macOS: started by Zora.app, which talks the plugin protocol on fds 3/4.
+  run --attached-plugin     macOS: started by Zora.app, which talks the plugin protocol on fds 3/4
+                            (Windows: on stdin/stdout).
   status                    Config problems, store, and jobs needing attention.
   transcript [--since 30m] [--last N] [--json]
                             Print the stored transcript (newest N lines with --last).
@@ -35,12 +37,14 @@ const USAGE: &str = "usage: zorad <command> [options]
                             --dry-run lists problems as `run --dry-run` sees them.
   simulate <script>         Feed a scripted transcript through the command logic (dry run).
 
-  --config <path>           Config file (default ~/.config/zora/config.json).";
+  --config <path>           Config file (default ~/.config/zora/config.json; Windows:
+                            %APPDATA%\\Zora\\config.json).";
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("__guard") => std::process::exit(guard::guard_main()),
+        #[cfg(unix)]
         Some("__gate") => std::process::exit(guard::gate_main(args.get(2..).unwrap_or(&[]))),
         _ => {}
     }
@@ -120,13 +124,17 @@ fn cmd_run(path: Option<PathBuf>, rest: &[String]) -> i32 {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(service::run(
+    let code = rt.block_on(service::run(
         config,
         service::Options {
             attached,
             config_path,
         },
-    ))
+    ));
+    // Windows reads the attached plugin's stdin on a blocking thread that cannot be cancelled.
+    #[cfg(windows)]
+    rt.shutdown_background();
+    code
 }
 
 fn cmd_status(path: Option<PathBuf>) -> i32 {
@@ -515,11 +523,9 @@ fn cmd_jobs(rest: &[String]) -> i32 {
             eprintln!("no running job {id}");
             return 1;
         };
-        // Signal only a job group that is provably this job's (leader pid == pgid with the recorded start time);
-        // its guard then reaps the group and the core records the outcome.
+        // Signal only a job that is provably this one; its guard then reaps it and the core records the outcome.
         match (job.job_pgid, job.gate_start) {
-            (Some(pgid), Some(start)) if os::start_time(pgid as i32) == Some(start) => {
-                os::signal_group(pgid as i32, libc::SIGTERM);
+            (Some(pgid), Some(start)) if os::cancel_job(&job.id, pgid as i32, start) => {
                 println!("job {} cancelled", job.id);
                 return 0;
             }

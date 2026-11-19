@@ -17,6 +17,15 @@ use zora_core::harness::HarnessSpec;
 use zora_core::model::{DiscardReason, EventKind, ZoraEvent};
 use zora_core::suppression::DictationSignal;
 
+/// `%LOCALAPPDATA%\Zora\zora.sqlite`; the pause file sits beside it.
+#[cfg(windows)]
+pub fn database_path() -> PathBuf {
+    zora_core::config::windows_dir("LOCALAPPDATA", &["AppData", "Local"])
+        .join("Zora")
+        .join("zora.sqlite")
+}
+
+#[cfg(unix)]
 pub fn database_path() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -236,18 +245,9 @@ pub async fn run(config: Config, opts: Options) -> i32 {
             }
         });
     }
-    for kind in [
-        tokio::signal::unix::SignalKind::terminate(),
-        tokio::signal::unix::SignalKind::interrupt(),
-    ] {
+    {
         let q = queue.clone();
-        if let Ok(mut sig) = tokio::signal::unix::signal(kind) {
-            tokio::spawn(async move {
-                while sig.recv().await.is_some() {
-                    q.force(Item::Shutdown);
-                }
-            });
-        }
+        crate::os::on_shutdown(move || q.force(Item::Shutdown));
     }
 
     notifier.notify(

@@ -14,7 +14,10 @@ pub fn secs(s: f64) -> Ns {
 pub const CLOCK_DOMAIN: &str = "darwin-uptime-raw-ns";
 #[cfg(target_os = "linux")]
 pub const CLOCK_DOMAIN: &str = "linux-monotonic-ns";
+#[cfg(windows)]
+pub const CLOCK_DOMAIN: &str = "windows-qpc-ns";
 
+#[cfg(unix)]
 pub fn now_ns() -> Ns {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -27,6 +30,21 @@ pub fn now_ns() -> Ns {
     // SAFETY: valid pointer to a timespec on the stack.
     unsafe { libc::clock_gettime(id, &mut ts) };
     ts.tv_sec as Ns * SECOND + ts.tv_nsec as Ns
+}
+
+/// QueryPerformanceCounter in nanoseconds; the counter is system-wide, so plugins read the same clock.
+#[cfg(windows)]
+pub fn now_ns() -> Ns {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let (mut count, mut freq) = (0i64, 0i64);
+    // SAFETY: both point to valid i64s; these calls cannot fail on Windows XP and later.
+    unsafe {
+        QueryPerformanceCounter(&mut count);
+        QueryPerformanceFrequency(&mut freq);
+    }
+    (count as i128 * SECOND as i128 / freq.max(1) as i128) as Ns
 }
 
 /// Unix seconds for a recent monotonic time (the monotonic clock pauses in sleep on macOS; use near now only).

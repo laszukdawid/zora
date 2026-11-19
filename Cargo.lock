@@ -2782,6 +2782,7 @@ dependencies = [
  "serde_json",
  "unicode-normalization",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]
@@ -2832,6 +2833,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "windows-sys",
  "zora-core",
 ]
 

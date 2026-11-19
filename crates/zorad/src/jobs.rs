@@ -12,7 +12,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, LinesCodec};
-use zora_core::harness::{HarnessResult, HarnessSpec, resolve_executable};
+use zora_core::config::PATH_SEPARATOR;
+use zora_core::harness::{HarnessResult, HarnessSpec, resolve_command};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JobEvent {
@@ -253,17 +254,14 @@ impl JobManager {
                 true,
             );
         }
-        let Some(exe) = resolve_executable(&job.spec.executable, &self.search_path) else {
-            return (
-                fail(format!("{} not found on PATH", job.spec.executable)),
-                true,
-            );
+        let mut argv = match resolve_command(&job.spec.executable, &self.search_path) {
+            Ok(argv) => argv,
+            Err(e) => return (fail(e), true),
         };
         let mut env: Vec<(String, String)> =
             std::env::vars().filter(|(k, _)| k != "PATH").collect();
-        env.push(("PATH".into(), self.search_path.join(":")));
+        env.push(("PATH".into(), self.search_path.join(PATH_SEPARATOR)));
         env.extend(job.spec.env.iter().cloned());
-        let mut argv = vec![exe];
         argv.extend(job.spec.argv(&job.prompt));
         let spec = JobSpec {
             argv,
@@ -271,17 +269,18 @@ impl JobManager {
             env,
             capture_limit: 64 * 1024,
             kill_grace_ms: self.kill_grace.as_millis() as u64,
+            name: job.id.clone(),
         };
 
         let exe_self = std::env::current_exe().unwrap_or_else(|_| "zorad".into());
-        let mut child = match Command::new(exe_self)
+        let mut guard = Command::new(exe_self);
+        guard
             .arg("__guard")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .process_group(0)
-            .spawn()
-        {
+            .stderr(Stdio::inherit());
+        os::detach(&mut guard);
+        let mut child = match guard.spawn() {
             Ok(c) => c,
             Err(e) => return (fail(format!("cannot start job guard: {e}")), true),
         };
@@ -354,7 +353,7 @@ impl JobManager {
             .is_err()
         {
             if let Some(gp) = guard_pid {
-                os::signal_group(gp, libc::SIGKILL);
+                os::kill_detached(gp);
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -365,8 +364,9 @@ impl JobManager {
             (None, None) => true, // never registered, so nothing ran
             (None, Some((pgid, gate_start))) => {
                 // The guard died without reporting; clean up only with verified identity.
+                let id = job.id.clone();
                 tokio::task::spawn_blocking(move || {
-                    verified_cleanup(pgid, gate_start, Duration::from_secs(5))
+                    os::reap_job(&id, pgid, gate_start, Duration::from_secs(5))
                 })
                 .await
                 .unwrap_or(false)
@@ -413,17 +413,6 @@ async fn send_guard(stdin: &mut Option<ChildStdin>, msg: CoreMsg) {
     }
 }
 
-/// Cleans a job group only when its leader is provably ours (same pid and start time). Blocking.
-pub fn verified_cleanup(pgid: i32, gate_start: i64, grace: Duration) -> bool {
-    if os::group_empty(pgid) {
-        return true;
-    }
-    if os::start_time(pgid) == Some(gate_start) {
-        return os::reap_group_blocking(pgid, grace);
-    }
-    false
-}
-
 /// Startup recovery for jobs a previous core left behind. Err means admission must stay closed.
 pub async fn recover(store: &StoreHandle) -> Result<usize, String> {
     let jobs = store
@@ -459,12 +448,15 @@ pub async fn recover(store: &StoreHandle) -> Result<usize, String> {
         }
         let ok = match (job.job_pgid, job.gate_start) {
             (None, _) => true,
-            (Some(pgid), Some(gate_start)) => tokio::task::spawn_blocking(move || {
-                verified_cleanup(pgid as i32, gate_start, Duration::from_secs(5))
-            })
-            .await
-            .unwrap_or(false),
-            (Some(pgid), None) => os::group_empty(pgid as i32),
+            (Some(pgid), Some(gate_start)) => {
+                let id = id.clone();
+                tokio::task::spawn_blocking(move || {
+                    os::reap_job(&id, pgid as i32, gate_start, Duration::from_secs(5))
+                })
+                .await
+                .unwrap_or(false)
+            }
+            (Some(pgid), None) => os::job_gone(&id, pgid as i32),
         };
         if ok {
             mark("interrupted");

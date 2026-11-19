@@ -1,11 +1,10 @@
-//! Plugin host: implements docs/protocol.md for one plugin (spawned child on Linux, attached fds on macOS).
+//! Plugin host: implements docs/protocol.md for one plugin (a spawned child, or the attached app that started us).
 
 use crate::pause::Listen;
 use crate::queue::{Class, Classify, InputQueue};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -209,7 +208,7 @@ impl Classify for Item {
 #[derive(Debug, Clone)]
 pub enum Connection {
     Spawn(Vec<String>),
-    /// macOS inverted launch: the app gave us fd 3 (read) and fd 4 (write).
+    /// Inverted launch: the app started us and talks over fds 3/4 (Windows: stdin/stdout).
     Attached,
 }
 
@@ -240,24 +239,18 @@ pub async fn run_plugin(
         generation += 1;
         let started = tokio::time::Instant::now();
         let result = match &spec.connection {
-            Connection::Attached => {
-                // SAFETY: the parent app passes these descriptors to us; nothing else owns them.
-                let (r, w) = unsafe { (OwnedFd::from_raw_fd(3), OwnedFd::from_raw_fd(4)) };
-                let r = tokio::net::unix::pipe::Receiver::from_owned_fd(r);
-                let w = tokio::net::unix::pipe::Sender::from_owned_fd(w);
-                match (r, w) {
-                    (Ok(r), Ok(w)) => {
-                        until_stop(
-                            session(&spec, generation, r, w, &queue, stop.clone()),
-                            stop.clone(),
-                        )
-                        .await
-                    }
-                    _ => Err(ProtocolError("fds 3/4 are not pipes".into())),
+            Connection::Attached => match crate::os::attached_plugin() {
+                Ok((r, w)) => {
+                    until_stop(
+                        session(&spec, generation, r, w, &queue, stop.clone()),
+                        stop.clone(),
+                    )
+                    .await
                 }
-            }
+                Err(e) => Err(ProtocolError(e)),
+            },
             Connection::Spawn(cmd) => match spawn(cmd) {
-                Ok(mut child) => {
+                Ok((mut child, group)) => {
                     let (r, w) = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
                     if let Some(err) = child.stderr.take() {
                         tokio::spawn(forward_stderr(spec.id.clone(), err));
@@ -270,10 +263,10 @@ pub async fn run_plugin(
                     )
                     .await;
                     // Reap the whole plugin group (TERM, grace, KILL, verify) before any restart.
-                    if let Some(pid) = child.id() {
-                        let pgid = pid as i32;
+                    {
+                        let pgid = group.id();
                         // Wait for the leader first: an unreaped (zombie) leader still counts as a group member.
-                        crate::os::signal_group(pgid, libc::SIGTERM);
+                        group.term();
                         if tokio::time::timeout(Duration::from_secs(3), child.wait())
                             .await
                             .is_err()
@@ -282,7 +275,7 @@ pub async fn run_plugin(
                             let _ = child.wait().await;
                         }
                         let reaped = tokio::task::spawn_blocking(move || {
-                            crate::os::reap_group_blocking(pgid, Duration::from_secs(3))
+                            group.reap_blocking(Duration::from_secs(3))
                         })
                         .await
                         .unwrap_or(false);
@@ -343,18 +336,17 @@ async fn until_stop(
     }
 }
 
-fn spawn(cmd: &[String]) -> std::io::Result<tokio::process::Child> {
+fn spawn(cmd: &[String]) -> std::io::Result<(tokio::process::Child, crate::os::Group)> {
     let (exe, args) = cmd
         .split_first()
         .ok_or_else(|| std::io::Error::other("empty plugin command"))?;
-    tokio::process::Command::new(zora_core::config::expand_tilde(exe))
-        .args(args)
+    let mut c = tokio::process::Command::new(zora_core::config::expand_tilde(exe));
+    c.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    crate::os::spawn_grouped(&mut c)
 }
 
 /// Forwards plugin stderr (metadata-only by contract) in whole lines, at roughly 4 KiB/s at most.
