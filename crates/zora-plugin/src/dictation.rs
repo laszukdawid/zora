@@ -29,6 +29,16 @@ pub fn matches_app<'a>(prop: impl Fn(&str) -> Option<&'a str>, apps: &[String]) 
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// Not an application's capture stream: irrelevant.
+    Other,
+    /// A capture stream with an app identity; `matches` when that app is a configured dictation tool.
+    Capture { matches: bool },
+    /// Not known yet (no properties), or a capture stream without an app identity.
+    Unclassified,
+}
+
 /// One audio node as seen through its info updates.
 #[derive(Debug, Default, Clone)]
 pub struct StreamNode {
@@ -60,6 +70,29 @@ impl StreamNode {
 
     pub fn is_capture(&self) -> bool {
         self.capture
+    }
+
+    /// What the properties prove about this node.
+    pub fn class(&self) -> Class {
+        match self.prop("media.class") {
+            // Nothing known yet.
+            None if self.props.is_empty() => Class::Unclassified,
+            // Every PipeWire stream carries a media class; a node with properties but none is a driver or
+            // similar, never an application's capture stream.
+            None => Class::Other,
+            Some(c) if c != CAPTURE_CLASS => Class::Other,
+            Some(_)
+                if APP_KEYS
+                    .iter()
+                    .any(|k| self.prop(k).is_some_and(|v| !v.trim().is_empty())) =>
+            {
+                Class::Capture {
+                    matches: self.matches,
+                }
+            }
+            // A capture stream that doesn't say which app it belongs to could be the dictation tool.
+            Some(_) => Class::Unclassified,
+        }
     }
 
     /// A configured dictation app is capturing through this node right now.
@@ -322,22 +355,29 @@ impl Graph {
         running: bool,
         now: Ns,
     ) -> Vec<Msg> {
-        let classified = props.is_some();
         let entry = self.streams.entry(id).or_default();
         if let Some(p) = props {
             entry.set_props(p, &self.apps);
         }
         entry.running = running;
         let mut out = vec![];
-        // Until its first info with properties, a node can't be classified and stays a blind spot. A dictation
-        // stream may have run and stopped between its discovery and that info, so that time is unknown.
-        if classified && let Some(since) = self.awaiting.remove(&id) {
-            let e = &self.streams[&id];
-            if e.capture && e.matches {
-                out.push(Msg::Unknown {
-                    from_ns: since,
-                    to_ns: now,
-                });
+        // A node stays a blind spot until it is classified. A dictation stream may have run and stopped between
+        // its discovery and that point, so the time is unknown.
+        if let Some(&since) = self.awaiting.get(&id) {
+            match self.streams[&id].class() {
+                Class::Unclassified => {}
+                Class::Other => {
+                    self.awaiting.remove(&id);
+                }
+                Class::Capture { matches } => {
+                    self.awaiting.remove(&id);
+                    if matches {
+                        out.push(Msg::Unknown {
+                            from_ns: since,
+                            to_ns: now,
+                        });
+                    }
+                }
             }
         }
         out.extend(self.edges(now));
@@ -548,6 +588,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn nodes_stay_blind_spots_until_their_properties_prove_what_they_are() {
+        let t = 10 * SECOND;
+        let mut g = Graph::new(vec!["rec".into()]);
+        g.monitor.observe(false, t);
+        g.discovered(1, None, t);
+        g.discovered(2, Some(CAPTURE_CLASS), t);
+        // An empty property set proves nothing.
+        assert!(g.info(1, Some([]), false, t + 100 * MILLI).is_empty());
+        // A capture stream without an app identity might be the dictation tool.
+        let anonymous = [("media.class", CAPTURE_CLASS), ("node.name", "x")];
+        assert!(
+            g.info(2, Some(anonymous), false, t + 100 * MILLI)
+                .is_empty()
+        );
+        assert!(!g.complete());
+        // Removed while still unclassified: its whole life is unknown.
+        assert_eq!(
+            g.removed(2, t + 300 * MILLI),
+            [Msg::Unknown {
+                from_ns: t,
+                to_ns: t + 300 * MILLI
+            }]
+        );
+        // Classified later as something else: irrelevant after all.
+        let sink = [("media.class", "Audio/Sink")];
+        assert!(g.info(1, Some(sink), false, t + 400 * MILLI).is_empty());
+        assert!(g.complete());
+        // A node with properties but no media class (a driver) is not a stream.
+        g.discovered(3, None, t);
+        assert!(
+            g.info(3, Some([("node.name", "Dummy-Driver")]), false, t)
+                .is_empty()
+        );
+        assert!(g.complete());
+        assert_eq!(
+            StreamNode::default().class(),
+            Class::Unclassified,
+            "no properties at all"
+        );
     }
 
     #[test]

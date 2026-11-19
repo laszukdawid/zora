@@ -133,13 +133,21 @@ or turn the monitor off (below).
   `start` and then `listening: true`, closes it on a pause, and drops audio it has not transcribed yet (from the moment
   the pause arrives, before the device has finished closing; a result still being decoded is not sent). It also closes it when the
   core goes away (it is the core's child and exits when its input closes). Open, close and stop run in one thread in
-  message order, so a late resume can never reopen it after a pause or a stop.
+  message order, so a late resume can never reopen it after a pause or a stop. One window remains: with cpal's
+  PipeWire backend, `play()` only queues the start, so a pause that arrives in that moment can find the device
+  starting. No audio from it is used (it belongs to a revoked epoch), and the stream is closed as soon as the mic
+  thread handles the pause; the device is only briefly active.
 - **Dictation monitor.** It reports a dictation stream starting or stopping as soon as PipeWire says so, so even a
   short one between two checks is suppressed. It fails closed: health is unknown until the first complete snapshot
   (a PipeWire core `sync` round trip that returns after every bound node has sent its state), when PipeWire is not
   running, when the connection drops or a round trip goes unanswered for 3 s (it reconnects every second), and when
-  observations stall for more than 1.5 s. A pure PulseAudio or ALSA system is not supported
-  and stays unknown, so no command runs there.
+  observations stall for more than 1.5 s. A node counts as unknown from its discovery until its properties show
+  what it is; a capture stream that never names its app stays unknown for as long as it exists, so no command runs
+  meanwhile. A pure PulseAudio or ALSA system is not supported and stays unknown, so no command runs there.
+- **Speech model.** `zora-listen setup` installs into `<models>/versions/` (marked as setup's own) and points
+  `<models>/<model>` at the new version with one atomic link rename, holding a lock so only one setup runs at a time.
+  It keeps the previous version and removes only older ones from that directory; it never deletes anything else. A
+  model directory placed at `<models>/<model>` by hand is used as it is; `setup --force` refuses to replace it.
 - **Tray.** `zora-desktop` is a notify plugin that `zorad` starts, not a separate autostart program: the protocol
   already delivers the listening state and every event it shows, and the icon goes away with the service instead of
   claiming a state nobody reports. Its menu matches the macOS one (state, Pause Listening / Resume Listening, Pause
