@@ -29,8 +29,10 @@ const USAGE: &str = "usage: zorad <command> [options]
   pause [30m|1h|...]        Stop listening: the microphone is released and nothing is transcribed.
                             Without a duration, stays paused (also across restarts) until `resume`.
   resume                    Start listening again.
-  settings [set <json>]     Print, or change, the settings the menu bar edits, as JSON: wakeNames,
+  settings [set <json>] [--dry-run]
+                            Print, or change, the settings the menu bar edits, as JSON: wakeNames,
                             phrases {start,end,cancel} and workspace (of the default harness).
+                            --dry-run lists problems as `run --dry-run` sees them.
   simulate <script>         Feed a scripted transcript through the command logic (dry run).
 
   --config <path>           Config file (default ~/.config/zora/config.json).";
@@ -375,7 +377,9 @@ struct PhrasesChange {
     cancel: Option<Vec<String>>,
 }
 
-fn settings_json(config: &Config, path: &std::path::Path) -> serde_json::Value {
+fn settings_json(config: &Config, path: &std::path::Path, dry_run: bool) -> serde_json::Value {
+    let mut checked = config.clone();
+    checked.dry_run |= dry_run;
     let workspace = config
         .harnesses
         .get(&config.default_harness)
@@ -389,7 +393,7 @@ fn settings_json(config: &Config, path: &std::path::Path) -> serde_json::Value {
         "configPath": path,
         "locale": config.locale,
         "dictationBundleIDs": config.dictation.bundle_ids,
-        "problems": config.validate(),
+        "problems": checked.validate(),
     })
 }
 
@@ -410,6 +414,7 @@ fn clean_list(items: Vec<String>) -> Vec<String> {
 }
 
 fn cmd_settings(path: Option<PathBuf>, rest: &[String]) -> i32 {
+    let original_len = rest.len();
     let path = path.unwrap_or_else(Config::default_path);
     let mut config = match load_config(Some(path.clone()), true) {
         Ok(c) => c,
@@ -418,7 +423,10 @@ fn cmd_settings(path: Option<PathBuf>, rest: &[String]) -> i32 {
             return 1;
         }
     };
-    match (rest.first().map(String::as_str), rest.get(1)) {
+    // `--dry-run`: report problems the way `zorad run --dry-run` sees them.
+    let rest: Vec<&String> = rest.iter().filter(|a| *a != "--dry-run").collect();
+    let dry_run = rest.len() < original_len;
+    match (rest.first().map(|a| a.as_str()), rest.get(1)) {
         (None, _) => {}
         (Some("set"), Some(json)) => {
             let change: SettingsChange = match serde_json::from_str(json) {
@@ -474,7 +482,7 @@ fn cmd_settings(path: Option<PathBuf>, rest: &[String]) -> i32 {
             return 2;
         }
     }
-    println!("{}", settings_json(&config, &path));
+    println!("{}", settings_json(&config, &path, dry_run));
     0
 }
 

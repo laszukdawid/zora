@@ -91,9 +91,10 @@ struct CoreSettings: Decodable, Sendable {
 }
 
 extension ZoradCLI {
-    /// Reads the settings (creating a default config file if there is none).
-    func settings() async throws -> CoreSettings {
-        let r = await run(["settings"])
+    /// Reads the settings (creating a default config file if there is none). `dryRun` reports problems as
+    /// `zorad run --dry-run` sees them.
+    func settings(dryRun: Bool = false) async throws -> CoreSettings {
+        let r = await run(["settings"] + (dryRun ? ["--dry-run"] : []))
         guard r.ok else { throw SettingsError(message: r.message) }
         guard let s = CoreSettings.decode(r.out) else { throw SettingsError(message: "unexpected output from zorad settings") }
         return s

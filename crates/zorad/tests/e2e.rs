@@ -823,4 +823,15 @@ fn an_invalid_config_exits_with_ex_config_and_settings_lists_the_problem() {
     );
     assert_eq!(v["locale"], "en-US");
     assert!(v["dictationBundleIDs"].is_array());
+    // A dry run needs no project folder, and checking for one doesn't save the flag.
+    let before = std::fs::read(&cfg).unwrap();
+    let out = Command::new(ZORAD)
+        .args(["settings", "--dry-run", "--config"])
+        .arg(&cfg)
+        .env("HOME", &env.home)
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["problems"], json!([]), "{v}");
+    assert_eq!(std::fs::read(&cfg).unwrap(), before);
 }

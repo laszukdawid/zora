@@ -357,28 +357,41 @@ fn spawn(cmd: &[String]) -> std::io::Result<tokio::process::Child> {
         .spawn()
 }
 
-/// Forwards plugin stderr (metadata-only by contract) at no more than 4 KiB/s.
+/// Forwards plugin stderr (metadata-only by contract) at no more than 4 KiB/s, whole lines only: a plugin may
+/// write one line in several pieces.
 async fn forward_stderr(id: String, mut err: impl AsyncRead + Unpin) {
     let mut buf = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
     let mut budget = 4096usize;
     let mut window = tokio::time::Instant::now();
     loop {
         let n = match err.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        pending.extend_from_slice(&buf[..n]);
+        let complete = match pending.iter().rposition(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            // An overlong line is cut rather than held forever.
+            None if pending.len() >= 4096 => pending.len(),
+            None => continue,
+        };
+        let chunk: Vec<u8> = pending.drain(..complete).collect();
         if window.elapsed() >= Duration::from_secs(1) {
             window = tokio::time::Instant::now();
             budget = 4096;
         }
-        let take = n.min(budget);
+        let take = chunk.len().min(budget);
         budget -= take;
-        if take > 0 {
-            let text = String::from_utf8_lossy(&buf[..take]);
-            for line in text.lines() {
-                eprintln!("[{id}] {line}");
-            }
-        }
+        print_lines(&id, &chunk[..take]);
+    }
+    let take = pending.len().min(budget);
+    print_lines(&id, &pending[..take]);
+}
+
+fn print_lines(id: &str, bytes: &[u8]) {
+    for line in String::from_utf8_lossy(bytes).lines() {
+        eprintln!("[{id}] {line}");
     }
 }
 

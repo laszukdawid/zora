@@ -123,6 +123,12 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         guard problems != setupProblems else { return }
         let first = setupProblems == nil && problems != nil
         setupProblems = problems
+        // Whatever was showing belongs to a core that has gone.
+        pendingTask?.cancel()
+        pendingTask = nil
+        resetTask?.cancel()
+        notice = nil
+        state = .idle
         problemItems.forEach(menu.removeItem)
         problemItems = (problems ?? []).map { p in
             let entry = NSMenuItem(title: Self.friendly(p), action: nil, keyEquivalent: "")
@@ -131,13 +137,8 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
             return entry
         }
         for (i, entry) in problemItems.enumerated() { menu.insertItem(entry, at: menu.index(of: stateLine) + 1 + i) }
-        if problems == nil {
-            listening = nil
-            setEnabled()
-        } else {
-            pauseItem.isEnabled = false
-            pauseHourItem.isEnabled = false
-        }
+        if problems == nil { listening = nil }
+        setEnabled()
         render()
         // Shown once per episode, so a fresh install or a vanished project folder doesn't go unnoticed.
         if first, problems?.contains(where: { $0.contains("workspace") }) == true { settings.show() }
@@ -240,8 +241,9 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         }
     }
 
+    /// A pause or resume still running keeps the items disabled, whatever else changed meanwhile.
     private func setEnabled() {
-        let on = setupProblems == nil
+        let on = setupProblems == nil && !requestInFlight
         pauseItem.isEnabled = on
         pauseHourItem.isEnabled = on
     }
@@ -276,7 +278,7 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         image?.isTemplate = true
         item.button?.image = image
         item.button?.toolTip = label
-        stateLine.title = notice ?? label
+        stateLine.title = setupProblems == nil ? (notice ?? label) : label
         pauseItem.title = paused ? "Resume Listening" : "Pause Listening"
         pauseHourItem.isHidden = paused
     }

@@ -128,8 +128,10 @@ final class Bridge: @unchecked Sendable {
         log.error("zorad refused the config; waiting for it to be fixed")
         let cli = self.cli
         while true {
+            // Checked the way `zorad run` will check it, so a dry run doesn't wait for a project folder.
+            let dryRun = options.coreArgs.contains("--dry-run")
             let problems = Self.blocking { () -> [String] in
-                do { return try await cli.settings().problems } catch { return ["\(error)"] }
+                do { return try await cli.settings(dryRun: dryRun).problems } catch { return ["\(error)"] }
             }
             let stop = lock.withLock { stopping }
             if stop { exit(0) }

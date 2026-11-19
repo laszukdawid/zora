@@ -137,14 +137,20 @@ case "uninstall":
 
 case "status":
     runMain {
-        let settings = try await core.settings()
+        // Everything except the speech model and dictation apps works without the core.
+        let settings: CoreSettings?
+        do { settings = try await core.settings() } catch {
+            settings = nil
+            print("config: cannot read it through zorad: \(error)")
+        }
         print("bundle:", Bundle.main.bundleIdentifier ?? "none (not running from Zora.app)")
         print("core:", FileManager.default.isExecutableFile(atPath: zoradPath()) ? zoradPath() : "missing")
         print("microphone:", Microphone.status)
         print("notifications:", await MacNotifier().authorizationDescription())
+        print("login item:", LoginItem.status)
+        guard let settings else { return 1 }
         let (locale, asset) = await SpeechPipeline.assetStatus(for: Locale(identifier: settings.locale))
         print("speech model:", locale?.identifier ?? "unsupported locale \(settings.locale)", "\(asset)")
-        print("login item:", LoginItem.status)
         print("config:", settings.problems.isEmpty ? "ok" : settings.problems.joined(separator: "; "))
         if let snap = CoreAudioDictationMonitor.snapshot(bundleIDs: settings.dictationBundleIDs) {
             print("dictation apps:", snap.isEmpty ? "none running" : snap.map { "\($0.bundleID) pid \($0.pid) capturing=\($0.capturing)" }.joined(separator: ", "))
