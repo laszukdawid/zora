@@ -322,15 +322,20 @@ impl<R: Recognizer> Engine<R> {
     }
 }
 
-/// Runs the engine until the audio channel closes.
+/// Runs the engine until the audio channel closes. `emit` gets each event with the epoch it was made in.
 pub fn run_engine<R: Recognizer>(
     mut engine: Engine<R>,
     rx: Receiver<Audio>,
-    mut emit: impl FnMut(Event),
+    mut emit: impl FnMut(Event, u64),
 ) {
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(a) => engine.handle(a, &mut emit),
+            Ok(a) => {
+                engine.check_epoch();
+                // Results carry the epoch they belong to, so the writer can drop them if it went stale.
+                let epoch = engine.seen_epoch;
+                engine.handle(a, &mut |ev| emit(ev, epoch));
+            }
             // A pause drops buffered audio even when no further chunk arrives.
             Err(RecvTimeoutError::Timeout) => engine.check_epoch(),
             Err(RecvTimeoutError::Disconnected) => return,
@@ -542,10 +547,10 @@ where
             Ok(rec) => {
                 out.send(json!({"t": "status", "ready": true, "reason": "speech ready"}));
                 let _ = mic_tx.send(MicEvent::Ready);
-                let mut engine = Engine::new(rec, live);
+                let mut engine = Engine::new(rec, live.clone());
                 engine.partials = partials;
-                run_engine(engine, audio_rx, |ev| {
-                    out.send(ev.to_json());
+                run_engine(engine, audio_rx, |ev, epoch| {
+                    out.send_if(ev.to_json(), || live.current(epoch));
                 });
             }
             Err(reason) => {

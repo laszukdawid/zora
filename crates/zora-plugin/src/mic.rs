@@ -91,6 +91,8 @@ pub struct AudioSink {
     epoch: u64,
     live: Arc<Live>,
     lost: Arc<AtomicBool>,
+    /// A timed buffer went out on this stream; untimed ones after it break continuity.
+    timed: Arc<AtomicBool>,
     failed: mpsc::Sender<MicEvent>,
 }
 
@@ -112,6 +114,34 @@ impl AudioSink {
         };
         if let Err(TrySendError::Full(_)) = self.tx.try_send(msg) {
             self.lost.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A buffer the device captured `capture_lag` before the callback ran at `callback_ns`. Without a usable
+    /// capture time its place in time is unknown, so it is dropped and the next timed buffer starts a new speech
+    /// session. Returns whether the buffer was timed.
+    pub fn push_captured(
+        &self,
+        data: &[f32],
+        channels: u16,
+        rate: u32,
+        callback_ns: Ns,
+        capture_lag: Option<Duration>,
+    ) -> bool {
+        let frames = data.len() / channels.max(1) as usize;
+        match buffer_end_ns(callback_ns, capture_lag, frames, rate) {
+            Some(end) => {
+                self.timed.store(true, Ordering::SeqCst);
+                self.push(data, channels, rate, end);
+                true
+            }
+            None => {
+                // At the start of a stream nothing came before, and a new stream is a new session anyway.
+                if self.timed.load(Ordering::SeqCst) {
+                    self.mark_lost();
+                }
+                false
+            }
         }
     }
 
@@ -268,7 +298,9 @@ impl<I: AudioInput> MicController<I> {
     }
 
     fn apply(&mut self) {
-        let wanted = self.gate.wanted();
+        // The gate reflects the events handled so far; `Live` reflects the latest one the core sent, which may still
+        // be queued behind them. Open only when both agree.
+        let wanted = self.gate.wanted() && self.live.allowed();
         if wanted && !self.running && self.retry_at.is_none() {
             let epoch = self.live.bump();
             let sink = AudioSink {
@@ -276,11 +308,17 @@ impl<I: AudioInput> MicController<I> {
                 epoch,
                 live: self.live.clone(),
                 lost: Arc::new(AtomicBool::new(false)),
+                timed: Arc::new(AtomicBool::new(false)),
                 failed: self.events.clone(),
             };
             match self.input.open(sink) {
                 Ok(()) => {
                     self.running = true;
+                    // Opening can take a while; a pause or lost core meanwhile closes it again at once.
+                    if !self.live.current(epoch) {
+                        self.close(false);
+                        return;
+                    }
                     if self.failing {
                         self.failing = false;
                         (self.status)(true, "microphone open".into());
@@ -346,11 +384,15 @@ mod tests {
     struct FakeInput {
         log: Arc<Mutex<Vec<String>>>,
         fail_next: Arc<AtomicBool>,
+        revoke_during_open: Arc<AtomicBool>,
         live: Arc<Mutex<Option<Arc<Live>>>>,
     }
 
     impl AudioInput for FakeInput {
         fn open(&mut self, sink: AudioSink) -> Result<(), String> {
+            if self.revoke_during_open.swap(false, Ordering::SeqCst) {
+                self.live.lock().unwrap().clone().unwrap().revoke();
+            }
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 self.log.lock().unwrap().push("open failed".into());
                 return Err("no device".into());
@@ -438,6 +480,30 @@ mod tests {
         c.handle(MicEvent::Listening(true));
         assert_eq!(log(&input), ["open 1", "close at epoch 2", "open 3"]);
         assert!(c.is_running());
+    }
+
+    #[test]
+    fn a_queued_start_does_not_open_after_a_pause_or_lost_core() {
+        // The protocol thread already revoked (pause, or EOF) while Ready and Start(true) were still queued.
+        for last in [MicEvent::Listening(false), MicEvent::Disconnect] {
+            let (mut c, input, _rx, _, live) = controller();
+            live.revoke();
+            c.handle(MicEvent::Ready);
+            c.handle(MicEvent::Start(true));
+            c.handle(last);
+            assert!(log(&input).is_empty(), "{:?}", log(&input));
+            assert!(!c.is_running());
+        }
+    }
+
+    #[test]
+    fn a_pause_while_opening_closes_again_at_once() {
+        let (mut c, input, _rx, _, _) = controller();
+        input.revoke_during_open.store(true, Ordering::SeqCst);
+        c.handle(MicEvent::Ready);
+        c.handle(MicEvent::Start(true));
+        assert!(!c.is_running());
+        assert_eq!(log(&input), ["open 1", "close at epoch 2"]);
     }
 
     #[test]
@@ -531,6 +597,7 @@ mod tests {
             epoch,
             live,
             lost: Arc::new(AtomicBool::new(false)),
+            timed: Arc::new(AtomicBool::new(false)),
             failed: etx,
         };
         (s, rx)
@@ -575,6 +642,44 @@ mod tests {
             rx.try_recv().is_err(),
             "the callback's late chunk never queues"
         );
+    }
+
+    #[test]
+    fn buffers_without_capture_times_are_dropped() {
+        let live = Arc::new(Live::default());
+        live.allow();
+        let lag = Some(Duration::from_millis(30));
+        // A stream that starts without timing (ALSA's first buffer): nothing is queued until timing appears.
+        let (s1, rx) = sink(8, live.clone(), 0);
+        assert!(!s1.push_captured(&[0.0; 320], 1, 16_000, SECOND, None));
+        assert!(!s1.push_captured(&[0.0; 320], 1, 16_000, SECOND, Some(Duration::from_secs(9))));
+        assert!(rx.try_recv().is_err());
+        assert!(s1.push_captured(&[0.0; 320], 1, 16_000, 2 * SECOND, lag));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Audio::Samples {
+                lost_before: false,
+                ..
+            }
+        ));
+        // Timing lost after a resume (a new sink for the new epoch): dropped again.
+        let (s2, rx2) = sink(8, live, 0);
+        assert!(s2.push_captured(&[0.0; 320], 1, 16_000, 3 * SECOND, lag));
+        assert!(!s2.push_captured(&[0.0; 320], 1, 16_000, 3 * SECOND, None));
+        assert!(s2.push_captured(&[0.0; 320], 1, 16_000, 4 * SECOND, lag));
+        let flags: Vec<bool> = rx2
+            .try_iter()
+            .map(|a| {
+                matches!(
+                    a,
+                    Audio::Samples {
+                        lost_before: true,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(flags, [false, true]);
     }
 
     #[test]

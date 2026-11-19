@@ -227,24 +227,58 @@ fn download_into(staging: &Path) -> Result<PathBuf, String> {
     Ok(model)
 }
 
-/// Puts a complete `staged` model in place of `dir`, keeping the old one if anything fails.
+/// Installs a complete `staged` model. `dir` is a symlink to a versioned directory beside it: the new model
+/// becomes a new version and the link is replaced in one rename, so at every moment `dir` names a complete model
+/// (the old one until the rename, the new one after). A crash leaves at most an unused version behind.
 fn activate(staged: &Path, dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
     if !model_present(staged) {
         return Err("the new model is incomplete; nothing was installed".into());
     }
-    let old = sibling(dir, "old");
-    let had_old = dir.exists();
-    if had_old {
-        std::fs::rename(dir, &old).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let version = sibling(dir, "v");
+    std::fs::rename(staged, &version).map_err(|e| err(&version, e))?;
+    let link = sibling(dir, "link");
+    let target = version.file_name().ok_or("bad version path")?;
+    if let Err(e) = symlink(target, &link) {
+        let _ = std::fs::remove_dir_all(&version);
+        return Err(err(&link, e));
     }
-    if let Err(e) = std::fs::rename(staged, dir) {
-        if had_old {
-            let _ = std::fs::rename(&old, dir);
+    let meta = std::fs::symlink_metadata(dir).ok();
+    let previous = match &meta {
+        Some(m) if m.file_type().is_symlink() => {
+            std::fs::read_link(dir).ok().map(|t| dir.with_file_name(t))
         }
-        return Err(format!("{}: {e}", dir.display()));
+        _ => None,
+    };
+    // A model installed as a plain directory (before versions) is moved aside first; only that step leaves a
+    // moment without a model, once.
+    let plain = match &meta {
+        Some(m) if m.is_dir() => {
+            let aside = sibling(dir, "old");
+            std::fs::rename(dir, &aside).map_err(|e| err(dir, e))?;
+            Some(aside)
+        }
+        _ => None,
+    };
+    if let Err(e) = std::fs::rename(&link, dir) {
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&version);
+        if let Some(aside) = &plain
+            && let Err(back) = std::fs::rename(aside, dir)
+        {
+            return Err(format!(
+                "{}; the previous model is at {} ({back})",
+                err(dir, e),
+                aside.display()
+            ));
+        }
+        return Err(err(dir, e));
     }
-    if had_old {
-        let _ = std::fs::remove_dir_all(&old);
+    for old in previous.iter().chain(plain.iter()) {
+        if old != &version {
+            let _ = std::fs::remove_dir_all(old);
+        }
     }
     Ok(())
 }
@@ -287,11 +321,17 @@ mod tests {
         }
     }
 
+    fn entries(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
     #[test]
-    fn activation_replaces_only_with_a_complete_model() {
+    fn activation_swaps_a_link_to_a_complete_model() {
         let root = std::env::temp_dir().join(format!("zora-stt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let live = root.join("models").join(MODEL);
+        let models = root.join("models");
+        let live = models.join(MODEL);
+        // An install from before versions: a plain directory.
         fake_model(&live, true);
         std::fs::write(live.join("marker"), b"old").unwrap();
         let partial = root.join("partial");
@@ -301,9 +341,32 @@ mod tests {
         let full = root.join("full");
         fake_model(&full, true);
         activate(&full, &live).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&live)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(model_present(&live) && !live.join("marker").exists());
-        let leftovers = std::fs::read_dir(root.join("models")).unwrap().count();
-        assert_eq!(leftovers, 1, "the old copy is removed");
+        assert_eq!(entries(&models), 2, "the link and one version");
+        // A run that crashed after moving its version in, before the swap: the live model is untouched.
+        let stray = sibling(&live, "v");
+        fake_model(&stray, true);
+        std::os::unix::fs::symlink("nowhere", sibling(&live, "link")).unwrap();
+        assert!(model_present(&live));
+        let again = root.join("again");
+        fake_model(&again, true);
+        std::fs::write(again.join("marker"), b"new").unwrap();
+        activate(&again, &live).unwrap();
+        assert!(
+            live.join("marker").exists(),
+            "the link points at the newest version"
+        );
+        assert_eq!(
+            entries(&models),
+            4,
+            "previous version removed; the crash leftovers stay"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -3,7 +3,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, SampleFormat, SizedSample};
 use zora_plugin::clock::now_ns;
-use zora_plugin::mic::{AudioInput, AudioSink, buffer_end_ns};
+use zora_plugin::mic::{AudioInput, AudioSink};
 
 #[derive(Default)]
 pub struct CpalInput {
@@ -22,30 +22,27 @@ where
     let (channels, rate) = (config.channels, config.sample_rate);
     let errs = sink.clone();
     let mut buf: Vec<f32> = Vec::new();
-    let mut timed: Option<bool> = None;
+    let mut untimed = 0u64;
     device.build_input_stream::<T, _, _>(
         config,
         move |data: &[T], info: &cpal::InputCallbackInfo| {
             let now = now_ns();
             let ts = info.timestamp();
-            let frames = data.len() / channels.max(1) as usize;
-            let end = buffer_end_ns(
-                now,
-                ts.callback.checked_duration_since(ts.capture),
-                frames,
-                rate,
-            );
-            // Losing (or regaining) the device's capture times moves the time base: start a new session.
-            if timed.is_some_and(|t| t != end.is_some()) {
-                sink.mark_lost();
-            }
-            timed = Some(end.is_some());
+            // cpal reports a capture time it could not compute as zero.
+            let lag = (ts.capture != cpal::StreamInstant::ZERO)
+                .then(|| ts.callback.checked_duration_since(ts.capture))
+                .flatten();
             buf.clear();
             buf.extend(
                 data.iter()
                     .map(|s| <f32 as cpal::FromSample<T>>::from_sample_(*s)),
             );
-            sink.push(&buf, channels, rate, end.unwrap_or(now));
+            if !sink.push_captured(&buf, channels, rate, now, lag) {
+                untimed += 1;
+                if untimed.is_power_of_two() {
+                    eprintln!("zora-listen: {untimed} buffer(s) without a capture time dropped");
+                }
+            }
         },
         move |err: cpal::Error| match err.kind() {
             ErrorKind::Xrun => errs.mark_lost(),
