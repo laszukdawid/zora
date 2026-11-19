@@ -322,13 +322,26 @@ impl Graph {
         running: bool,
         now: Ns,
     ) -> Vec<Msg> {
-        self.awaiting.remove(&id);
+        let classified = props.is_some();
         let entry = self.streams.entry(id).or_default();
         if let Some(p) = props {
             entry.set_props(p, &self.apps);
         }
         entry.running = running;
-        self.edges(now)
+        let mut out = vec![];
+        // Until its first info with properties, a node can't be classified and stays a blind spot. A dictation
+        // stream may have run and stopped between its discovery and that info, so that time is unknown.
+        if classified && let Some(since) = self.awaiting.remove(&id) {
+            let e = &self.streams[&id];
+            if e.capture && e.matches {
+                out.push(Msg::Unknown {
+                    from_ns: since,
+                    to_ns: now,
+                });
+            }
+        }
+        out.extend(self.edges(now));
+        out
     }
 
     pub fn removed(&mut self, id: u32, now: Ns) -> Vec<Msg> {
@@ -496,13 +509,61 @@ mod tests {
     }
 
     #[test]
+    fn time_before_a_dictation_streams_first_info_is_unknown() {
+        let t = 10 * SECOND;
+        let mut g = Graph::new(vec!["rec".into()]);
+        g.monitor.observe(false, t);
+        g.discovered(4, Some(CAPTURE_CLASS), t + 100 * MILLI);
+        g.discovered(5, Some(CAPTURE_CLASS), t + 100 * MILLI);
+        // Info without properties can't classify the node: still a blind spot.
+        assert!(
+            g.info(4, None::<[(&str, &str); 0]>, false, t + 200 * MILLI)
+                .is_empty()
+        );
+        assert!(!g.complete());
+        let rec = [("media.class", CAPTURE_CLASS), ("application.name", "rec")];
+        let out = g.info(4, Some(rec), false, t + 500 * MILLI);
+        assert_eq!(
+            out,
+            [Msg::Unknown {
+                from_ns: t + 100 * MILLI,
+                to_ns: t + 500 * MILLI
+            }],
+            "it may have recorded before it was seen idle"
+        );
+        // A capture stream of another app is proven irrelevant by its first info.
+        let other = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.name", "browser"),
+        ];
+        assert!(g.info(5, Some(other), false, t + 500 * MILLI).is_empty());
+        assert!(g.complete());
+        // The command's sync now reports idle, and the core already holds the unknown interval.
+        assert!(g.monitor.observe(false, t + 600 * MILLI).is_empty());
+        assert!(matches!(
+            g.monitor.synced(1, t + 600 * MILLI),
+            Msg::Synced {
+                healthy: true,
+                capturing: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn graph_reports_edges_from_node_info() {
         let t = 10 * SECOND;
         let mut g = Graph::new(vec!["rec".into()]);
         g.monitor.observe(false, t);
         g.discovered(3, Some(CAPTURE_CLASS), t);
         let props = [("media.class", CAPTURE_CLASS), ("application.name", "rec")];
-        assert!(g.info(3, Some(props), false, t).is_empty());
+        assert_eq!(
+            g.info(3, Some(props), false, t),
+            [Msg::Unknown {
+                from_ns: t,
+                to_ns: t
+            }]
+        );
         assert!(g.complete() && g.known(3));
         let out = g.info(3, None::<[(&str, &str); 0]>, true, t + SECOND);
         assert!(matches!(out[0], Msg::Dictation { began: true, .. }));
