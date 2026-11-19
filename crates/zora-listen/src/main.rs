@@ -10,6 +10,7 @@ use zora_plugin::listen::{FileInput, ScriptedRecognizer, run_listen_plugin};
 
 const USAGE: &str = "usage: zora-listen [--file <wav>] [--fake-stt <script>]
        zora-listen setup [--force]       download the speech model (about 130 MB, once)
+       zora-listen prune                 remove older model versions (run while Zora is stopped)
        zora-listen transcribe <wav>      print what the model hears in a WAV file
 
 With no arguments it is a zorad plugin (docs/protocol.md) that listens to the default microphone.
@@ -30,6 +31,7 @@ fn main() {
             0
         }
         Some("setup") => linux::setup(args.iter().any(|a| a == "--force")),
+        Some("prune") => linux::prune(),
         Some("transcribe") => match args.get(1) {
             Some(f) => linux::transcribe(&PathBuf::from(f)),
             None => {
@@ -89,6 +91,19 @@ mod linux {
         }
     }
 
+    pub fn prune() -> i32 {
+        match stt::prune(&json!({})) {
+            Ok(n) => {
+                println!("removed {n} older model version(s)");
+                0
+            }
+            Err(e) => {
+                eprintln!("zora-listen prune: {e}");
+                1
+            }
+        }
+    }
+
     pub fn setup(force: bool) -> i32 {
         match stt::setup(&json!({}), force) {
             Ok(dir) => {
@@ -140,6 +155,10 @@ mod linux {
     const ONLY: &str = "zora-listen: the microphone and speech model are Linux-only; elsewhere only --file with --fake-stt works";
 
     pub fn run(_: Option<FileInput>) -> i32 {
+        eprintln!("{ONLY}");
+        1
+    }
+    pub fn prune() -> i32 {
         eprintln!("{ONLY}");
         1
     }

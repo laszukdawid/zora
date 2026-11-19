@@ -171,15 +171,42 @@ pub fn setup(config: &Value, force: bool) -> Result<PathBuf, String> {
     install(&dir, force, download_into)
 }
 
-/// Where setup keeps model versions: `<models>/versions`, marked as setup's own. Nothing outside it is ever
-/// deleted, and inside it only versions older than the previous one.
+/// Where setup keeps model versions: `<models>/versions`, marked as setup's own. Setup never deletes a version;
+/// `prune` removes all but the current one, and nothing outside that directory, ever.
 const VERSIONS: &str = "versions";
 const MARKER: &str = ".zora-managed";
+const MARKER_TEXT: &[u8] = b"zora-listen setup keeps model versions here\n";
+
+/// Removes every installed version except the one in use. Run it while Zora is stopped: a starting plugin may
+/// be about to read an older version. Returns how many were removed.
+pub fn prune(config: &Value) -> Result<usize, String> {
+    let dir = model_dir(config);
+    let root = dir.parent().ok_or("model directory has no parent")?;
+    if !root.join(VERSIONS).exists() {
+        return Ok(0);
+    }
+    let _lock = lock(&root.join(".setup.lock"))?;
+    let versions = managed_versions(root)?;
+    let Some(current) = current_version(&dir, &versions) else {
+        return Err(format!(
+            "{} does not point at a version setup installed; nothing removed",
+            dir.display()
+        ));
+    };
+    let mut removed = 0;
+    for (v, path) in list_versions(&versions) {
+        if v != current {
+            std::fs::remove_dir_all(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
 
 /// Installs a model fetched by `fetch` (which fills the directory it is given). Rules:
 /// - one setup at a time: an exclusive lock on `<models>/.setup.lock` for the whole run;
 /// - versions live only in the marked `<models>/versions`; `dir` becomes a link to one of them;
-/// - replacing the link is the commit point: after it nothing new is deleted, and later failures are reported;
+/// - replacing the link is the commit point; no version is ever deleted here (see `prune`);
 /// - a model installed as a plain directory at `dir` is used as it is and never touched; to replace it the user
 ///   moves it away first.
 fn install(
@@ -235,8 +262,7 @@ fn install(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
-    let previous = current_version(dir, &versions);
-    let n = previous.map_or(1, |p| p + 1).max(newest(&versions) + 1);
+    let n = newest(&versions) + 1;
     let name = format!("{MODEL}-{n}");
     let version = versions.join(&name);
     std::fs::rename(&model, &version).map_err(|e| err(&version, e))?;
@@ -247,13 +273,6 @@ fn install(
         .map_err(|e| err(&link, e))?;
     // The commit point.
     std::fs::rename(&link, dir).map_err(|e| err(dir, e))?;
-    if let Some(p) = previous {
-        for (v, path) in list_versions(&versions) {
-            if v < p {
-                let _ = std::fs::remove_dir_all(path);
-            }
-        }
-    }
     Ok(dir.to_path_buf())
 }
 
@@ -276,26 +295,36 @@ fn lock(path: &Path) -> Result<std::fs::File, String> {
     Ok(f)
 }
 
-/// `<models>/versions`, created with its marker; an unmarked one with contents is not setup's and is refused.
+/// `<models>/versions`, created with its marker. It must be a real directory (not a link) holding setup's
+/// marker as a regular file with the expected text; an unmarked one with contents is not setup's and is refused.
 fn managed_versions(root: &Path) -> Result<PathBuf, String> {
     let v = root.join(VERSIONS);
-    if !v.exists() {
-        std::fs::create_dir(&v).map_err(|e| format!("{}: {e}", v.display()))?;
+    let refuse = || {
+        format!(
+            "{} was not created by setup; move it away and run setup again",
+            v.display()
+        )
+    };
+    match std::fs::symlink_metadata(&v) {
+        Err(_) => std::fs::create_dir(&v).map_err(|e| format!("{}: {e}", v.display()))?,
+        Ok(m) if !m.is_dir() => return Err(refuse()),
+        Ok(_) => {}
     }
     let marker = v.join(MARKER);
-    if !marker.exists() {
-        let empty = std::fs::read_dir(&v)
-            .map_err(|e| format!("{}: {e}", v.display()))?
-            .next()
-            .is_none();
-        if !empty {
-            return Err(format!(
-                "{} was not created by setup; move it away and run setup again",
-                v.display()
-            ));
+    match std::fs::symlink_metadata(&marker) {
+        Ok(m) if m.is_file() && std::fs::read(&marker).is_ok_and(|t| t == MARKER_TEXT) => {}
+        Ok(_) => return Err(refuse()),
+        Err(_) => {
+            let empty = std::fs::read_dir(&v)
+                .map_err(|e| format!("{}: {e}", v.display()))?
+                .next()
+                .is_none();
+            if !empty {
+                return Err(refuse());
+            }
+            std::fs::write(&marker, MARKER_TEXT)
+                .map_err(|e| format!("{}: {e}", marker.display()))?;
         }
-        std::fs::write(&marker, b"zora-listen setup keeps model versions here\n")
-            .map_err(|e| format!("{}: {e}", marker.display()))?;
     }
     Ok(v)
 }
@@ -445,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn installs_link_to_versions_and_keeps_the_previous_one() {
+    fn installs_link_to_versions_and_prunes_only_when_asked() {
         let r = root("versions");
         let live = r.join(MODEL);
         install(&live, false, fetch_tagged("a")).unwrap();
@@ -464,9 +493,14 @@ mod tests {
         assert_eq!(tag(&live), "c");
         assert_eq!(
             version_numbers(&r),
-            [2, 3],
-            "only versions older than the previous one go"
+            [1, 2, 3],
+            "setup never deletes a version"
         );
+        let config = serde_json::json!({"model": live});
+        assert_eq!(prune(&config).unwrap(), 2);
+        assert_eq!(version_numbers(&r), [3]);
+        assert_eq!(tag(&live), "c");
+        assert_eq!(prune(&config).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&r);
     }
 
@@ -538,6 +572,32 @@ mod tests {
     }
 
     #[test]
+    fn a_linked_or_falsely_marked_versions_directory_is_refused() {
+        let r = root("linked");
+        std::fs::create_dir_all(&r).unwrap();
+        // A link to someone else's directory that even carries the right marker.
+        let elsewhere = r.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(format!("{MODEL}-1"))).unwrap();
+        std::fs::write(elsewhere.join(MARKER), MARKER_TEXT).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, r.join(VERSIONS)).unwrap();
+        let live = r.join(MODEL);
+        assert!(install(&live, true, fetch_tagged("a")).is_err());
+        assert!(prune(&serde_json::json!({"model": live})).is_err());
+        assert!(elsewhere.join(format!("{MODEL}-1")).exists());
+        // A real directory whose marker is a link, or has other contents.
+        let r2 = root("marker");
+        let v = r2.join(VERSIONS);
+        std::fs::create_dir_all(&v).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join(MARKER), v.join(MARKER)).unwrap();
+        assert!(install(&r2.join(MODEL), true, fetch_tagged("a")).is_err());
+        std::fs::remove_file(v.join(MARKER)).unwrap();
+        std::fs::write(v.join(MARKER), b"something else").unwrap();
+        assert!(install(&r2.join(MODEL), true, fetch_tagged("a")).is_err());
+        let _ = std::fs::remove_dir_all(&r);
+        let _ = std::fs::remove_dir_all(&r2);
+    }
+
+    #[test]
     fn setup_runs_one_at_a_time() {
         let r = root("lock");
         let live = r.join(MODEL);
@@ -569,7 +629,7 @@ mod tests {
             h.join().unwrap().unwrap();
         }
         assert!(model_present(&live));
-        assert_eq!(version_numbers(&r).len(), 2);
+        assert_eq!(version_numbers(&r).len(), 5);
         let _ = std::fs::remove_dir_all(&r);
     }
 
