@@ -25,19 +25,20 @@ public enum SpeechPipelineError: Error, CustomStringConvertible {
 /// Microphone (or file) → AVAudioConverter → SpeechAnalyzer(SpeechDetector + SpeechTranscriber) → final segments.
 /// Timestamps are host seconds: each analyzer session is anchored to the host time of its first buffer.
 public final class SpeechPipeline: @unchecked Sendable {
-    struct Chunk { var buffer: AVAudioPCMBuffer; var host: HostSeconds; var wall: Date }
+    struct Chunk { var buffer: AVAudioPCMBuffer; var host: HostSeconds; var wall: Date; var tag: CaptureTag? }
 
     private final class Session {
         let id: UInt64
         let h0: HostSeconds
+        let tag: CaptureTag?
         let analyzer: SpeechAnalyzer
         let input: AsyncStream<AnalyzerInput>.Continuation
         let results: Task<Void, Never>
         /// Cleared when the session's audio timeline is broken; late results are then discarded.
         let valid: OSAllocatedUnfairLock<Bool>
-        init(id: UInt64, h0: HostSeconds, analyzer: SpeechAnalyzer, input: AsyncStream<AnalyzerInput>.Continuation,
+        init(id: UInt64, h0: HostSeconds, tag: CaptureTag?, analyzer: SpeechAnalyzer, input: AsyncStream<AnalyzerInput>.Continuation,
              results: Task<Void, Never>, valid: OSAllocatedUnfairLock<Bool>) {
-            self.id = id; self.h0 = h0; self.analyzer = analyzer; self.input = input; self.results = results; self.valid = valid
+            self.id = id; self.h0 = h0; self.tag = tag; self.analyzer = analyzer; self.input = input; self.results = results; self.valid = valid
         }
     }
 
@@ -58,6 +59,9 @@ public final class SpeechPipeline: @unchecked Sendable {
     private var micOn = false
     /// Set while pausing: buffered audio is skipped and the open session is thrown away, not finalized.
     private let discarding = OSAllocatedUnfairLock(initialState: false)
+    /// The tag new microphone audio is captured under; nil while paused (the tap drops audio and no partial
+    /// text goes out).
+    private let live = OSAllocatedUnfairLock<CaptureTag?>(initialState: nil)
 
     // Consumer-task state.
     private var session: Session?
@@ -68,7 +72,10 @@ public final class SpeechPipeline: @unchecked Sendable {
     private var boundedInput = true
 
     /// Live, unfinished text (for early UI feedback only). Setting it before `prepare()` turns on volatile results.
-    public var onPartial: (@Sendable (_ session: UInt64, _ text: String) -> Void)?
+    public var onPartial: (@Sendable (_ session: UInt64, _ text: String, _ tag: CaptureTag?) -> Void)?
+    /// The microphone closed on its own (a restart after a device change failed). The engine is stopped, but
+    /// the consumer still runs: call `pauseMicrophone()` to release the rest.
+    public var onMicLost: (@Sendable (_ tag: CaptureTag?, _ reason: String) -> Void)?
 
     public init(locale: Locale, useDetector: Bool, onEvent: @escaping @Sendable (TranscriptEvent) -> Void) {
         self.requestedLocale = locale
@@ -118,11 +125,18 @@ public final class SpeechPipeline: @unchecked Sendable {
 
     // MARK: Microphone
 
-    public func startMicrophone() throws {
+    /// Opens the microphone; its audio and text carry `tag`. On failure everything is released again.
+    public func startMicrophone(tag: CaptureTag) async throws {
+        live.withLock { $0 = tag }
         startConsumer()
-        try engineLock.withLock {
-            try installTapAndStart()
-            micOn = true
+        do {
+            try engineLock.withLock {
+                try installTapAndStart()
+                micOn = true
+            }
+        } catch {
+            await pauseMicrophone()
+            throw error
         }
         if configObserver == nil {
             configObserver = NotificationCenter.default.addObserver(
@@ -134,6 +148,8 @@ public final class SpeechPipeline: @unchecked Sendable {
     /// Releases the microphone (the system's mic indicator goes off) and throws away what was heard but not yet
     /// transcribed, so nothing from before the pause arrives later. `startMicrophone()` resumes.
     public func pauseMicrophone() async {
+        // First, so partial text still on its way from the analyzer is dropped.
+        live.withLock { $0 = nil }
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
         configObserver = nil
         closeEngine()
@@ -178,7 +194,10 @@ public final class SpeechPipeline: @unchecked Sendable {
             markDiscontinuity()
             do { try installTapAndStart() } catch {
                 micOn = false
+                let tag = live.withLock { v in defer { v = nil }; return v }
+                log.error("microphone restart failed: \(String(describing: error), privacy: .public)")
                 onEvent(.gap(reason: "microphone restart failed: \(error)", at: HostClock.now()))
+                onMicLost?(tag, "\(error)")
             }
         }
     }
@@ -192,9 +211,9 @@ public final class SpeechPipeline: @unchecked Sendable {
         // ~100 ms blocks keep wakeups low without adding much latency.
         let frames = AVAudioFrameCount(format.sampleRate / 10)
         input.installTap(onBus: 0, bufferSize: frames, format: format) { [weak self] buffer, when in
-            guard let self, let copy = Self.copy(buffer) else { return }
+            guard let self, let tag = self.live.withLock({ $0 }), let copy = Self.copy(buffer) else { return }
             let host = when.isHostTimeValid ? HostClock.seconds(fromHostTime: when.hostTime) : HostClock.now()
-            if case .dropped = self.chunks?.yield(Chunk(buffer: copy, host: host, wall: Date())) {
+            if case .dropped = self.chunks?.yield(Chunk(buffer: copy, host: host, wall: Date(), tag: tag)) {
                 self.dropped.withLock { $0 = true }
             }
         }
@@ -224,7 +243,7 @@ public final class SpeechPipeline: @unchecked Sendable {
             // Real-time pace, like a microphone: segment timestamps must never lie in the future.
             let wait = h0 + offset - HostClock.now()
             if wait > 0 { try await Task.sleep(for: .seconds(wait)) }
-            chunks?.yield(Chunk(buffer: buf, host: h0 + offset, wall: wall0.addingTimeInterval(offset)))
+            chunks?.yield(Chunk(buffer: buf, host: h0 + offset, wall: wall0.addingTimeInterval(offset), tag: nil))
             position += AVAudioFramePosition(buf.frameLength)
         }
         chunks?.finish()
@@ -247,6 +266,11 @@ public final class SpeechPipeline: @unchecked Sendable {
 
     private func process(_ chunk: Chunk) async {
         if discarding.withLock({ $0 }) { return }
+        // Audio from another epoch or connection never joins a session; the old one is thrown away.
+        if let s = session, s.tag != chunk.tag {
+            await discardSession()
+            onEvent(.gap(reason: "listening epoch changed", at: chunk.host))
+        }
         let lostAudio = dropped.withLock { v in defer { v = false }; return v }
         let restart = restartRequested.withLock { v in defer { v = false }; return v }
         var gapReason: String?
@@ -264,7 +288,7 @@ public final class SpeechPipeline: @unchecked Sendable {
         lastEnd = (chunk.host + duration, chunk.wall.addingTimeInterval(duration))
 
         if session == nil {
-            do { try await startSession(h0: chunk.host) } catch {
+            do { try await startSession(h0: chunk.host, tag: chunk.tag) } catch {
                 onEvent(.gap(reason: "analyzer start failed: \(error)", at: chunk.host))
                 return
             }
@@ -292,7 +316,7 @@ public final class SpeechPipeline: @unchecked Sendable {
         return (modules, transcriber)
     }
 
-    private func startSession(h0: HostSeconds) async throws {
+    private func startSession(h0: HostSeconds, tag: CaptureTag?) async throws {
         guard let format = analyzerFormat else { throw SpeechPipelineError.noAudioFormat }
         let (modules, transcriber) = makeModules()
         let analyzer = SpeechAnalyzer(modules: modules, options: .init(priority: .utility, modelRetention: .whileInUse))
@@ -312,16 +336,18 @@ public final class SpeechPipeline: @unchecked Sendable {
                     if !r.isFinal {
                         // At most ~4 updates a second, and only when the text changed.
                         let now = HostClock.now()
-                        if let onPartial = self?.onPartial, text != lastPartial, now - lastPartialAt >= 0.25 {
+                        // Only while capturing under the session's own tag: a pause or restart stops it at once.
+                        if let self, let onPartial = self.onPartial, text != lastPartial, now - lastPartialAt >= 0.25,
+                           tag == nil || self.live.withLock({ $0 }) == tag {
                             lastPartial = text
                             lastPartialAt = now
-                            onPartial(id, text)
+                            onPartial(id, text, tag)
                         }
                         continue
                     }
                     lastPartial = ""
                     onEvent(.segment(TranscriptSegment(
-                        session: id, start: h0 + r.range.start.seconds, end: h0 + r.range.end.seconds, text: text
+                        session: id, start: h0 + r.range.start.seconds, end: h0 + r.range.end.seconds, text: text, tag: tag
                     )))
                 }
             } catch {
@@ -332,7 +358,7 @@ public final class SpeechPipeline: @unchecked Sendable {
             }
         }
         try await analyzer.start(inputSequence: input)
-        session = Session(id: id, h0: h0, analyzer: analyzer, input: cont, results: results, valid: valid)
+        session = Session(id: id, h0: h0, tag: tag, analyzer: analyzer, input: cont, results: results, valid: valid)
         converter = nil
     }
 

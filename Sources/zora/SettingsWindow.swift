@@ -110,24 +110,44 @@ final class SettingsModel {
     func save() async {
         guard !busy, let original else { return }
         addName() // a name typed but not yet added still counts
+        // `expect` holds the loaded value of each changed field; zorad refuses the change if one differs on disk.
         var change: [String: Any] = [:]
-        if names != original.wakeNames { change["wakeNames"] = names }
-        if workspace != original.workspace { change["workspace"] = workspace }
+        var expect: [String: Any] = [:]
+        if names != original.wakeNames {
+            change["wakeNames"] = names
+            expect["wakeNames"] = original.wakeNames
+        }
+        if workspace != original.workspace {
+            change["workspace"] = workspace
+            expect["workspace"] = original.workspace
+        }
         var phrases: [String: [String]] = [:]
+        var oldPhrases: [String: [String]] = [:]
         for (key, text, old) in [("start", start, original.phrases.start), ("end", end, original.phrases.end),
                                  ("cancel", cancel, original.phrases.cancel)] where lines(text) != old {
             phrases[key] = lines(text)
+            oldPhrases[key] = old
         }
-        if !phrases.isEmpty { change["phrases"] = phrases }
+        if !phrases.isEmpty {
+            change["phrases"] = phrases
+            expect["phrases"] = oldPhrases
+        }
         guard !change.isEmpty else { return close() }
-        guard let data = try? JSONSerialization.data(withJSONObject: change),
-              let json = String(data: data, encoding: .utf8) else { return }
+        guard let plain = Self.json(change), let json = Self.json(change.merging(["expect": expect]) { a, _ in a }) else { return }
         busy = true
-        defer { busy = false }
         error = nil
-        let r = await cli.run(["settings", "set", json])
+        var r = await cli.run(["settings", "set", json])
+        // A zorad from before `expect` rejects it as an unknown field; it can't check for conflicts anyway.
+        if !r.ok && r.message.contains("unknown field `expect`") { r = await cli.run(["settings", "set", plain]) }
+        busy = false
         guard r.ok else {
-            error = r.message
+            if r.message.localizedCaseInsensitiveContains("conflict") {
+                // Someone else saved meanwhile: show their values rather than overwrite them.
+                await load()
+                if error == nil { error = "Settings changed elsewhere — reloaded" }
+            } else {
+                error = r.message
+            }
             return
         }
         if let s = CoreSettings.decode(r.out) { apply(s) }
@@ -144,6 +164,10 @@ final class SettingsModel {
         end = s.phrases.end.joined(separator: "\n")
         cancel = s.phrases.cancel.joined(separator: "\n")
         problems = s.problems
+    }
+
+    private static func json(_ object: [String: Any]) -> String? {
+        (try? JSONSerialization.data(withJSONObject: object)).flatMap { String(data: $0, encoding: .utf8) }
     }
 
     private func lines(_ text: String) -> [String] {
