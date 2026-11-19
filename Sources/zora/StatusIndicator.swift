@@ -125,7 +125,8 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
             if epoch != self.epoch || connection != self.connection { self.confirmed = nil }
             self.connection = connection
             self.epoch = epoch
-            if let confirmed { self.confirmed = confirmed }
+            // The core sends its current decision every time; none (with epochs) means pending, e.g. withdrawn.
+            if confirmed != nil || epoch != nil { self.confirmed = confirmed }
             if !on { localPause = false }
             confirmTimeout?.cancel()
             if !on, epoch != nil, self.confirmed == nil {
