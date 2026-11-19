@@ -743,6 +743,50 @@ fn stop_it_by_voice_cancels_the_running_job() {
 }
 
 #[test]
+fn jobs_cancel_stops_the_harness_gracefully_and_records_it() {
+    let env = Env::new();
+    let marker = env.home.join("stopped");
+    let m = marker.display().to_string();
+    let cfg = env.config(
+        json!([{"delayMs": 3500, "say": "Hey Zora, long job. Do it, Zora.", "durMs": 500}]),
+        sh(
+            &format!("trap 'echo stopped > {m}; exit 0' TERM; sleep 60 & wait"),
+            &["graceful", &m],
+        ),
+    );
+    let child = env.start(&cfg);
+    let id = wait_for(Duration::from_secs(20), || {
+        let j = env.jobs().into_iter().next()?;
+        (j.status == "running").then_some(j.id)
+    });
+    // The harness needs a moment to set up its handler after it starts.
+    std::thread::sleep(Duration::from_millis(1500));
+    let out = id
+        .as_ref()
+        .map(|id| env.cmd().args(["jobs", "cancel", id]).output().unwrap());
+    let done = wait_for(Duration::from_secs(15), || {
+        env.commands()
+            .into_iter()
+            .find(|c| c.2 == "failed" || c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    let out = out.unwrap_or_else(|| panic!("job never ran:\n{err}"));
+    assert!(
+        out.status.success(),
+        "{}\n{err}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let done = done.unwrap_or_else(|| panic!("job not stopped:\n{err}"));
+    assert_eq!(
+        (done.2.as_str(), done.3.as_deref()),
+        ("failed", Some("cancelled")),
+        "{err}"
+    );
+    // TERM (Ctrl+Break on Windows) reached the harness before anything was killed.
+    assert!(marker.exists(), "the harness never saw TERM:\n{err}");
+}
+
+#[test]
 fn a_new_project_folder_applies_without_restart() {
     let env = Env::new();
     let cfg = env.config(

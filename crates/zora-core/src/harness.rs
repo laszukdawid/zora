@@ -221,7 +221,7 @@ pub fn resolve_executable(executable: &str, search_path: &[String]) -> Option<St
 }
 
 /// cmd.exe parses a batch file's arguments again, so a batch file never receives the prompt. An npm shim
-/// (`claude.cmd`) is replaced by what it starts: its `.exe`, or `node` with its script. Other batch files are refused.
+/// (`claude.cmd`) is replaced by what it starts; any other batch file is refused.
 #[cfg(windows)]
 fn windows_shim(shim: &str, search_path: &[String]) -> Result<Vec<String>, String> {
     let refuse = || {
@@ -233,35 +233,85 @@ fn windows_shim(shim: &str, search_path: &[String]) -> Result<Vec<String>, Strin
     let text = std::fs::read(shim).map_err(|_| refuse())?;
     let target = npm_shim_target(&String::from_utf8_lossy(&text)).ok_or_else(refuse)?;
     let dir = Path::new(shim).parent().unwrap_or(Path::new("."));
-    let target = dir.join(target);
-    if !target.is_file() {
-        return Err(refuse());
-    }
-    let target = target.to_string_lossy().into_owned();
-    if target.to_ascii_lowercase().ends_with(".exe") {
-        return Ok(vec![target]);
-    }
-    let node = dir.join("node.exe");
-    let node = if node.is_file() {
-        node.to_string_lossy().into_owned()
-    } else {
-        resolve_executable("node.exe", search_path)
-            .ok_or_else(|| format!("node not found on PATH (needed by {shim})"))?
+    let path = |t: &str| {
+        let p = dir.join(t);
+        p.is_file()
+            .then(|| p.to_string_lossy().into_owned())
+            .ok_or_else(refuse)
     };
-    Ok(vec![node, target])
+    match target {
+        NpmShim::Program(t) => Ok(vec![path(&t)?]),
+        NpmShim::Node(t) => {
+            // The shim's own rule: node.exe beside it, else node from the path.
+            let node = dir.join("node.exe");
+            let node = if node.is_file() {
+                node.to_string_lossy().into_owned()
+            } else {
+                resolve_executable("node.exe", search_path)
+                    .ok_or_else(|| format!("node not found on PATH (needed by {shim})"))?
+            };
+            Ok(vec![node, path(&t)?])
+        }
+    }
 }
 
-/// What an npm `cmd-shim` starts, relative to the shim's folder: the first quoted `"%dp0%\…"` path ending in
-/// `.js`, `.cjs`, `.mjs` or `.exe` (other than `node.exe`).
-pub fn npm_shim_target(cmd_text: &str) -> Option<String> {
-    cmd_text.split("\"%dp0%\\").skip(1).find_map(|rest| {
-        let path = &rest[..rest.find('"')?];
-        let lower = path.to_ascii_lowercase();
-        let ok = [".js", ".cjs", ".mjs", ".exe"]
-            .iter()
-            .any(|x| lower.ends_with(x))
-            && !lower.ends_with("node.exe")
-            && !path.contains(['%', '\n', '\r']);
-        ok.then(|| path.to_string())
-    })
+/// What an npm shim starts; the path is relative to the shim's folder.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NpmShim {
+    /// `node <script>`: a `#!/usr/bin/env node` script, with no interpreter arguments or variables.
+    Node(String),
+    /// A program run directly (a target without a shebang); only `.exe` is accepted.
+    Program(String),
+}
+
+const SHIM_HEAD: [&str; 8] = [
+    "@ECHO off",
+    "GOTO start",
+    ":find_dp0",
+    "SET dp0=%~dp0",
+    "EXIT /b",
+    ":start",
+    "SETLOCAL",
+    "CALL :find_dp0",
+];
+const SHIM_LAUNCH: &str = "endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & ";
+
+/// Recognizes exactly the `.cmd` files npm's `cmd-shim` (6 to 8, and its current main) writes for a node script or
+/// a program, and returns the target of the invocation line. Anything else (interpreter flags, `@SET` variables,
+/// another interpreter, edits) is `None`.
+pub fn npm_shim_target(cmd_text: &str) -> Option<NpmShim> {
+    let lines: Vec<&str> = cmd_text.lines().collect();
+    let rest = lines.strip_prefix(&SHIM_HEAD[..])?;
+    let target = |s: &str| {
+        let t = s.strip_prefix("\"%dp0%\\")?.strip_suffix('"')?;
+        (!t.is_empty() && !t.contains(['"', '%', '\r', '\n'])).then(|| t.to_string())
+    };
+    match rest {
+        [line] => {
+            let t = target(line.strip_suffix("   %*")?)?;
+            t.to_ascii_lowercase()
+                .ends_with(".exe")
+                .then_some(NpmShim::Program(t))
+        }
+        ["", if_exists, local, or_else, path_node, tail @ ..] => {
+            let node_block = *if_exists == "IF EXIST \"%dp0%\\node.exe\" ("
+                && *local == "  SET \"_prog=%dp0%\\node.exe\""
+                && *or_else == ") ELSE ("
+                && *path_node == "  SET \"_prog=node\"";
+            if !node_block {
+                return None;
+            }
+            let call = match tail {
+                ["  SET PATHEXT=%PATHEXT:;.JS;=;%", ")", "", last] => last
+                    .strip_prefix(SHIM_LAUNCH)?
+                    .strip_prefix("\"%_prog%\"  ")?,
+                [")", "", last] => last
+                    .strip_prefix(SHIM_LAUNCH)?
+                    .strip_prefix("set PATHEXT=%PATHEXT:;.JS;=;% & \"%_prog%\"  ")?,
+                _ => return None,
+            };
+            Some(NpmShim::Node(target(call.strip_suffix(" %*")?)?))
+        }
+        _ => None,
+    }
 }

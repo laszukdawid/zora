@@ -4,6 +4,7 @@
 //!   print <text> | ran | pwd | sleep <secs> <text> | noisy   output for the job result
 //!   stubborn <pidfile>   starts `hold` as a descendant, then waits, ignoring Ctrl+Break
 //!   hold <pidfile>       writes its pid, then waits, ignoring Ctrl+Break
+//!   graceful <marker>    waits; on Ctrl+Break writes `marker` and exits 0
 
 use std::io::Write;
 use std::time::Duration;
@@ -34,6 +35,10 @@ fn main() {
                 .spawn();
             std::thread::sleep(Duration::from_secs(120));
         }
+        "graceful" => {
+            on_break_write(arg(1));
+            std::thread::sleep(Duration::from_secs(60));
+        }
         "hold" => {
             ignore_ctrl();
             let _ = std::fs::write(arg(1), std::process::id().to_string());
@@ -54,6 +59,25 @@ fn ignore_ctrl() {
     // SAFETY: registers a handler that only returns TRUE.
     unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(ignore), 1) };
 }
+
+#[cfg(windows)]
+fn on_break_write(marker: String) {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, SetConsoleCtrlHandler};
+    static MARKER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let _ = MARKER.set(marker);
+    unsafe extern "system" fn handler(event: u32) -> i32 {
+        if event != CTRL_BREAK_EVENT {
+            return 0;
+        }
+        let _ = std::fs::write(MARKER.get().unwrap(), "stopped");
+        std::process::exit(0)
+    }
+    // SAFETY: registers a handler that writes a file and exits.
+    unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
+}
+
+#[cfg(unix)]
+fn on_break_write(_marker: String) {}
 
 #[cfg(unix)]
 fn ignore_ctrl() {}

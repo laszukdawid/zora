@@ -1,6 +1,6 @@
 use zora_core::config::{Config, Harness};
 use zora_core::detector::{tokens, units};
-use zora_core::harness::{HarnessSpec, last_line_summary, npm_shim_target};
+use zora_core::harness::{HarnessSpec, NpmShim, last_line_summary, npm_shim_target};
 use zora_core::store::Store;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -113,14 +113,71 @@ fn harness_argv_and_summaries() {
     assert_eq!((r.success, r.summary.as_str()), (false, "exit 3: boom"));
 }
 
+/// What npm's cmd-shim writes (`writeShim_` in lib/index.js): `pathext_inline` is its current main, otherwise
+/// 6.x to 8.x (8.0.0 ships with npm 11). `vars` and `args` come from the target's shebang.
+fn cmd_shim(target: &str, shebang: Option<(&str, &str, &str)>, pathext_inline: bool) -> String {
+    let head = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n";
+    let target = format!("\"%dp0%\\{target}\"");
+    let Some((vars, prog, args)) = shebang else {
+        return format!("{head}{target}   %*\r\n");
+    };
+    let vars: String = vars
+        .split_whitespace()
+        .map(|v| format!("@SET {v}\r\n"))
+        .collect();
+    let (else_extra, inline) = if pathext_inline {
+        ("", "set PATHEXT=%PATHEXT:;.JS;=;% & ")
+    } else {
+        ("  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n", "")
+    };
+    format!(
+        "{head}{vars}\r\nIF EXIST \"%dp0%\\{prog}.exe\" (\r\n  SET \"_prog=%dp0%\\{prog}.exe\"\r\n) ELSE (\r\n  SET \"_prog={prog}\"\r\n\
+         {else_extra})\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & {inline}\"%_prog%\" {args} {target} %*\r\n"
+    )
+}
+
 #[test]
-fn npm_shim_target_is_the_script_it_starts() {
-    let shim = "@ECHO off\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n)\r\n\
-                endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli.js\" %*\r\n";
+fn npm_shims_resolve_to_what_they_start() {
+    let cli = "node_modules\\@anthropic-ai\\claude-code\\cli.js";
+    for inline in [false, true] {
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("", "node", "")), inline)),
+            Some(NpmShim::Node(cli.into()))
+        );
+        // LF line endings (a checkout that converted them) parse the same.
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("", "node", "")), inline).replace("\r\n", "\n")),
+            Some(NpmShim::Node(cli.into()))
+        );
+        // Interpreter flags, variables or another interpreter would be dropped or changed: refused.
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("", "node", "--inspect")), inline)),
+            None
+        );
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("NODE_OPTIONS=x", "node", "")), inline)),
+            None
+        );
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("", "python", "")), inline)),
+            None
+        );
+    }
+    let exe = "node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
     assert_eq!(
-        npm_shim_target(shim).as_deref(),
-        Some("node_modules\\@anthropic-ai\\claude-code\\cli.js")
+        npm_shim_target(&cmd_shim(exe, None, false)),
+        Some(NpmShim::Program(exe.into()))
     );
+    assert_eq!(
+        npm_shim_target(&cmd_shim("node_modules\\x\\run.ps1", None, false)),
+        None
+    );
+    // A quoted path elsewhere in the file is not the invocation.
+    let edited = cmd_shim(cli, Some(("", "node", "")), true).replace(
+        "CALL :find_dp0\r\n",
+        "CALL :find_dp0\r\nREM \"%dp0%\\evil.exe\"\r\n",
+    );
+    assert_eq!(npm_shim_target(&edited), None);
     assert_eq!(npm_shim_target("@echo off\r\nrun.exe %*\r\n"), None);
 }
 

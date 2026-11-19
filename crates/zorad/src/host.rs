@@ -5,7 +5,6 @@ use crate::queue::{Class, Classify, InputQueue};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -336,17 +335,11 @@ async fn until_stop(
     }
 }
 
-fn spawn(cmd: &[String]) -> std::io::Result<(tokio::process::Child, crate::os::Group)> {
+fn spawn(cmd: &[String]) -> std::io::Result<(crate::os::PluginChild, crate::os::Group)> {
     let (exe, args) = cmd
         .split_first()
         .ok_or_else(|| std::io::Error::other("empty plugin command"))?;
-    let mut c = tokio::process::Command::new(zora_core::config::expand_tilde(exe));
-    c.args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    crate::os::spawn_grouped(&mut c)
+    crate::os::spawn_plugin(&zora_core::config::expand_tilde(exe), args)
 }
 
 /// Forwards plugin stderr (metadata-only by contract) in whole lines, at roughly 4 KiB/s at most.
