@@ -448,6 +448,8 @@ fn input_args(tool: Dialog, prompt: &str, current: &str) -> Vec<String> {
             "Zora Settings".into(),
             "--inputbox".into(),
             prompt.into(),
+            // The current value is positional; `--` keeps one starting with a dash from reading as an option.
+            "--".into(),
             current.into(),
         ],
     }
@@ -470,6 +472,7 @@ fn folder_args(tool: Dialog, current: &str) -> Vec<String> {
             "--title".into(),
             "Zora: project folder".into(),
             "--getexistingdirectory".into(),
+            "--".into(),
             start,
         ],
     }
@@ -543,6 +546,15 @@ async fn edit_setting(cli: &Cli, action: &Action, notifier: &mut Notifier) {
 
 // MARK: main loop
 
+fn ack(id: u64, result: Result<(), String>) -> Value {
+    let mut ack = json!({"t": "ack", "id": id, "ok": result.is_ok()});
+    if let Err(e) = result {
+        eprintln!("zora-desktop: notification failed: {e}");
+        ack["error"] = json!(e);
+    }
+    ack
+}
+
 enum Ev {
     Core(CoreMsg),
     Eof,
@@ -561,10 +573,27 @@ pub async fn run(config: Value, out: Arc<Out>, mut core_rx: UnboundedReceiver<Co
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<Ev>();
     let mut tray: Option<ksni::Handle<ZoraTray>> = None;
     let mut next_tray_try = Instant::now();
-    let mut notifier = Notifier {
-        conn: None,
-        listening_id: 0,
-    };
+    // Notifications go through one worker in order, so a slow notification service never holds up pause,
+    // stop or the end of input. The core keeps at most 16 unacknowledged, so the queue never fills in practice.
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<(Notify, bool)>(64);
+    {
+        let out = out.clone();
+        let enabled = opts.notifications;
+        tokio::spawn(async move {
+            let mut notifier = Notifier {
+                conn: None,
+                listening_id: 0,
+            };
+            while let Some((n, show)) = notify_rx.recv().await {
+                let result = if enabled {
+                    notifier.notify(&n, show).await
+                } else {
+                    Ok(())
+                };
+                out.send(ack(n.id, result));
+            }
+        });
+    }
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
     loop {
@@ -610,17 +639,10 @@ pub async fn run(config: Value, out: Arc<Out>, mut core_rx: UnboundedReceiver<Co
                     .lock()
                     .unwrap()
                     .handle(&n.kind, &n.title, &n.body, Instant::now());
-                let result = if opts.notifications {
-                    notifier.notify(&n, show).await
-                } else {
-                    Ok(())
-                };
-                let mut ack = json!({"t": "ack", "id": n.id, "ok": result.is_ok()});
-                if let Err(e) = result {
-                    eprintln!("zora-desktop: notification failed: {e}");
-                    ack["error"] = json!(e);
+                let id = n.id;
+                if notify_tx.try_send((n, show)).is_err() {
+                    out.send(ack(id, Err("too many notifications waiting".into())));
                 }
-                out.send(ack);
             }
             Ev::Core(CoreMsg::Clock { id }) => {
                 out.send(clock_reply(id));
@@ -692,6 +714,16 @@ mod tests {
     fn names_are_split_and_trimmed() {
         assert_eq!(parse_names(" zora, nova ,,\nkai "), ["zora", "nova", "kai"]);
         assert!(parse_names(" , ").is_empty());
+    }
+
+    #[test]
+    fn kdialog_values_cannot_become_options() {
+        let a = input_args(Dialog::KDialog, "Names", "-x, zora");
+        assert_eq!(&a[a.len() - 2..], ["--", "-x, zora"]);
+        let a = folder_args(Dialog::KDialog, "-dir");
+        assert_eq!(&a[a.len() - 2..], ["--", "-dir"]);
+        let a = input_args(Dialog::Zenity, "Names", "-x");
+        assert!(a.contains(&"--entry-text=-x".to_string()));
     }
 
     #[test]
