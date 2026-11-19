@@ -44,8 +44,11 @@ fn expand_tilde(p: &str) -> String {
     }
 }
 
+/// Every model file is there and not empty.
 pub fn model_present(dir: &Path) -> bool {
-    FILES.iter().all(|f| dir.join(f).is_file())
+    FILES
+        .iter()
+        .all(|f| std::fs::metadata(dir.join(f)).is_ok_and(|m| m.is_file() && m.len() > 0))
 }
 
 pub struct Sherpa {
@@ -193,6 +196,13 @@ pub fn prune(config: &Value) -> Result<usize, String> {
             dir.display()
         ));
     };
+    // The fallbacks go only when the version kept is whole.
+    if !model_present(&dir) {
+        return Err(format!(
+            "the current model in {} is incomplete; nothing removed (run `zora-listen setup --force`)",
+            dir.display()
+        ));
+    }
     let mut removed = 0;
     for (v, path) in list_versions(&versions) {
         if v != current {
@@ -501,6 +511,11 @@ mod tests {
         assert_eq!(version_numbers(&r), [3]);
         assert_eq!(tag(&live), "c");
         assert_eq!(prune(&config).unwrap(), 0);
+        // A damaged current version keeps its fallbacks.
+        install(&live, true, fetch_tagged("d")).unwrap();
+        std::fs::write(live.join(FILES[0]), b"").unwrap();
+        assert!(prune(&config).is_err());
+        assert_eq!(version_numbers(&r), [3, 4]);
         let _ = std::fs::remove_dir_all(&r);
     }
 
