@@ -124,7 +124,10 @@ invalidates everything before it, so a plugin still listening under an older epo
   `mic{open: true}` for a paused epoch is a failure too: a spawned plugin is stopped until resume. The core stops a
   spawned plugin that hasn't confirmed within a few seconds even if the plugin isn't reading its input. Only a
   confirmation or a verified reap of the plugin's processes counts as closed; an attached app that disconnects, or
-  a plugin whose processes couldn't be reaped, leaves the pause unconfirmed (`confirmed: false` and `degraded`).
+  a plugin whose processes couldn't be reaped, leaves the pause unconfirmed (`confirmed: false` and `degraded`). A
+  group that couldn't be reaped keeps counting, in later pauses too, until it is verified gone; a new connection of
+  the same plugin can't confirm for it. The timeout is reported once; if every source is later confirmed or
+  verified gone during the same pause, the core repeats `listening` with `confirmed: true`.
 - Whatever a plugin still sends while paused, the core drops: segments and partial text are neither stored nor
   matched (this takes precedence over storing old-generation segments), and an open capture ends. Final segments
   keep their capture-time check after a resume. Commands completed before the pause still run.

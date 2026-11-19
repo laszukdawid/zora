@@ -43,13 +43,6 @@ pub fn database_path() -> PathBuf {
 /// How long the core waits for every transcript plugin to confirm its microphone is off after a pause.
 const PAUSE_CONFIRM: Duration = Duration::from_secs(5);
 
-struct Awaiting {
-    deadline: Instant,
-    waiting: HashSet<String>,
-    /// Settle as soon as `waiting` is empty (false at startup, before any plugin has connected).
-    early: bool,
-}
-
 struct Plugin {
     generation: u64,
     capabilities: Vec<String>,
@@ -187,16 +180,12 @@ pub async fn run(config: Config, opts: Options) -> i32 {
         confirmed: None,
     };
     let (listen_tx, listen_rx) = tokio::sync::watch::channel(listen_state);
-    // Transcript plugins that haven't confirmed the current pause yet, and until when the core waits.
-    let mut awaiting: Option<Awaiting> = None;
+    // What the current pause still waits on before it counts as confirmed.
+    let mut tracker = crate::pause::PauseTracker::default();
     if !listen.listening {
         eprintln!("[zorad] starting paused");
         // No plugin is up yet: wait the whole deadline for them to connect and confirm.
-        awaiting = Some(Awaiting {
-            deadline: Instant::now() + PAUSE_CONFIRM,
-            waiting: HashSet::new(),
-            early: false,
-        });
+        tracker.pause(Instant::now() + PAUSE_CONFIRM, false, []);
     }
 
     // Plugins.
@@ -352,15 +341,18 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                 if next.listening != listen.listening {
                     listen_state.turn += 1;
                     listen_state.confirmed = None;
-                    awaiting = (!next.listening).then(|| Awaiting {
-                        deadline: Instant::now() + PAUSE_CONFIRM,
-                        waiting: plugins
-                            .iter()
-                            .filter(|(_, p)| p.transcript())
-                            .map(|(id, _)| id.clone())
-                            .collect(),
-                        early: true,
-                    });
+                    if next.listening {
+                        tracker.resume();
+                    } else {
+                        tracker.pause(
+                            Instant::now() + PAUSE_CONFIRM,
+                            true,
+                            plugins
+                                .iter()
+                                .filter(|(_, p)| p.transcript())
+                                .map(|(id, _)| id.clone()),
+                        );
+                    }
                 }
                 listen = next;
                 listen_state.listen = listen;
@@ -378,11 +370,8 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                 }
             }
             Item::Mic { id, turn, open } => {
-                if let Some(Awaiting { waiting, .. }) = &mut awaiting
-                    && turn == listen_state.turn
-                    && !open
-                {
-                    waiting.remove(&id);
+                if turn == listen_state.turn && !open {
+                    tracker.closed(&id);
                 }
                 vec![]
             }
@@ -395,10 +384,8 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                 capabilities,
                 tx,
             } => {
-                if let Some(Awaiting { waiting, .. }) = &mut awaiting
-                    && capabilities.iter().any(|c| c == "transcript")
-                {
-                    waiting.insert(id.clone());
+                if capabilities.iter().any(|c| c == "transcript") {
+                    tracker.up(&id);
                 }
                 plugins.insert(
                     id,
@@ -415,39 +402,19 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                 id,
                 generation,
                 reaped,
+                may_record,
             } => {
-                if let Some(p) = plugins.get(&id)
-                    && p.generation == generation
-                {
-                    let transcript = p.transcript();
+                if plugins.get(&id).is_some_and(|p| p.generation == generation) {
                     plugins.remove(&id);
-                    if reaped {
-                        // Its processes are gone, so is its microphone.
-                        if let Some(Awaiting { waiting, .. }) = &mut awaiting {
-                            waiting.remove(&id);
-                        }
-                    } else if transcript
-                        && !listen.listening
-                        && awaiting.is_none()
-                        && listen_state.confirmed == Some(true)
-                    {
-                        // An attached app that went away, or a group that couldn't be reaped: the pause is no
-                        // longer confirmed. (While still waiting, it stays unconfirmed and times out.)
-                        notifier.notify(
-                            &ZoraEvent::Degraded {
-                                reason: format!(
-                                    "plugin {id} went away while paused; its microphone may still be on"
-                                ),
-                            },
-                            &mut plugins,
-                        );
-                        listen_state.confirmed = Some(false);
-                        let _ = listen_tx.send(listen_state);
-                    }
                 }
+                tracker.down(&id, generation, reaped, may_record);
                 if let Some((_, waiting)) = &mut shutting_down {
                     waiting.remove(&id);
                 }
+                vec![]
+            }
+            Item::Reaped { id, generation } => {
+                tracker.reaped(&id, generation);
                 vec![]
             }
             Item::PluginStopped { id } => {
@@ -494,22 +461,14 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                 vec![]
             }
         };
-        if let Some(a) = &awaiting
-            && ((a.early && a.waiting.is_empty()) || Instant::now() >= a.deadline)
+        if !listen.listening
+            && let Some((confirmed, report)) = tracker.evaluate(Instant::now())
         {
-            let mut late: Vec<&String> = a.waiting.iter().collect();
-            late.sort();
-            for id in &late {
-                notifier.notify(
-                    &ZoraEvent::Degraded {
-                        reason: format!("plugin {id} did not confirm its microphone is off"),
-                    },
-                    &mut plugins,
-                );
+            for reason in report {
+                notifier.notify(&ZoraEvent::Degraded { reason }, &mut plugins);
             }
-            eprintln!("[zorad] pause confirmed={}", late.is_empty());
-            listen_state.confirmed = Some(late.is_empty());
-            awaiting = None;
+            eprintln!("[zorad] pause confirmed={confirmed}");
+            listen_state.confirmed = Some(confirmed);
             let _ = listen_tx.send(listen_state);
         }
         for fx in effects {
