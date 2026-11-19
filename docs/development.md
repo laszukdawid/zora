@@ -146,7 +146,8 @@ or turn the monitor off (below).
   meanwhile. A pure PulseAudio or ALSA system is not supported and stays unknown, so no command runs there.
 - **Speech model.** `zora-listen setup` installs into `<models>/versions/` (marked as setup's own) and points
   `<models>/<model>` at the new version with one atomic link rename, holding a lock so only one setup runs at a time.
-  It keeps the previous version and removes only older ones from that directory; it never deletes anything else. A
+  Setup never deletes a version. `zora-listen prune` removes all but the current one from that directory (and
+  nothing else); run it while Zora is stopped, since a starting plugin may be about to read an older version. A
   model directory placed at `<models>/<model>` by hand is used as it is; `setup --force` refuses to replace it.
 - **Tray.** `zora-desktop` is a notify plugin that `zorad` starts, not a separate autostart program: the protocol
   already delivers the listening state and every event it shows, and the icon goes away with the service instead of
