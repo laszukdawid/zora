@@ -82,16 +82,24 @@ impl StreamNode {
         }
     }
 
+    /// The app identity properties, to notice when they change.
+    pub fn identity(&self) -> [Option<&str>; 3] {
+        APP_KEYS.map(|k| self.prop(k))
+    }
+
     fn identified(&self) -> bool {
         APP_KEYS
             .iter()
             .any(|k| self.prop(k).is_some_and(|v| !v.trim().is_empty()))
     }
 
-    /// PipeWire's graph drivers (Dummy-Driver, Freewheel-Driver) carry no media class but say what they are.
+    /// PipeWire's own graph drivers (Dummy-Driver, Freewheel-Driver): made by the driver factory, with no media
+    /// class anywhere and no app identity. `node.driver=true` alone only means a node can drive the graph.
     pub fn is_driver(&self) -> bool {
         self.prop("factory.name") == Some("support.node.driver")
-            || self.prop("node.driver") == Some("true")
+            && self.prop("media.class").is_none()
+            && self.global_class.is_none()
+            && !self.identified()
     }
 }
 
@@ -319,8 +327,11 @@ pub struct Graph {
     streams: std::collections::HashMap<u32, StreamNode>,
     /// Blind spots and since when.
     blind: std::collections::HashMap<u32, Ns>,
-    /// Blind spots that were dictating when they went blind: they still count as capturing.
-    held: std::collections::HashSet<u32>,
+    /// Nodes seen capturing for a configured app while running: they count as capturing until seen not
+    /// running or removed, whatever happens to their identity meanwhile.
+    sticky: std::collections::HashSet<u32>,
+    /// Blind spots opened by an identity change on a running node: they close when it stops or goes away.
+    until_stopped: std::collections::HashSet<u32>,
 }
 
 impl Graph {
@@ -330,7 +341,8 @@ impl Graph {
             apps,
             streams: Default::default(),
             blind: Default::default(),
-            held: Default::default(),
+            sticky: Default::default(),
+            until_stopped: Default::default(),
         }
     }
 
@@ -360,26 +372,55 @@ impl Graph {
         running: bool,
         now: Ns,
     ) -> Vec<Msg> {
-        let was_dictating = self.dictating(id);
         let node = self.streams.entry(id).or_default();
+        let seen_before = node.seen_info;
+        let relevant_before = node.effective(&self.apps) != Class::Irrelevant;
+        let was_running = node.running;
+        let identity_before: Vec<Option<String>> = node
+            .identity()
+            .iter()
+            .map(|v| v.map(String::from))
+            .collect();
         node.seen_info = true;
         if let Some(p) = props {
             node.set_props(p);
         }
         node.running = running;
+        let identity_changed = node
+            .identity()
+            .iter()
+            .map(|v| v.map(String::from))
+            .collect::<Vec<_>>()
+            != identity_before;
         let class = node.effective(&self.apps);
         let driver = node.is_driver();
+        if !running {
+            self.sticky.remove(&id);
+        } else if class
+            == (Class::Capture {
+                matches: true,
+                running: true,
+            })
+        {
+            self.sticky.insert(id);
+        }
+        // What a running node did while its identity changed is not known: blind until it stops.
+        let relevant = relevant_before || class != Class::Irrelevant;
+        if seen_before && relevant && identity_changed && (was_running || running) {
+            self.blind.entry(id).or_insert(now);
+            self.until_stopped.insert(id);
+        }
         let mut out = vec![];
-        match (class, self.blind.contains_key(&id)) {
-            (Class::Unclassified, false) => {
-                self.blind.insert(id, now);
-                if was_dictating {
-                    self.held.insert(id);
-                }
-            }
-            (Class::Unclassified, true) => {}
-            (_, true) => out.extend(self.close_blind(id, driver, now)),
-            (_, false) => {}
+        let blind = self.blind.contains_key(&id);
+        let resolved = if self.until_stopped.contains(&id) {
+            !running && class != Class::Unclassified
+        } else {
+            class != Class::Unclassified
+        };
+        if !blind && class == Class::Unclassified {
+            self.blind.insert(id, now);
+        } else if blind && resolved {
+            out.extend(self.close_blind(id, driver, now));
         }
         out.extend(self.edges(now));
         out
@@ -389,12 +430,13 @@ impl Graph {
         let driver = self.streams.get(&id).is_some_and(StreamNode::is_driver);
         let mut out = self.close_blind(id, driver, now);
         self.streams.remove(&id);
+        self.sticky.remove(&id);
         out.extend(self.edges(now));
         out
     }
 
     fn close_blind(&mut self, id: u32, driver: bool, now: Ns) -> Vec<Msg> {
-        self.held.remove(&id);
+        self.until_stopped.remove(&id);
         match self.blind.remove(&id) {
             Some(since) if !driver => vec![Msg::Unknown {
                 from_ns: since,
@@ -408,9 +450,9 @@ impl Graph {
         self.blind.is_empty()
     }
 
-    /// A configured dictation app is capturing through this node now, or may be (held while blind).
+    /// A configured dictation app is capturing through this node now, or was and hasn't been seen to stop.
     fn dictating(&self, id: u32) -> bool {
-        self.held.contains(&id)
+        self.sticky.contains(&id)
             || matches!(
                 self.class(id),
                 Some(Class::Capture {
@@ -432,7 +474,8 @@ impl Graph {
     pub fn clear(&mut self) {
         self.streams.clear();
         self.blind.clear();
-        self.held.clear();
+        self.sticky.clear();
+        self.until_stopped.clear();
     }
 
     fn edges(&mut self, now: Ns) -> Vec<Msg> {
@@ -657,16 +700,103 @@ mod tests {
             ("media.class", CAPTURE_CLASS),
             ("application.name", "browser"),
         ];
-        let out = g.info(1, Some(other), true, t + 500 * MILLI);
+        // Another app's name while still running doesn't end it: it ends only when it is seen to stop.
+        assert!(g.info(1, Some(other), true, t + 500 * MILLI).is_empty());
+        assert!(g.capturing() && !g.complete());
+        let out = g.info(1, NONE, false, t + 900 * MILLI);
         assert_eq!(
             out,
             [
-                unknown(t + 200 * MILLI, t + 500 * MILLI),
+                unknown(t + 200 * MILLI, t + 900 * MILLI),
                 Msg::Dictation {
                     began: false,
-                    at_ns: t + 500 * MILLI
+                    at_ns: t + 900 * MILLI
                 }
             ]
+        );
+        assert!(g.complete() && !g.capturing());
+    }
+
+    #[test]
+    fn losing_only_the_matching_property_while_running_does_not_end_capture() {
+        let t = 10 * SECOND;
+        let mut g = graph(t);
+        g.discovered(1, Some(CAPTURE_CLASS), t);
+        let both = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.process.binary", REC),
+            ("application.name", "Generic Recorder"),
+        ];
+        g.info(1, Some(both), true, t);
+        assert!(g.capturing());
+        // The binary disappears; the generic name stays, so the node is still classified (as non-matching).
+        let generic = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.name", "Generic Recorder"),
+        ];
+        let out = g.info(1, Some(generic), true, t + 300 * MILLI);
+        assert!(out.is_empty(), "no ended: {out:?}");
+        assert!(g.capturing(), "sticky until seen not running");
+        assert!(!g.complete(), "the identity change opened a blind interval");
+        assert!(g.monitor.observe(true, t + 400 * MILLI).is_empty());
+        assert!(matches!(
+            g.monitor.synced(1, t + 400 * MILLI),
+            Msg::Synced {
+                capturing: true,
+                ..
+            }
+        ));
+        let out = g.info(1, NONE, false, t + SECOND);
+        assert_eq!(out[0], unknown(t + 300 * MILLI, t + SECOND));
+        assert!(matches!(out[1], Msg::Dictation { began: false, .. }));
+    }
+
+    #[test]
+    fn identity_changes_on_irrelevant_nodes_are_ignored() {
+        let t = 10 * SECOND;
+        let mut g = graph(t);
+        g.discovered(1, Some("Audio/Sink"), t);
+        g.info(1, Some([("application.name", "a")]), true, t);
+        g.info(1, Some([("application.name", "b")]), true, t + SECOND);
+        assert!(g.complete());
+    }
+
+    #[test]
+    fn driver_markers_exempt_only_classless_anonymous_driver_nodes() {
+        let t = 10 * SECOND;
+        let mut g = graph(t);
+        // node.driver=true with a matching app and no class: could be the recorder.
+        g.discovered(1, None, t);
+        g.info(
+            1,
+            Some([("node.driver", "true"), ("application.name", REC)]),
+            true,
+            t,
+        );
+        assert_eq!(g.class(1), Some(Class::Unclassified));
+        // Even the driver factory with an app identity is not exempt.
+        g.discovered(2, None, t);
+        let f = [
+            ("factory.name", "support.node.driver"),
+            ("application.name", REC),
+        ];
+        g.info(2, Some(f), false, t);
+        assert_eq!(g.class(2), Some(Class::Unclassified));
+        // A capture node that can drive the graph is a capture node; its blind interval is reported.
+        g.discovered(3, Some(CAPTURE_CLASS), t);
+        let c = [
+            ("media.class", CAPTURE_CLASS),
+            ("node.driver", "true"),
+            ("application.name", REC),
+        ];
+        let out = g.info(3, Some(c), false, t + 100 * MILLI);
+        assert_eq!(out, [unknown(t, t + 100 * MILLI)]);
+        assert_eq!(
+            g.class(3),
+            Some(Class::Capture {
+                matches: true,
+                running: false
+            })
         );
     }
 
