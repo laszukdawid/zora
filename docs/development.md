@@ -134,8 +134,9 @@ or turn the monitor off (below).
   the pause arrives, before the device has finished closing; a result still being decoded is not sent). It also closes it when the
   core goes away (it is the core's child and exits when its input closes). Open, close and stop run in one thread in
   message order, so a late resume can never reopen it after a pause or a stop. One window remains: with cpal's
-  PipeWire backend, `play()` only queues the start, so a pause that arrives in that moment can find the device
-  starting. No audio from it is used (it belongs to a revoked epoch), and the stream is closed as soon as the mic
+  PipeWire backend (and WASAPI on Windows, where `play()` queues `IAudioClient::Start` for cpal's worker thread),
+  `play()` only queues the start, so a pause that arrives in that moment can find the device starting; a pause
+  seen right after `play()` stops the stream at once. No audio from it is used (it belongs to a revoked epoch), and the stream is closed as soon as the mic
   thread handles the pause; the device is only briefly active.
 - **Dictation monitor.** It reports a dictation stream starting or stopping as soon as PipeWire says so, so even a
   short one between two checks is suppressed. It fails closed: health is unknown until the first complete snapshot
@@ -174,8 +175,8 @@ The plugins are new and have so far only been compiled, not run on Windows:
 | Plugin | Capability | How |
 |---|---|---|
 | `zora-listen` | transcript | The same plugin as on Linux: cpal (WASAPI, the default microphone) and sherpa-onnx's streaming Zipformer. The model goes to `%LOCALAPPDATA%\Zora\models`; `zora-listen setup` needs the `curl.exe` and `tar.exe` that ship with Windows 10 and later. Links need privileges on Windows, so setup names the model version in use in `<model>.version` instead of linking it. |
-| `zora-win-dictation` | dictation | Reads every active capture endpoint's audio sessions (WASAPI `IAudioSessionManager2`) four times a second. A session that is active and whose process image is named in `dictation.windowsApps` (by file name, with or without `.exe`, any case) means dictation; so does an active session whose process can't be identified. Health is unknown with no names configured, on any WASAPI error, after a stalled poll, and for the interval in which a capture device appeared or went away. `zora-win-dictation watch` lists capture sessions so you can find the name to configure. |
-| `zora-tray` | notify | The notification-area icon with the same menu as macOS and Linux (state, Pause/Resume Listening, Pause for 1 Hour, Settings → Names / Project Folder, the last five results, Restart Zora) and notifications as balloons, which Windows 10 and 11 show as toasts. Changes go only through `zorad pause`, `resume` and `settings`. Restart Zora runs the scheduled task `Zora` (option `task`). |
+| `zora-win-dictation` | dictation | Event-driven on WASAPI: it registers for endpoint changes, for new sessions on every capture endpoint (before enumerating them) and for each session's state changes, and reports dictation as the events arrive, so a capture that starts and stops between two checks is still seen. A session that is active and whose process image is named in `dictation.windowsApps` (by file name, with or without `.exe`, any case) means dictation; so does an active session whose process can't be identified, including one shared by several processes. Every 250 ms a snapshot reconciles: a session no event announced, a state the events didn't report, a device change, a failed registration or callback, or an event that arrives out of order makes the time since the last agreement unknown. Health is also unknown with no names configured, on any WASAPI error and after a stalled check. `zora-win-dictation watch` lists capture sessions so you can find the name to configure. |
+| `zora-tray` | notify | The notification-area icon with the same menu as macOS and Linux (state, Pause/Resume Listening, Pause for 1 Hour, Settings → Names / Project Folder, the last five results, Restart Zora) and notifications as balloons, which Windows 10 and 11 show as toasts. Changes go only through `zorad pause`, `resume` and `settings`. Restart Zora runs the scheduled task `\Zora\Zora` (option `task`). |
 
 ```powershell
 cargo test --workspace -- --test-threads=4   # needs the MSVC build tools (bundled SQLite is compiled from C)
@@ -185,10 +186,19 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
 
 `install.ps1` builds the four programs (or takes them from `-From <folder>`), copies them to
 `%LOCALAPPDATA%\Zora\bin`, writes `%APPDATA%\Zora\config.json` only if there is none, runs `zora-listen setup`
-(`-NoModel` skips it) and registers a scheduled task `Zora` that starts `zorad run` at logon without a console
+(`-NoModel` skips it) and registers a scheduled task `\Zora\Zora` that starts `zorad run` at logon without a console
 window (`-NoTask` skips it). Running the task again stops the old instance first, which is how the tray restarts
 Zora. The config lists no dictation app and no project folder: set both before Zora runs commands (the script
-prints how). zorad's own log goes nowhere when started by the task; run `zorad run` in a terminal to see it.
+prints how). zorad's own log goes nowhere when started by the task; run `zorad run` in a terminal to see it. It never replaces a task of that name that starts something else, and never overwrites an existing config,
+even one created while it runs.
+
+**Gates (Windows, untested on hardware).** None of the Windows plugins has run on a real machine yet:
+- the dictation monitor's events and reconciliation against a real dictation tool, a multi-process session, a
+  headset plugged in or removed while dictating, and an audio service restart;
+- `zora-listen` live capture, including the short window in which a pause arriving just as `play()` queues
+  `IAudioClient::Start` can find the device starting (a pause seen right after `play()` stops it at once; cpal
+  offers no hook to close it further);
+- the tray's menu, balloons, settings dialogs and Restart, and `install.ps1` with its scheduled task.
 
 What differs from Unix (details in [design.md](design.md)):
 
