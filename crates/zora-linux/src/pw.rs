@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use zora_plugin::clock::{Ns, SECOND, now_ns};
-use zora_plugin::dictation::{APP_KEYS, Graph, Msg, StreamNode};
+use zora_plugin::dictation::{APP_KEYS, Class, Graph, Msg, StreamNode};
 use zora_plugin::proto::Out;
 
 /// From the stdin thread into the loop.
@@ -126,13 +126,18 @@ struct Conn {
 
 const NOT_RUNNING: &str = "cannot connect to PipeWire (PulseAudio or ALSA alone is not supported)";
 
-fn describe(id: u32, n: &StreamNode) -> String {
+fn describe(id: u32, n: &StreamNode, class: Class) -> String {
     let props: Vec<String> = APP_KEYS
         .iter()
         .filter_map(|k| n.prop(k).map(|v| format!("{k}={v:?}")))
         .collect();
     let state = if n.running { "running" } else { "not running" };
-    format!("stream {id} {state}: {}", props.join(" "))
+    let kind = if class == Class::Unclassified {
+        " (names no app)"
+    } else {
+        ""
+    };
+    format!("stream {id} {state}{kind}: {}", props.join(" "))
 }
 
 fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Result<Conn, String> {
@@ -200,8 +205,13 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                         }
                         let first = !sh.graph.known(id);
                         let seen = |g: &Graph| {
-                            g.node(id)
-                                .map(|n| (n.running, n.prop(APP_KEYS[0]).map(String::from)))
+                            g.node(id).map(|n| {
+                                (
+                                    n.running,
+                                    g.class(id),
+                                    n.prop(APP_KEYS[0]).map(String::from),
+                                )
+                            })
                         };
                         let before = seen(&sh.graph);
                         let props = if first || info.change_mask().contains(NodeChangeMask::PROPS) {
@@ -213,11 +223,11 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                         let msgs = sh.graph.info(id, props, running, now_ns());
                         sh.send(msgs);
                         if sh.watch
-                            && let Some(n) = sh.graph.node(id)
-                            && n.is_capture()
+                            && let (Some(n), Some(class)) = (sh.graph.node(id), sh.graph.class(id))
+                            && class != Class::Irrelevant
                             && (first || before != seen(&sh.graph))
                         {
-                            println!("{}", describe(id, n));
+                            println!("{}", describe(id, n, class));
                         }
                     })
                     .register();
@@ -229,7 +239,7 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                 }
                 if let Some(shared) = s2.upgrade() {
                     let sh = &mut *shared.borrow_mut();
-                    if sh.watch && sh.graph.node(id).is_some_and(StreamNode::is_capture) {
+                    if sh.watch && sh.graph.class(id).is_some_and(|c| c != Class::Irrelevant) {
                         println!("stream {id} removed");
                     }
                     let msgs = sh.graph.removed(id, now_ns());

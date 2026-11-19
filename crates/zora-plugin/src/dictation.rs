@@ -29,70 +29,55 @@ pub fn matches_app<'a>(prop: impl Fn(&str) -> Option<&'a str>, apps: &[String]) 
     })
 }
 
+/// What a node is, from everything known about it. Capture detection, snapshot completeness, edges and
+/// `zora-dictation watch` all use this one classification (`StreamNode::effective`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
-    /// Not an application's capture stream: irrelevant.
-    Other,
-    /// A capture stream with an app identity; `matches` when that app is a configured dictation tool.
-    Capture { matches: bool },
-    /// Not known yet (no properties), or a capture stream without an app identity.
+    /// Proven not to be an application's capture stream.
+    Irrelevant,
+    /// A capture stream that names its app; `matches` when that app is a configured dictation tool.
+    Capture { matches: bool, running: bool },
+    /// Not proven either way: no properties yet, conflicting classes, or a capture stream without an app.
     Unclassified,
 }
 
-/// One audio node as seen through its info updates.
+/// One audio node: the media class its registry entry advertised, and its latest info.
 #[derive(Debug, Default, Clone)]
 pub struct StreamNode {
     props: std::collections::HashMap<String, String>,
-    /// The media class the registry advertised when the node appeared.
     global_class: Option<String>,
-    capture: bool,
-    matches: bool,
     pub running: bool,
-    /// A dictation stream that became unclassified while running: it still counts as capturing.
-    held: bool,
     seen_info: bool,
 }
 
 impl StreamNode {
     /// Replaces the properties. PipeWire sends the full set when they change (its change mask says so) and an
     /// empty set otherwise; the caller passes only the former.
-    pub fn set_props<'a>(
-        &mut self,
-        props: impl IntoIterator<Item = (&'a str, &'a str)>,
-        apps: &[String],
-    ) {
+    pub fn set_props<'a>(&mut self, props: impl IntoIterator<Item = (&'a str, &'a str)>) {
         self.props = props
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        self.capture = self.props.get("media.class").map(String::as_str) == Some(CAPTURE_CLASS);
-        self.matches = matches_app(|k| self.props.get(k).map(String::as_str), apps);
     }
 
     pub fn prop(&self, key: &str) -> Option<&str> {
         self.props.get(key).map(String::as_str)
     }
 
-    pub fn is_capture(&self) -> bool {
-        self.capture
-    }
-
-    /// What the registry and the properties together prove about this node. Missing or conflicting evidence
-    /// leaves it unclassified.
-    pub fn class(&self) -> Class {
+    /// The one classification: registry class and info properties together.
+    pub fn effective(&self, apps: &[String]) -> Class {
         let class = match (self.prop("media.class"), self.global_class.as_deref()) {
             (Some(a), Some(b)) if a != b => return Class::Unclassified,
             (a, b) => a.or(b),
         };
         match class {
-            Some(c) if c != CAPTURE_CLASS => Class::Other,
+            Some(c) if c != CAPTURE_CLASS => Class::Irrelevant,
             Some(_) if self.identified() => Class::Capture {
-                matches: self.matches,
+                matches: matches_app(|k| self.prop(k), apps),
+                running: self.running,
             },
-            // A capture stream that doesn't say which app it belongs to could be the dictation tool.
             Some(_) => Class::Unclassified,
-            // No class anywhere: only a node that says it is a driver is known to be irrelevant.
-            None if self.is_driver() => Class::Other,
+            None if self.is_driver() => Class::Irrelevant,
             None => Class::Unclassified,
         }
     }
@@ -103,15 +88,10 @@ impl StreamNode {
             .any(|k| self.prop(k).is_some_and(|v| !v.trim().is_empty()))
     }
 
-    /// PipeWire's graph drivers (Dummy-Driver, Freewheel-Driver) carry no media class.
-    fn is_driver(&self) -> bool {
+    /// PipeWire's graph drivers (Dummy-Driver, Freewheel-Driver) carry no media class but say what they are.
+    pub fn is_driver(&self) -> bool {
         self.prop("factory.name") == Some("support.node.driver")
             || self.prop("node.driver") == Some("true")
-    }
-
-    /// A configured dictation app is capturing through this node right now (or may be: see `held`).
-    pub fn dictating(&self) -> bool {
-        self.held || (self.capture && self.matches && self.running)
     }
 }
 
@@ -327,16 +307,20 @@ impl Monitor {
     }
 }
 
-/// The audio nodes seen on one connection. A node whose kind or state is not known yet is a blind spot: it may
-/// be a dictation stream capturing right now, so a snapshot is incomplete until its first info arrives, and one
-/// that disappears before that leaves an unknown interval.
+/// The audio nodes seen on one connection. A node is a blind spot while it is unclassified: from its discovery,
+/// or from the update that took away what classified it. Every blind interval is reported as unknown when it
+/// closes, whatever the node turns out to be, because its final identity doesn't prove what it did meanwhile.
+/// The only exceptions: a node the registry already proved irrelevant at discovery never becomes a blind spot,
+/// and a driver-marked node closes its interval silently.
 #[derive(Debug)]
 pub struct Graph {
     pub monitor: Monitor,
     apps: Vec<String>,
     streams: std::collections::HashMap<u32, StreamNode>,
-    /// Possibly relevant nodes without their first info, and since when.
-    awaiting: std::collections::HashMap<u32, Ns>,
+    /// Blind spots and since when.
+    blind: std::collections::HashMap<u32, Ns>,
+    /// Blind spots that were dictating when they went blind: they still count as capturing.
+    held: std::collections::HashSet<u32>,
 }
 
 impl Graph {
@@ -345,16 +329,21 @@ impl Graph {
             monitor: Monitor::new(!apps.is_empty()),
             apps,
             streams: Default::default(),
-            awaiting: Default::default(),
+            blind: Default::default(),
+            held: Default::default(),
         }
     }
 
-    /// A node appeared. `media_class` is from its global properties, when they carry it.
+    pub fn class(&self, id: u32) -> Option<Class> {
+        self.streams.get(&id).map(|n| n.effective(&self.apps))
+    }
+
+    /// A node appeared. `media_class` is from its registry entry, when it carries one.
     pub fn discovered(&mut self, id: u32, media_class: Option<&str>, now: Ns) {
         let node = self.streams.entry(id).or_default();
         node.global_class = media_class.map(String::from);
-        if node.class() != Class::Other {
-            self.awaiting.insert(id, now);
+        if node.effective(&self.apps) != Class::Irrelevant {
+            self.blind.insert(id, now);
         }
     }
 
@@ -371,59 +360,68 @@ impl Graph {
         running: bool,
         now: Ns,
     ) -> Vec<Msg> {
-        let entry = self.streams.entry(id).or_default();
-        let was_dictating = entry.dictating();
-        entry.seen_info = true;
+        let was_dictating = self.dictating(id);
+        let node = self.streams.entry(id).or_default();
+        node.seen_info = true;
         if let Some(p) = props {
-            entry.set_props(p, &self.apps);
+            node.set_props(p);
         }
-        entry.running = running;
-        let class = entry.class();
+        node.running = running;
+        let class = node.effective(&self.apps);
+        let driver = node.is_driver();
         let mut out = vec![];
-        // A node is a blind spot whenever it is unclassified: from its discovery, or from the update that took
-        // away what classified it. A dictation stream may have run during that time, so it is unknown; one that was
-        // running when it became unclassified still counts as capturing until it is classified or removed.
-        match (class, self.awaiting.get(&id).copied()) {
-            (Class::Unclassified, None) => {
-                self.awaiting.insert(id, now);
-                entry.held = was_dictating;
-            }
-            (Class::Unclassified, Some(_)) => {}
-            (_, Some(since)) => {
-                self.awaiting.remove(&id);
-                let held = std::mem::take(&mut entry.held);
-                if held || class == (Class::Capture { matches: true }) {
-                    out.push(Msg::Unknown {
-                        from_ns: since,
-                        to_ns: now,
-                    });
+        match (class, self.blind.contains_key(&id)) {
+            (Class::Unclassified, false) => {
+                self.blind.insert(id, now);
+                if was_dictating {
+                    self.held.insert(id);
                 }
             }
-            (_, None) => {}
+            (Class::Unclassified, true) => {}
+            (_, true) => out.extend(self.close_blind(id, driver, now)),
+            (_, false) => {}
         }
         out.extend(self.edges(now));
         out
     }
 
     pub fn removed(&mut self, id: u32, now: Ns) -> Vec<Msg> {
-        let mut out = vec![];
-        if let Some(since) = self.awaiting.remove(&id) {
-            out.push(Msg::Unknown {
-                from_ns: since,
-                to_ns: now,
-            });
-        }
+        let driver = self.streams.get(&id).is_some_and(StreamNode::is_driver);
+        let mut out = self.close_blind(id, driver, now);
         self.streams.remove(&id);
         out.extend(self.edges(now));
         out
     }
 
+    fn close_blind(&mut self, id: u32, driver: bool, now: Ns) -> Vec<Msg> {
+        self.held.remove(&id);
+        match self.blind.remove(&id) {
+            Some(since) if !driver => vec![Msg::Unknown {
+                from_ns: since,
+                to_ns: now,
+            }],
+            _ => vec![],
+        }
+    }
+
     pub fn complete(&self) -> bool {
-        self.awaiting.is_empty()
+        self.blind.is_empty()
+    }
+
+    /// A configured dictation app is capturing through this node now, or may be (held while blind).
+    fn dictating(&self, id: u32) -> bool {
+        self.held.contains(&id)
+            || matches!(
+                self.class(id),
+                Some(Class::Capture {
+                    matches: true,
+                    running: true
+                })
+            )
     }
 
     pub fn capturing(&self) -> bool {
-        self.streams.values().any(StreamNode::dictating)
+        self.streams.keys().any(|id| self.dictating(*id))
     }
 
     pub fn node(&self, id: u32) -> Option<&StreamNode> {
@@ -433,7 +431,8 @@ impl Graph {
     /// The connection is gone; everything learned on it is forgotten.
     pub fn clear(&mut self) {
         self.streams.clear();
-        self.awaiting.clear();
+        self.blind.clear();
+        self.held.clear();
     }
 
     fn edges(&mut self, now: Ns) -> Vec<Msg> {
@@ -479,39 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn property_changes_replace_the_set() {
-        let apps = vec!["pw-record".to_string()];
-        let mut n = StreamNode::default();
-        n.set_props(
-            [
-                ("media.class", CAPTURE_CLASS),
-                ("application.name", "pw-record"),
-            ],
-            &apps,
-        );
-        n.running = true;
-        assert!(n.dictating());
-        n.set_props(
-            [
-                ("media.class", CAPTURE_CLASS),
-                ("node.latency", "1024/48000"),
-            ],
-            &apps,
-        );
-        assert!(!n.dictating(), "a removed app name no longer matches");
-        let mut other = StreamNode::default();
-        other.set_props(
-            [
-                ("media.class", "Audio/Source"),
-                ("application.name", "pw-record"),
-            ],
-            &apps,
-        );
-        other.running = true;
-        assert!(!other.dictating(), "only capture streams count");
-    }
-
-    #[test]
     fn dictation_between_two_snapshots_is_still_reported() {
         let mut mon = Monitor::new(true);
         let t = 10 * SECOND;
@@ -546,173 +512,147 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_node_gone_before_its_first_info_leaves_an_unknown_interval() {
-        let t = 10 * SECOND;
-        let mut g = Graph::new(vec!["rec".into()]);
+    const REC: &str = "rec";
+
+    fn graph(t: Ns) -> Graph {
+        let mut g = Graph::new(vec![REC.into()]);
         g.monitor.observe(false, t);
-        g.discovered(7, Some(CAPTURE_CLASS), t + SECOND);
-        g.discovered(8, None, t + SECOND);
-        g.discovered(9, Some("Audio/Sink"), t + SECOND);
-        assert!(!g.complete());
-        let out = g.removed(7, t + 2 * SECOND);
-        assert_eq!(
-            out,
-            [Msg::Unknown {
-                from_ns: t + SECOND,
-                to_ns: t + 2 * SECOND
-            }]
-        );
-        assert!(!g.complete(), "an unclassified node is still a blind spot");
-        assert_eq!(g.removed(8, t + 2 * SECOND).len(), 1);
-        assert!(g.complete(), "a sink never blocks a snapshot");
-        assert!(g.removed(9, t + 2 * SECOND).is_empty());
+        g
     }
 
+    fn unknown(from_ns: Ns, to_ns: Ns) -> Msg {
+        Msg::Unknown { from_ns, to_ns }
+    }
+
+    const NONE: Option<[(&str, &str); 0]> = None;
+
     #[test]
-    fn time_before_a_dictation_streams_first_info_is_unknown() {
+    fn registry_class_and_info_identity_together_detect_a_recorder() {
         let t = 10 * SECOND;
-        let mut g = Graph::new(vec!["rec".into()]);
-        g.monitor.observe(false, t);
-        g.discovered(4, Some(CAPTURE_CLASS), t + 100 * MILLI);
-        g.discovered(5, Some(CAPTURE_CLASS), t + 100 * MILLI);
-        // Info without properties can't classify the node: still a blind spot.
-        assert!(
-            g.info(4, None::<[(&str, &str); 0]>, false, t + 200 * MILLI)
-                .is_empty()
-        );
-        assert!(!g.complete());
-        let rec = [("media.class", CAPTURE_CLASS), ("application.name", "rec")];
-        let out = g.info(4, Some(rec), false, t + 500 * MILLI);
+        let mut g = graph(t);
+        g.discovered(1, Some(CAPTURE_CLASS), t);
+        // The info names the app but not the class; the registry supplied that.
+        let out = g.info(1, Some([("application.name", REC)]), true, t + 100 * MILLI);
         assert_eq!(
-            out,
-            [Msg::Unknown {
-                from_ns: t + 100 * MILLI,
-                to_ns: t + 500 * MILLI
-            }],
-            "it may have recorded before it was seen idle"
+            g.class(1),
+            Some(Class::Capture {
+                matches: true,
+                running: true
+            })
         );
-        // A capture stream of another app is proven irrelevant by its first info.
-        let other = [
-            ("media.class", CAPTURE_CLASS),
-            ("application.name", "browser"),
-        ];
-        assert!(g.info(5, Some(other), false, t + 500 * MILLI).is_empty());
-        assert!(g.complete());
-        // The command's sync now reports idle, and the core already holds the unknown interval.
-        assert!(g.monitor.observe(false, t + 600 * MILLI).is_empty());
+        assert!(g.capturing());
         assert!(matches!(
-            g.monitor.synced(1, t + 600 * MILLI),
+            out.last(),
+            Some(Msg::Dictation { began: true, .. })
+        ));
+        assert!(matches!(
+            g.monitor.synced(1, t + 200 * MILLI),
             Msg::Synced {
-                healthy: true,
-                capturing: false,
+                capturing: true,
                 ..
             }
         ));
     }
 
     #[test]
-    fn nodes_stay_blind_spots_until_their_properties_prove_what_they_are() {
+    fn every_blind_interval_is_unknown_when_it_closes() {
         let t = 10 * SECOND;
-        let mut g = Graph::new(vec!["rec".into()]);
-        g.monitor.observe(false, t);
-        g.discovered(1, None, t);
-        g.discovered(2, Some(CAPTURE_CLASS), t);
-        // An empty property set proves nothing.
-        assert!(g.info(1, Some([]), false, t + 100 * MILLI).is_empty());
-        // A capture stream without an app identity might be the dictation tool.
-        let anonymous = [("media.class", CAPTURE_CLASS), ("node.name", "x")];
+        let mut g = graph(t);
+        g.discovered(1, Some(CAPTURE_CLASS), t);
+        let rec = [("media.class", CAPTURE_CLASS), ("application.name", REC)];
+        assert_eq!(g.info(1, Some(rec), false, t), [unknown(t, t)]);
+        // Idle, then it loses its identity, runs while unclassified, and comes back as another app.
         assert!(
-            g.info(2, Some(anonymous), false, t + 100 * MILLI)
-                .is_empty()
+            g.info(
+                1,
+                Some([("media.class", CAPTURE_CLASS)]),
+                false,
+                t + 100 * MILLI
+            )
+            .is_empty()
         );
         assert!(!g.complete());
-        // Removed while still unclassified: its whole life is unknown.
-        assert_eq!(
-            g.removed(2, t + 300 * MILLI),
-            [Msg::Unknown {
-                from_ns: t,
-                to_ns: t + 300 * MILLI
-            }]
-        );
-        // Classified later as something else: irrelevant after all.
-        let sink = [("media.class", "Audio/Sink")];
-        assert!(g.info(1, Some(sink), false, t + 400 * MILLI).is_empty());
+        assert!(g.info(1, NONE, true, t + 200 * MILLI).is_empty());
+        let other = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.name", "browser"),
+        ];
+        let out = g.info(1, Some(other), false, t + 400 * MILLI);
+        assert_eq!(out, [unknown(t + 100 * MILLI, t + 400 * MILLI)]);
         assert!(g.complete());
-        // PipeWire's drivers carry no media class but say what they are.
-        g.discovered(3, None, t);
+        // A node seen only through its registry entry and removed unseen: also unknown.
+        g.discovered(2, None, t + 500 * MILLI);
+        assert_eq!(
+            g.removed(2, t + 600 * MILLI),
+            [unknown(t + 500 * MILLI, t + 600 * MILLI)]
+        );
+        // Even when the first info proves it irrelevant (its registry entry had no class).
+        g.discovered(3, None, t + 600 * MILLI);
+        let out = g.info(
+            3,
+            Some([("media.class", "Audio/Sink")]),
+            false,
+            t + 700 * MILLI,
+        );
+        assert_eq!(out, [unknown(t + 600 * MILLI, t + 700 * MILLI)]);
+    }
+
+    #[test]
+    fn only_registry_proof_or_a_driver_marker_avoid_blind_spots() {
+        let t = 10 * SECOND;
+        let mut g = graph(t);
+        g.discovered(1, Some("Audio/Sink"), t);
+        assert!(g.complete(), "proved irrelevant at discovery");
+        assert!(
+            g.info(1, Some([("node.name", "speakers")]), false, t)
+                .is_empty()
+        );
+        g.discovered(2, None, t);
         let driver = [
             ("node.name", "Dummy-Driver"),
             ("factory.name", "support.node.driver"),
             ("node.driver", "true"),
         ];
-        assert!(g.info(3, Some(driver), false, t).is_empty());
+        assert!(g.info(2, Some(driver), true, t + 100 * MILLI).is_empty());
         assert!(g.complete());
-        // Properties without a class or a driver marker prove nothing.
-        g.discovered(4, None, t);
-        assert!(g.info(4, Some([("node.name", "x")]), false, t).is_empty());
-        assert!(!g.complete());
-        g.removed(4, t);
-        assert_eq!(
-            StreamNode::default().class(),
-            Class::Unclassified,
-            "no properties at all"
-        );
-    }
-
-    #[test]
-    fn the_registry_class_counts_as_evidence() {
-        let t = 10 * SECOND;
-        let mut g = Graph::new(vec!["rec".into()]);
-        g.monitor.observe(false, t);
-        // The registry says capture stream; the first info has only a name: still unknown.
-        g.discovered(1, Some(CAPTURE_CLASS), t);
-        assert!(g.info(1, Some([("node.name", "x")]), false, t).is_empty());
-        assert!(!g.complete());
-        // Conflicting classes prove nothing either.
-        g.discovered(2, Some(CAPTURE_CLASS), t);
-        g.info(
-            2,
-            Some([("media.class", "Audio/Sink"), ("application.name", "x")]),
-            false,
-            t,
-        );
-        assert!(!g.complete());
-        // The registry alone can prove a node irrelevant.
-        g.discovered(3, Some("Audio/Sink"), t);
-        g.info(3, Some([("node.name", "speakers")]), false, t);
-        g.removed(1, t);
-        g.removed(2, t);
+        // Proving nothing: empty properties, a name only, a capture stream without an app, conflicting classes.
+        type Case<'a> = (Option<&'a str>, Vec<(&'a str, &'a str)>);
+        let cases: [Case; 4] = [
+            (None, vec![]),
+            (None, vec![("node.name", "x")]),
+            (Some(CAPTURE_CLASS), vec![("node.name", "x")]),
+            (
+                Some(CAPTURE_CLASS),
+                vec![("media.class", "Audio/Sink"), ("application.name", "x")],
+            ),
+        ];
+        for (i, (global, props)) in cases.into_iter().enumerate() {
+            let id = 10 + i as u32;
+            g.discovered(id, global, t);
+            g.info(id, Some(props), false, t);
+            assert_eq!(g.class(id), Some(Class::Unclassified), "case {i}");
+            assert!(!g.complete());
+            g.removed(id, t);
+        }
         assert!(g.complete());
     }
 
     #[test]
-    fn a_running_recorder_that_loses_its_identity_still_counts_as_capturing() {
+    fn a_running_recorder_that_goes_blind_still_counts_as_capturing() {
         let t = 10 * SECOND;
-        let mut g = Graph::new(vec!["rec".into()]);
-        g.monitor.observe(false, t);
+        let mut g = graph(t);
         g.discovered(1, Some(CAPTURE_CLASS), t);
-        let rec = [("media.class", CAPTURE_CLASS), ("application.name", "rec")];
+        let rec = [("media.class", CAPTURE_CLASS), ("application.name", REC)];
         g.info(1, Some(rec), true, t);
         assert!(g.capturing());
-        // A props update drops the app name while it records: no `ended`, and the graph is incomplete again.
         let out = g.info(
             1,
             Some([("media.class", CAPTURE_CLASS)]),
             true,
             t + 200 * MILLI,
         );
-        assert!(out.is_empty(), "{out:?}");
+        assert!(out.is_empty(), "no ended: {out:?}");
         assert!(g.capturing() && !g.complete());
-        assert!(g.monitor.observe(true, t + 300 * MILLI).is_empty());
-        assert!(matches!(
-            g.monitor.synced(1, t + 300 * MILLI),
-            Msg::Synced {
-                capturing: true,
-                ..
-            }
-        ));
-        // Reclassified as another app: the blind time is unknown, then it ends.
         let other = [
             ("media.class", CAPTURE_CLASS),
             ("application.name", "browser"),
@@ -721,35 +661,24 @@ mod tests {
         assert_eq!(
             out,
             [
-                Msg::Unknown {
-                    from_ns: t + 200 * MILLI,
-                    to_ns: t + 500 * MILLI
-                },
+                unknown(t + 200 * MILLI, t + 500 * MILLI),
                 Msg::Dictation {
                     began: false,
                     at_ns: t + 500 * MILLI
                 }
             ]
         );
-        assert!(g.complete());
     }
 
     #[test]
     fn graph_reports_edges_from_node_info() {
         let t = 10 * SECOND;
-        let mut g = Graph::new(vec!["rec".into()]);
-        g.monitor.observe(false, t);
+        let mut g = graph(t);
         g.discovered(3, Some(CAPTURE_CLASS), t);
-        let props = [("media.class", CAPTURE_CLASS), ("application.name", "rec")];
-        assert_eq!(
-            g.info(3, Some(props), false, t),
-            [Msg::Unknown {
-                from_ns: t,
-                to_ns: t
-            }]
-        );
+        let props = [("media.class", CAPTURE_CLASS), ("application.name", REC)];
+        assert_eq!(g.info(3, Some(props), false, t), [unknown(t, t)]);
         assert!(g.complete() && g.known(3));
-        let out = g.info(3, None::<[(&str, &str); 0]>, true, t + SECOND);
+        let out = g.info(3, NONE, true, t + SECOND);
         assert!(matches!(out[0], Msg::Dictation { began: true, .. }));
         let out = g.removed(3, t + 1200 * MILLI);
         assert_eq!(
