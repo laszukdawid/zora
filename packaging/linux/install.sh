@@ -17,13 +17,18 @@ systemctl --user daemon-reload
 config="$HOME/.config/zora/config.json"
 mkdir -p "$(dirname "$config")"
 tmp="$(mktemp "$(dirname "$config")/.config.json.XXXXXX")"
+trap 'rm -f -- "$tmp"' EXIT
 install -m600 packaging/linux/config.json "$tmp"
-if ln "$tmp" "$config" 2>/dev/null; then
+if [ -e "$config" ] || [ -L "$config" ]; then
+    echo "$config exists; merge the \"plugins\" and \"dictation\" parts of packaging/linux/config.json into it"
+elif ln -T -- "$tmp" "$config"; then
     echo "wrote $config"
     echo "set harnesses.claude.workspace, and either name your dictation tool in dictation.linuxApps"
     echo "(run zora-dictation watch and dictate to see its name) or set dictation.monitor to \"none\""
+elif [ -e "$config" ] || [ -L "$config" ]; then
+    echo "$config appeared meanwhile; merge packaging/linux/config.json into it by hand"
 else
-    echo "$config exists; merge the \"plugins\" and \"dictation\" parts of packaging/linux/config.json into it"
+    echo "cannot write $config" >&2
+    exit 1
 fi
-rm -f "$tmp"
 echo "then: zorad status && systemctl --user enable --now zora"
