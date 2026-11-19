@@ -505,7 +505,7 @@ fn owner_file_ok(dirfd: i32) -> bool {
         let fd = libc::openat(
             dirfd,
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         );
         if fd < 0 {
             return false;
@@ -704,5 +704,28 @@ mod tests {
         std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
         prune_cancel_markers(&other, &live);
         assert!(other.join(&o).exists());
+    }
+
+    #[test]
+    fn a_fifo_in_place_of_the_ownership_file_neither_blocks_nor_counts() {
+        let dir = tmp().join("cancel");
+        zora_core::config::create_private_dir(&dir).unwrap();
+        let fifo =
+            std::ffi::CString::new(dir.join(OWNER_FILE).as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let orphan = uuid::Uuid::new_v4().to_string();
+        std::fs::write(dir.join(&orphan), b"").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.clone();
+        std::thread::spawn(move || {
+            prune_cancel_markers(&d, &Default::default());
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "pruning blocked on a FIFO"
+        );
+        assert!(dir.join(&orphan).exists());
     }
 }
