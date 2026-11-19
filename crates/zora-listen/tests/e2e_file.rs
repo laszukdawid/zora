@@ -211,6 +211,8 @@ fn paused_core_never_opens_the_input() {
     assert!(told, "the plugin never heard it is paused:\n{log}");
     assert!(!log.contains("listening=true"), "{log}");
     assert!(!log.contains("captureStarted"), "{log}");
+    assert!(log.contains("microphone open=false epoch=1"), "{log}");
+    assert!(log.contains("pause confirmed=true"), "{log}");
     let t = transcript(&env, &zorad);
     assert!(t["segments"].as_array().unwrap().is_empty(), "{t}");
 }

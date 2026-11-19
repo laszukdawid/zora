@@ -272,6 +272,11 @@ second and tells the plugins (`start` and `listening` messages in [protocol.md](
 - the core drops any transcript text that still arrives, and anything that started before the last resume,
 - an open capture ends; a command already completed before the pause still runs.
 
+The speech plugin confirms that its microphone is closed (`mic` in the protocol). The core waits up to 5 s for that,
+then tells the trays whether the pause is confirmed: they show "Pausing…" meanwhile and "Pause not confirmed" if a
+plugin didn't answer. A spawned speech plugin that doesn't confirm, or that can't (one written before the
+`listening` capability), is stopped until listening resumes, and a `degraded` notification names it.
+
 A file that can't be read counts as paused, so a damaged file never turns the microphone back on. The menu's
 **Pause** also closes the microphone at once, before the core has seen the file, and the macOS app keeps the
 microphone closed whenever the core is not running.

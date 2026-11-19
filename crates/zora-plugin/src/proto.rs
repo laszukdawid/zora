@@ -29,14 +29,18 @@ pub enum CoreMsg {
         now_ns: Ns,
         config: Value,
     },
-    /// `start` and `listening`: `until` is a timed pause's end in Unix seconds.
+    /// `start` and `listening`: `until` is a timed pause's end in Unix seconds; `epoch` numbers the on/off turns of
+    /// this connection (absent from an older core); `confirmed` says whether a pause was confirmed.
     Start {
         listening: bool,
         until: Option<f64>,
+        epoch: Option<u64>,
     },
     Listening {
         listening: bool,
         until: Option<f64>,
+        epoch: Option<u64>,
+        confirmed: Option<bool>,
     },
     Sync {
         id: u64,
@@ -68,11 +72,14 @@ pub fn parse(line: &str) -> CoreMsg {
         Some("start") => CoreMsg::Start {
             listening: listening.unwrap_or(false),
             until: v["until"].as_f64(),
+            epoch: v["epoch"].as_u64(),
         },
         // A malformed `listening` is read as a pause, so it can only ever close the microphone.
         Some("listening") => CoreMsg::Listening {
             listening: listening.unwrap_or(false),
             until: v["until"].as_f64(),
+            epoch: v["epoch"].as_u64(),
+            confirmed: v["confirmed"].as_bool(),
         },
         Some("sync") => match v["id"].as_u64() {
             Some(id) => CoreMsg::Sync {
@@ -284,17 +291,20 @@ mod tests {
     #[test]
     fn parses_core_messages() {
         assert_eq!(
-            parse(r#"{"t":"start","listening":false,"until":1700000000.5}"#),
+            parse(r#"{"t":"start","listening":false,"until":1700000000.5,"epoch":1}"#),
             CoreMsg::Start {
                 listening: false,
-                until: Some(1700000000.5)
+                until: Some(1700000000.5),
+                epoch: Some(1)
             }
         );
         assert_eq!(
-            parse(r#"{"t":"listening","listening":true}"#),
+            parse(r#"{"t":"listening","listening":false,"epoch":2,"confirmed":true}"#),
             CoreMsg::Listening {
-                listening: true,
-                until: None
+                listening: false,
+                until: None,
+                epoch: Some(2),
+                confirmed: Some(true)
             }
         );
         assert_eq!(
@@ -325,7 +335,9 @@ mod tests {
             parse(r#"{"t":"listening","listening":"yes"}"#),
             CoreMsg::Listening {
                 listening: false,
-                until: None
+                until: None,
+                epoch: None,
+                confirmed: None
             },
             "a malformed listening message pauses"
         );
@@ -335,7 +347,8 @@ mod tests {
             parse(r#"{"t":"start"}"#),
             CoreMsg::Start {
                 listening: false,
-                until: None
+                until: None,
+                epoch: None
             }
         );
     }
