@@ -17,6 +17,7 @@ serde_json.workspace = true
 cpal = { version = "0.18", features = ["pipewire"] }
 sherpa-onnx = "2.0"
 sha2 = "0.10"
+libc.workspace = true
 
 [dev-dependencies]
 hound.workspace = true
