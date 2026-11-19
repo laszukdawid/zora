@@ -237,10 +237,12 @@ final class Bridge: @unchecked Sendable {
             let isRestart: Bool = lock.withLock {
                 let restart = generation != 0
                 generation = gen
+                coreEpoch = nil // epochs are per connection and start again with `start`
+                lastMic = nil
                 return restart
             }
             pendingConfig = config
-            sendRaw(["t": "ready", "protocol": 1, "generation": gen, "capabilities": ["transcript", "dictation", "notify"],
+            sendRaw(["t": "ready", "protocol": 1, "generation": gen, "capabilities": ["transcript", "dictation", "notify", "listening"],
                      "clock": "darwin-uptime-raw-ns", "now_ns": HostClock.nowNanos()])
             lock.withLock { ready = true }
             if isRestart { pipeline?.markDiscontinuity() } // sessions are scoped to a generation
@@ -287,8 +289,11 @@ final class Bridge: @unchecked Sendable {
             onMic { [weak self] in
                 guard let self else { return }
                 micReady = false
-                micRunning = false
+                retryTask?.cancel()
                 await pipeline?.stop()
+                micRunning = false
+                runningTag = nil
+                lock.withLock { self.announced = nil }
                 monitor?.stop()
                 send(["t": "stopped"])
                 // A later core connection starts fresh capture and a fresh monitoring snapshot.
@@ -316,13 +321,26 @@ final class Bridge: @unchecked Sendable {
     /// nil while no core is connected (exited, restarting), so a pause saved meanwhile is never ignored.
     private var coreListening: Bool?
     private var coreUntil: Date?
+    /// The core's listening epoch; nil for a core that sends none (it would reject `mic`) or none connected.
+    private var coreEpoch: UInt64?
     private var localPause = false
     /// Counts core connections; see `readLoop`.
     private var connection: UInt64 = 0
-    private var micWanted: Bool { lock.withLock { coreListening == true && !localPause } }
+    /// Bumped by every mic request. A request that isn't the newest when it reaches the head of the chain is
+    /// dropped: the newer one behind it applies the latest state.
+    private var micToken: UInt64 = 0
+    /// The tag the core was last told is open; transcript output must carry it.
+    private var announced: CaptureTag?
+    private var lastMic: (tag: CaptureTag, open: Bool)?
     // Touched only inside the chain.
     private var micReady = false
     private var micRunning = false
+    private var runningTag: CaptureTag?
+    private var micFailure: String?
+    private var retryDelay = 1.0
+    private var retryTask: Task<Void, Never>?
+
+    private struct MicTarget { let tag: CaptureTag; let wanted: Bool; let epochs: Bool }
 
     private func onMic(_ work: @escaping @Sendable () async -> Void) {
         lock.withLock {
@@ -331,63 +349,164 @@ final class Bridge: @unchecked Sendable {
         }
     }
 
+    /// Queues a mic change that applies whatever state is current when it runs.
+    private func requestMic() {
+        let token: UInt64 = lock.withLock { micToken += 1; return micToken }
+        onMic { [weak self] in await self?.applyMic(token: token) }
+    }
+
+    /// The state to apply; nil when `token` has been superseded.
+    private func micTarget(token: UInt64?) -> MicTarget? {
+        lock.withLock {
+            if let token, token != micToken { return nil }
+            return MicTarget(tag: CaptureTag(connection: connection, epoch: coreEpoch ?? 0),
+                             wanted: coreListening == true && !localPause, epochs: coreEpoch != nil)
+        }
+    }
+
+    private var micWanted: Bool { lock.withLock { coreListening == true && !localPause } }
+
     private func listeningChanged(_ msg: [String: Any], conn: UInt64) {
         let on = msg["listening"] as? Bool ?? true
         let until = (msg["until"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+        let epoch = (msg["epoch"] as? NSNumber)?.uint64Value
+        let confirmed = msg["confirmed"] as? Bool
         let current: Bool = lock.withLock {
             guard conn == connection else { return false }
             coreListening = on
             coreUntil = until
+            coreEpoch = epoch
             if !on { localPause = false } // the core has it now
             return true
         }
         guard current else { return }
-        log.info("listening \(on ? "on" : "paused", privacy: .public)")
-        Task { @MainActor [weak self] in self?.indicator?.setListening(on, until: until, connection: conn) }
-        onMic { [weak self] in await self?.applyMic() }
+        log.info("listening \(on ? "on" : "paused", privacy: .public) epoch \(epoch.map(String.init) ?? "-", privacy: .public)")
+        Task { @MainActor [weak self] in
+            self?.indicator?.setListening(on, until: until, connection: conn, epoch: epoch, confirmed: confirmed)
+        }
+        // A confirmation repeats a state the chain already has.
+        if confirmed == nil { requestMic() }
     }
 
     /// The menu's "Pause" closes the mic at once, without waiting for the core (which may be restarting), and
     /// keeps it closed until the core confirms; `false` withdraws it (the pause surely wasn't saved, or the user
     /// resumed).
     private func setLocalPause(_ on: Bool) {
-        let core: (Bool?, Date?, UInt64) = lock.withLock {
+        let core: (Bool?, Date?, UInt64, UInt64?) = lock.withLock {
             localPause = on
-            return (coreListening, coreUntil, connection)
+            return (coreListening, coreUntil, connection, coreEpoch)
         }
         // Withdrawn: the menu shows the core's state again (it may have shown a pause the core never got).
         if !on, let listening = core.0 {
-            Task { @MainActor [weak self] in self?.indicator?.setListening(listening, until: core.1, connection: core.2) }
+            Task { @MainActor [weak self] in
+                self?.indicator?.setListening(listening, until: core.1, connection: core.2, epoch: core.3, confirmed: nil)
+            }
         }
-        onMic { [weak self] in await self?.applyMic() }
+        requestMic()
     }
 
     /// The core connection ended: close the mic until a new core says to listen.
     private func coreLost() {
         let gone: UInt64 = lock.withLock {
             coreListening = nil
+            coreEpoch = nil
             connection += 1
             return connection
         }
         Task { @MainActor [weak self] in self?.indicator?.coreStopped(connection: gone) }
-        onMic { [weak self] in await self?.applyMic() }
+        requestMic()
     }
 
     /// Runs in the mic chain.
-    private func applyMic() async {
-        guard micReady, let pipeline else { return }
-        if micWanted && !micRunning {
-            do {
-                try pipeline.startMicrophone()
-                micRunning = true
-            } catch {
-                send(["t": "status", "ready": false, "reason": "\(error)"])
-            }
-        } else if !micWanted && micRunning {
+    private func applyMic(token: UInt64) async {
+        guard let first = micTarget(token: token) else { return }
+        guard micReady, let pipeline else { return reportMic(first) }
+        if !first.wanted {
+            retryTask?.cancel()
+            retryDelay = 1
+        }
+        // Audio of an older epoch or connection is never carried over: close, then open under the new tag.
+        if micRunning && (!first.wanted || runningTag != first.tag) {
             await pipeline.pauseMicrophone()
             micRunning = false
+            runningTag = nil
+        }
+        // A newer request queued while pausing applies the rest (and reports).
+        guard let target = micTarget(token: token) else { return }
+        if target.wanted && !micRunning {
+            do {
+                try await pipeline.startMicrophone(tag: target.tag)
+                micRunning = true
+                runningTag = target.tag
+                if micFailure != nil { log.info("microphone works again") }
+                micFailure = nil
+                retryDelay = 1
+                retryTask?.cancel()
+            } catch {
+                send(["t": "gap", "at_ns": HostClock.nowNanos(), "reason": "microphone start failed"])
+                micFailed("\(error)", target: target)
+            }
+        }
+        reportMic(target)
+    }
+
+    /// The pipeline's engine stopped on its own (a failed restart after a device change).
+    private func micLost(tag: CaptureTag?, reason: String) {
+        onMic { [weak self] in
+            guard let self, micRunning, runningTag == tag, let pipeline else { return }
+            await pipeline.pauseMicrophone() // stops the consumer as well
+            micRunning = false
+            runningTag = nil
+            guard let target = micTarget(token: nil) else { return }
+            micFailed(reason, target: target)
+            reportMic(target)
         }
     }
+
+    /// Runs in the mic chain. Reports a new reason once, and retries with backoff while listening is wanted.
+    private func micFailed(_ reason: String, target: MicTarget) {
+        log.error("microphone unavailable: \(reason, privacy: .public)")
+        if micFailure != reason { send(["t": "status", "ready": false, "reason": "microphone unavailable: \(reason)"]) }
+        micFailure = reason
+        retryTask?.cancel()
+        guard target.wanted else { return }
+        let delay = retryDelay
+        retryDelay = min(retryDelay * 2, 30)
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self, micWanted else { return }
+            requestMic()
+        }
+    }
+
+    /// Runs in the mic chain: tells the core (`mic`, only a core that sends epochs) and the menu what is open.
+    private func reportMic(_ target: MicTarget) {
+        let open = micRunning
+        let tag = target.tag
+        let tell: Bool = lock.withLock {
+            guard tag.connection == connection else { return false }
+            announced = open ? tag : nil
+            guard target.epochs, lastMic.map({ $0.tag != tag || $0.open != open }) ?? true else { return false }
+            lastMic = (tag, open)
+            return true
+        }
+        // Queued before any transcript output this tag allows, so the core hears `open: true` first.
+        if tell { send(["t": "mic", "epoch": tag.epoch, "open": open], connection: tag.connection) }
+        let failure = target.wanted ? micFailure : nil
+        Task { @MainActor [weak self] in
+            self?.indicator?.setMic(open: open, failure: failure, connection: tag.connection)
+        }
+    }
+
+    /// `tag` if transcript output captured under it may go out now: same connection and epoch, and the core was
+    /// told the mic is open. nil drops it.
+    private func outputTag(_ tag: CaptureTag) -> CaptureTag? {
+        lock.withLock {
+            guard tag == announced, tag.connection == connection, tag.epoch == (coreEpoch ?? 0) else { return nil }
+            return tag
+        }
+    }
+
     /// Last capture state published by the monitor (began/ended); only touched on the monitor's queue.
     private var dictating = false
     private var pendingWrites = 0
@@ -420,18 +539,27 @@ final class Bridge: @unchecked Sendable {
         let pipeline = SpeechPipeline(locale: locale, useDetector: useDetector) { [weak self] event in
             switch event {
             case .segment(let s):
-                self?.send(["t": "segment", "session": s.session, "start_ns": HostClock.nanos(s.start), "end_ns": HostClock.nanos(s.end), "text": s.text])
+                // File input has no tag and is never paused.
+                guard let self, s.tag.map({ self.outputTag($0) != nil }) ?? true else { return }
+                send(["t": "segment", "session": s.session, "start_ns": HostClock.nanos(s.start), "end_ns": HostClock.nanos(s.end), "text": s.text])
             case .gap(let reason, let at):
                 self?.send(["t": "gap", "at_ns": HostClock.nanos(at), "reason": reason])
             }
         }
         if config["earlyWake"] as? Bool ?? true {
-            pipeline.onPartial = { [weak self] session, text in
+            pipeline.onPartial = { [weak self] session, text, tag in
+                guard let self else { return }
+                var msg: [String: Any] = ["t": "partial", "session": session, "text": String(text.suffix(512))]
+                if let tag {
+                    guard let ok = outputTag(tag) else { return }
+                    if ok.epoch > 0 { msg["epoch"] = ok.epoch }
+                }
                 log.debug("partial chars=\(text.count)")
-                self?.send(["t": "partial", "session": session, "text": String(text.suffix(512))])
+                send(msg)
             }
             log.info("early wake enabled")
         }
+        pipeline.onMicLost = { [weak self] tag, reason in self?.micLost(tag: tag, reason: reason) }
         self.pipeline = pipeline
         if let file = options.audioFile {
             // File mode is for testing and ignores pause.
@@ -461,7 +589,7 @@ final class Bridge: @unchecked Sendable {
                 }
                 guard Microphone.granted else { throw SpeechPipelineError.microphoneUnavailable("access is \(Microphone.status); allow Zora in System Settings → Privacy & Security → Microphone") }
                 micReady = true
-                await applyMic()
+                await applyMic(token: lock.withLock { self.micToken })
             } catch {
                 send(["t": "status", "ready": false, "reason": "\(error)"])
             }
@@ -471,7 +599,8 @@ final class Bridge: @unchecked Sendable {
     // MARK: Output
 
     /// The writer queue is the single point that assigns `seq` and writes, so sequence order is wire order.
-    private func send(_ body: [String: Any]) {
+    /// With `connection`, the message is dropped if that connection has gone by the time it is written.
+    private func send(_ body: [String: Any], connection conn: UInt64? = nil) {
         let overloaded: Bool = lock.withLock {
             pendingWrites += 1
             return pendingWrites > 1024
@@ -486,7 +615,9 @@ final class Bridge: @unchecked Sendable {
         }
         writer.async { [self] in
             defer { lock.withLock { pendingWrites -= 1 } }
-            guard let (fd, gen): (Int32, UInt64) = lock.withLock({ ready && writeFD >= 0 ? (writeFD, generation) : nil }) else { return }
+            guard let (fd, gen): (Int32, UInt64) = lock.withLock({
+                ready && writeFD >= 0 && (conn == nil || conn == connection) ? (writeFD, generation) : nil
+            }) else { return }
             seq += 1
             var msg = body
             msg["seq"] = seq

@@ -20,11 +20,21 @@ public enum HostClock {
     public static func nanos(_ s: HostSeconds) -> Int64 { Int64((s * 1_000_000_000).rounded()) }
 }
 
+/// The core connection and listening epoch audio was captured under (docs/protocol.md "Epochs"). `epoch` is 0
+/// for a core that sends none.
+public struct CaptureTag: Sendable, Equatable, Hashable {
+    public let connection: UInt64
+    public let epoch: UInt64
+    public init(connection: UInt64, epoch: UInt64) { self.connection = connection; self.epoch = epoch }
+}
+
 public struct TranscriptSegment: Sendable, Equatable {
     public var session: UInt64
     public var start: HostSeconds
     public var end: HostSeconds
     public var text: String
+    /// nil for file input.
+    public var tag: CaptureTag?
 }
 
 public enum TranscriptEvent: Sendable, Equatable {
