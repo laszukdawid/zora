@@ -170,7 +170,12 @@ or turn the monitor off (below).
 ## Windows
 
 The core (`zorad`) builds and passes the full test suite on Windows 10 and later; CI runs it on `windows-2025`.
-The plugins are new and have so far only been compiled, not run on Windows:
+The plugins are new and have so far only been compiled, not run on Windows. **Windows is experimental: no
+voice command runs there by default.** The dictation monitor reports health unknown until you opt in with
+`"dictation": {"windowsExperimental": true}` (or set `"monitor": "none"` if you use no dictation app). WASAPI
+offers no way to prove that every session callback has been delivered when the core asks for a `sync`: the monitor
+drains what has arrived and treats anything it can't account for as unknown, but a callback still in flight at that
+moment can't be seen. Until that is verified on hardware, the safe default is to run no commands.
 
 | Plugin | Capability | How |
 |---|---|---|
@@ -277,7 +282,7 @@ Names, phrases, capture limits and the default harness apply live; everything el
   "retentionHours": 4,
   "phrases": { "start": ["hey zora"], "end": ["do it zora", "zora do it"], "cancel": ["zora cancel", "never mind zora"] },
   "capture": { "holdBackSeconds": 1.5, "timeoutSeconds": 180, "maxGapSeconds": 30, "maxChars": 4000 },
-  "dictation": { "bundleIDs": ["com.typewhisper.mac"], "linuxApps": ["my-dictation-tool"], "windowsApps": ["MyDictation.exe"], "padSeconds": 1, "monitor": "plugin" },
+  "dictation": { "bundleIDs": ["com.typewhisper.mac"], "linuxApps": ["my-dictation-tool"], "windowsApps": ["MyDictation.exe"], "windowsExperimental": false, "padSeconds": 1, "monitor": "plugin" },
   "defaultHarness": "claude",
   "harnesses": {
     "claude": { "type": "claude", "workspace": "~/projects/some-repo", "permissionMode": "acceptEdits" },

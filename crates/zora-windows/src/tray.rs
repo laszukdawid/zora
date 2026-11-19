@@ -246,23 +246,85 @@ fn zorad(opts: &Options, args: &[String]) -> Result<String, String> {
     run_bounded(cmd, &opts.zorad)
 }
 
-/// Runs `cmd` for at most 10 s. On timeout the process is terminated and reaped before this returns, so a late
-/// `zorad` can never land after a later request.
+/// A Job Object that kills whatever is still in it when it is closed or terminated.
+struct KillJob(windows_sys::Win32::Foundation::HANDLE);
+
+impl KillJob {
+    fn new() -> Option<KillJob> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        // SAFETY: a new unnamed job; the info struct is fully initialized.
+        unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return None;
+            }
+            let job = KillJob(h);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0;
+            ok.then_some(job)
+        }
+    }
+
+    fn assign(&self, child: &std::process::Child) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: both handles are valid for the call.
+        unsafe {
+            windows_sys::Win32::System::JobObjects::AssignProcessToJobObject(
+                self.0,
+                child.as_raw_handle(),
+            ) != 0
+        }
+    }
+
+    fn terminate(&self) {
+        // SAFETY: valid job handle.
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) };
+    }
+}
+
+impl Drop for KillJob {
+    fn drop(&mut self) {
+        // SAFETY: closing the only handle kills anything left in the job.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Runs `cmd` for at most 10 s, inside a job. On timeout the whole job is terminated and the process reaped
+/// before this returns, so a late `zorad` can never land after a later request; output readers are waited for
+/// at most 2 s more, in case something outside the job holds the pipes.
 fn run_bounded(mut cmd: std::process::Command, name: &str) -> Result<String, String> {
     use std::io::Read;
+    let job = KillJob::new().ok_or_else(|| format!("cannot run {name}: no job object"))?;
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run {name}: {e}"))?;
+    if !job.assign(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("cannot run {name} inside a job"));
+    }
     let drain = |r: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut r) = r {
                 let _ = r.read_to_end(&mut buf);
             }
-            buf
-        })
+            let _ = tx.send(buf);
+        });
+        rx
     };
     let out = drain(
         child
@@ -282,20 +344,22 @@ fn run_bounded(mut cmd: std::process::Command, name: &str) -> Result<String, Str
             Ok(Some(s)) => break Ok(s),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             Ok(None) => {
-                let _ = child.kill();
+                job.terminate();
                 let _ = child.wait();
                 break Err(format!("{name} did not answer within 10 s and was stopped"));
             }
             Err(e) => {
-                let _ = child.kill();
+                job.terminate();
                 let _ = child.wait();
                 break Err(format!("cannot run {name}: {e}"));
             }
         }
     };
+    drop(job);
+    let grace = Duration::from_secs(2);
     let (out, err) = (
-        out.join().unwrap_or_default(),
-        err.join().unwrap_or_default(),
+        out.recv_timeout(grace).unwrap_or_default(),
+        err.recv_timeout(grace).unwrap_or_default(),
     );
     match status? {
         s if s.success() => Ok(String::from_utf8_lossy(&out).into_owned()),

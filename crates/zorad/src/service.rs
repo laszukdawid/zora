@@ -210,6 +210,10 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                         &config.dictation.linux_apps
                     };
                     obj.entry("apps").or_insert(json!(apps));
+                    if cfg!(windows) {
+                        obj.entry("windowsExperimental")
+                            .or_insert(json!(config.dictation.windows_experimental));
+                    }
                 }
                 PluginSpec {
                     id: id.clone(),

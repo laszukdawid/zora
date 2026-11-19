@@ -130,24 +130,31 @@ fn read_pointer(dir: &Path) -> Result<Option<PathBuf>, String> {
 /// Windows).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn write_pointer(dir: &Path, name: &str) -> Result<(), String> {
-    use std::io::Write;
-    let file = pointer_file(dir);
-    let tmp = file.with_extension(format!(
-        "version.{}.{}.tmp",
+    let suffix = format!(
+        "{}.{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
-    ));
-    let written = std::fs::OpenOptions::new()
+    );
+    write_pointer_via(dir, name, &suffix)
+}
+
+/// `write_pointer` with a given temp suffix. Only a temp file this call created is ever removed.
+fn write_pointer_via(dir: &Path, name: &str, suffix: &str) -> Result<(), String> {
+    use std::io::Write;
+    let file = pointer_file(dir);
+    let tmp = file.with_extension(format!("version.{suffix}.tmp"));
+    let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .and_then(|mut f| {
-            f.write_all(format!("{name}\n").as_bytes())
-                .and_then(|()| f.sync_all())
-        });
+        .map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let written = f
+        .write_all(format!("{name}\n").as_bytes())
+        .and_then(|()| f.sync_all());
+    drop(f);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{}: {e}", tmp.display()));
@@ -697,6 +704,17 @@ mod pointer_tests {
         std::fs::rename(root.join(VERSIONS), &elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, root.join(VERSIONS)).unwrap();
         assert!(read_pointer(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_temp_file_that_was_already_there_is_left_alone() {
+        let (root, dir) = setup("taken");
+        let taken = pointer_file(&dir).with_extension("version.x.tmp");
+        std::fs::write(&taken, b"not ours").unwrap();
+        assert!(write_pointer_via(&dir, &format!("{MODEL}-2"), "x").is_err());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"not ours");
+        assert_eq!(read_pointer(&dir), Ok(None));
         let _ = std::fs::remove_dir_all(&root);
     }
 
