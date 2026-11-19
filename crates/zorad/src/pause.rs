@@ -21,6 +21,15 @@ impl Listen {
     };
 }
 
+/// What plugin hosts watch. `turn` counts on/off transitions (each host maps it to its connection's epoch);
+/// `confirmed` is set once every transcript plugin confirmed the pause, or the deadline passed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ListenState {
+    pub listen: Listen,
+    pub turn: u64,
+    pub confirmed: Option<bool>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct PauseFile {
     paused: bool,

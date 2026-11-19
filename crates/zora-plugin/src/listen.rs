@@ -506,13 +506,18 @@ impl Recognizer for ScriptedRecognizer {
 /// from now on. Nothing is allowed before `start`; a malformed `listening` arrives as a pause.
 pub fn mic_control(started: &mut bool, msg: &CoreMsg) -> Option<(MicEvent, bool)> {
     match msg {
-        CoreMsg::Start { listening, .. } => {
+        CoreMsg::Start {
+            listening, epoch, ..
+        } => {
             *started = true;
-            Some((MicEvent::Start(*listening), *listening))
+            Some((MicEvent::Start(*listening, *epoch), *listening))
         }
-        CoreMsg::Listening { listening, .. } => {
-            Some((MicEvent::Listening(*listening), *listening && *started))
-        }
+        CoreMsg::Listening {
+            listening, epoch, ..
+        } => Some((
+            MicEvent::Listening(*listening, *epoch),
+            *listening && *started,
+        )),
         _ => None,
     }
 }
@@ -531,7 +536,7 @@ where
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let out = Arc::new(Out::stdout());
-    let session = match handshake(&mut input, &out, &["transcript"]) {
+    let session = match handshake(&mut input, &out, &["transcript", "listening"]) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("zora-listen: {e}");
@@ -553,7 +558,15 @@ where
                 let mut engine = Engine::new(rec, live.clone());
                 engine.partials = partials;
                 run_engine(engine, audio_rx, |ev, epoch| {
-                    out.send_if(ev.to_json(), || live.current(epoch));
+                    let mut v = ev.to_json();
+                    if matches!(ev, Event::Partial { .. }) {
+                        // Tagged with the core's epoch the audio was heard in; without one the core drops it.
+                        match live.core_epoch(epoch) {
+                            Some(e) => v["epoch"] = json!(e),
+                            None => return,
+                        }
+                    }
+                    out.send_if(v, || live.current(epoch));
                 });
             }
             Err(reason) => {
@@ -581,6 +594,10 @@ where
                 Box::new(move |ready, reason| {
                     eprintln!("zora-listen: microphone ready={ready}");
                     status_out.send(json!({"t": "status", "ready": ready, "reason": reason}));
+                }),
+                Box::new(move |epoch, open| {
+                    eprintln!("zora-listen: microphone open={open} epoch={epoch}");
+                    out.send(json!({"t": "mic", "epoch": epoch, "open": open}));
                 }),
             )
         })
@@ -901,23 +918,26 @@ mod tests {
         let l = |on| CoreMsg::Listening {
             listening: on,
             until: None,
+            epoch: Some(2),
+            confirmed: None,
         };
         assert_eq!(
             mic_control(&mut started, &l(true)),
-            Some((MicEvent::Listening(true), false)),
+            Some((MicEvent::Listening(true, Some(2)), false)),
             "no audio before start"
         );
         let start = CoreMsg::Start {
             listening: true,
             until: None,
+            epoch: Some(1),
         };
         assert_eq!(
             mic_control(&mut started, &start),
-            Some((MicEvent::Start(true), true))
+            Some((MicEvent::Start(true, Some(1)), true))
         );
         assert_eq!(
             mic_control(&mut started, &l(false)),
-            Some((MicEvent::Listening(false), false))
+            Some((MicEvent::Listening(false, Some(2)), false))
         );
         assert_eq!(mic_control(&mut started, &CoreMsg::Stop), None);
     }

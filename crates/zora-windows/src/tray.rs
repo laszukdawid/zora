@@ -189,10 +189,21 @@ impl App {
                     unsafe { PostQuitMessage(0) };
                     return;
                 }
-                Some(
-                    CoreMsg::Start { listening, until } | CoreMsg::Listening { listening, until },
-                ) => {
-                    self.model.set_listening(listening, until);
+                Some(CoreMsg::Start {
+                    listening,
+                    until,
+                    epoch,
+                }) => {
+                    self.model.set_core_listening(listening, until, epoch, None);
+                }
+                Some(CoreMsg::Listening {
+                    listening,
+                    until,
+                    epoch,
+                    confirmed,
+                }) => {
+                    self.model
+                        .set_core_listening(listening, until, epoch, confirmed);
                 }
                 Some(CoreMsg::Notify(n)) => {
                     let show = self

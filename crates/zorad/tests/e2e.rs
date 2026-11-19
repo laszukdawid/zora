@@ -873,6 +873,169 @@ fn speech_from_the_pause_that_arrives_after_resume_is_dropped() {
     assert_eq!(commands[0].1, "say hi");
 }
 
+impl Env {
+    /// `zorad settings set <change>` on `cfg`: exit code and stderr.
+    fn settings_set(&self, cfg: &Path, change: Value) -> (Option<i32>, String) {
+        let out = self
+            .cmd()
+            .args(["settings", "set", &change.to_string(), "--config"])
+            .arg(cfg)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn settings_set_changes_only_the_requested_keys() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let mut doc = read_json(&cfg);
+    doc["futureKey"] = json!({"from": "a newer zorad"});
+    std::fs::write(&cfg, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let (code, err) = env.settings_set(&cfg, json!({"wakeNames": ["Zora", "Jarvis"]}));
+    assert_eq!(code, Some(0), "{err}");
+    let after = read_json(&cfg);
+    assert_eq!(after["wakeNames"], json!(["zora", "jarvis"]));
+    doc["wakeNames"] = after["wakeNames"].clone();
+    assert_eq!(after, doc, "keys other than wakeNames changed");
+}
+
+#[test]
+fn a_settings_change_based_on_stale_values_is_refused() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let before = std::fs::read(&cfg).unwrap();
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"wakeNames": ["zora", "jarvis"], "expect": {"wakeNames": ["zora"]}}),
+    );
+    assert_eq!(code, Some(3), "{err}");
+    assert!(err.contains("wakeNames changed"), "{err}");
+    assert_eq!(
+        std::fs::read(&cfg).unwrap(),
+        before,
+        "a refused change wrote"
+    );
+    // The values actually loaded go through.
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"wakeNames": ["zora", "jarvis"], "expect": {"wakeNames": ["zora", "nova"]}}),
+    );
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(read_json(&cfg)["wakeNames"], json!(["zora", "jarvis"]));
+}
+
+#[test]
+fn concurrent_config_writers_do_not_lose_changes() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let names: Vec<String> = (0..8)
+        .map(|i| format!("name{}", "abcdefgh".as_bytes()[i] as char))
+        .collect();
+    let children: Vec<Child> = names
+        .iter()
+        .map(|n| {
+            env.cmd()
+                .args(["names", "add", n, "--config"])
+                .arg(&cfg)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut c in children {
+        assert!(c.wait().unwrap().success());
+    }
+    let have = read_json(&cfg)["wakeNames"].clone();
+    for n in &names {
+        assert!(
+            have.as_array().unwrap().contains(&json!(n)),
+            "{n} lost: {have}"
+        );
+    }
+}
+
+#[test]
+fn live_text_from_before_a_pause_does_not_notify_after_resume() {
+    let env = Env::new();
+    let cfg = env.config(
+        // Tagged with epoch 1 (before the pause), delivered after the resume (epoch 3).
+        json!([{"delayMs": 7000, "partial": "Hey Nova", "epoch": 1}]),
+        sh("echo ran", &["print", "ran"]),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(2000));
+    env.zorad(&["resume"]);
+    std::thread::sleep(Duration::from_millis(6000));
+    let (_, err) = term_and_collect(child);
+    assert!(err.contains("listening=true epoch=3"), "{err}");
+    assert!(err.contains("pause confirmed=true"), "{err}");
+    assert!(!err.contains("notify kind=captureStarted"), "{err}");
+}
+
+#[test]
+fn a_plugin_without_pause_support_is_stopped_while_paused_and_restarted_on_resume() {
+    let env = Env::new();
+    let cfg = env.config_with(
+        // Each connection replays the script: the first is stopped before speaking, the restarted one speaks.
+        json!([{"delayMs": 6000, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 800}]),
+        sh("echo \"ran: $1\"", &["ran"]),
+        json!({"listeningCapability": false}),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1000));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(5000));
+    env.zorad(&["resume"]);
+    let done = wait_for(Duration::from_secs(25), || {
+        env.commands().into_iter().find(|c| c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    assert!(
+        err.contains("plugin script can't confirm its microphone is off"),
+        "{err}"
+    );
+    assert_eq!(err.matches("listening=true epoch=1 ").count(), 2, "{err}");
+    assert!(!err.contains("listening=false"), "{err}");
+    assert_eq!(done.map(|c| c.1).as_deref(), Some("say hi"), "{err}");
+}
+
+#[test]
+fn a_plugin_that_never_confirms_a_pause_is_stopped_and_reported() {
+    let env = Env::new();
+    let cfg = env.config_with(
+        json!([]),
+        sh("true", &["print", "ok"]),
+        json!({"confirmPause": false}),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    // The 5 s deadline, plus up to a second each to notice the pause and the timeout.
+    std::thread::sleep(Duration::from_millis(9000));
+    env.zorad(&["resume"]);
+    std::thread::sleep(Duration::from_millis(3000));
+    let (_, err) = term_and_collect(child);
+    assert!(
+        err.contains("plugin script did not confirm its microphone is off"),
+        "{err}"
+    );
+    assert!(err.contains("pause confirmed=false"), "{err}");
+    // Stopped on the timeout, started again on resume.
+    assert_eq!(err.matches("listening=true epoch=1 ").count(), 2, "{err}");
+}
+
 /// Requests the fake board saw: (path, Host header, JSON body).
 type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
 

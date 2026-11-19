@@ -248,6 +248,20 @@ problems, and the systemd unit sets `RestartPreventExitStatus=78`.
 The menu bar on every platform should go through `zorad` (`pause`, `resume`, `settings`) rather than edit files
 itself, so validation and the pause rules live in one place. The running core picks up changes within a second.
 
+`zorad settings set` and `zorad names add|remove` change only the keys they set, in the file's own JSON: other
+keys, including ones this version doesn't know, are kept. They hold an exclusive lock on `config.json.lock` (next
+to the config) from reading the file to replacing it, so two writers never lose each other's change. An editor
+that shows the settings before saving sends the values it loaded for the fields it changes under `expect`:
+
+```json
+{"wakeNames": ["zora", "jarvis"], "expect": {"wakeNames": ["zora", "nova"]}}
+```
+
+`expect` takes `wakeNames`, `phrases` (any of `start`, `end`, `cancel`) and `workspace`, compared exactly with the
+values `zorad settings` printed. If the file now holds something else for any of them (a hand edit, another
+window), nothing is saved and the command exits with status 3, naming the fields; reload and let the user retry.
+Status 2 means the change was invalid (the problems are on stderr), 1 that the file couldn't be read or written.
+
 ## Pause
 
 `zorad pause` writes `pause.json` next to the transcript store; `zorad resume` deletes it. The core checks it once a
@@ -257,6 +271,11 @@ second and tells the plugins (`start` and `listening` messages in [protocol.md](
   had not transcribed yet,
 - the core drops any transcript text that still arrives, and anything that started before the last resume,
 - an open capture ends; a command already completed before the pause still runs.
+
+The speech plugin confirms that its microphone is closed (`mic` in the protocol). The core waits up to 5 s for that,
+then tells the trays whether the pause is confirmed: they show "Pausing…" meanwhile and "Pause not confirmed" if a
+plugin didn't answer. A spawned speech plugin that doesn't confirm, or that can't (one written before the
+`listening` capability), is stopped until listening resumes, and a `degraded` notification names it.
 
 A file that can't be read counts as paused, so a damaged file never turns the microphone back on. The menu's
 **Pause** also closes the microphone at once, before the core has seen the file, and the macOS app keeps the

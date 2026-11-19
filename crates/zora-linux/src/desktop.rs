@@ -629,10 +629,26 @@ pub async fn run(config: Value, out: Arc<Out>, mut core_rx: UnboundedReceiver<Co
         };
         match ev {
             Ev::Eof => break,
-            Ev::Core(
-                CoreMsg::Start { listening, until } | CoreMsg::Listening { listening, until },
-            ) => {
-                model.lock().unwrap().set_listening(listening, until);
+            Ev::Core(CoreMsg::Start {
+                listening,
+                until,
+                epoch,
+            }) => {
+                model
+                    .lock()
+                    .unwrap()
+                    .set_core_listening(listening, until, epoch, None);
+            }
+            Ev::Core(CoreMsg::Listening {
+                listening,
+                until,
+                epoch,
+                confirmed,
+            }) => {
+                model
+                    .lock()
+                    .unwrap()
+                    .set_core_listening(listening, until, epoch, confirmed);
             }
             Ev::Core(CoreMsg::Notify(n)) => {
                 let show = model

@@ -9,7 +9,10 @@
 //!              {"delayMs": 0, "began": true} / {"ended": true},
 //!              {"delayMs": 0, "quietEnd": true}, {"delayMs": 0, "skipSeq": true},
 //!              {"delayMs": 0, "exit": 3} ],
-//!   "capturingAtStart": false
+//!   "capturingAtStart": false,
+//!   "listeningCapability": true,            // declare `listening` with `transcript` (false: an old plugin)
+//!   "confirmPause": true,                   // answer each epoch with `mic` (false: never confirm)
+//!   // {"partial": "hey zora"} carries the current epoch; {"partial": ..., "epoch": 1} a given (stale) one
 //! }
 
 use serde_json::{Value, json};
@@ -79,8 +82,16 @@ fn main() {
     let hello: Value = serde_json::from_str(&hello).unwrap_or_default();
     let generation = hello["generation"].as_u64().unwrap_or(0);
     let config = hello["config"].clone();
-    let caps: Vec<String> = serde_json::from_value(config["capabilities"].clone())
+    let mut caps: Vec<String> = serde_json::from_value(config["capabilities"].clone())
         .unwrap_or_else(|_| vec!["transcript".into()]);
+    if caps.iter().any(|c| c == "transcript")
+        && config["listeningCapability"].as_bool().unwrap_or(true)
+    {
+        caps.push("listening".into());
+    }
+    let confirm =
+        caps.iter().any(|c| c == "listening") && config["confirmPause"].as_bool().unwrap_or(true);
+    let epoch = Arc::new(AtomicU64::new(0));
     let out = Arc::new(Out {
         seq: AtomicU64::new(0),
         generation,
@@ -114,7 +125,12 @@ fn main() {
     }
 
     {
-        let (out, capturing, healthy) = (out.clone(), capturing.clone(), healthy.clone());
+        let (out, capturing, healthy, epoch) = (
+            out.clone(),
+            capturing.clone(),
+            healthy.clone(),
+            epoch.clone(),
+        );
         let steps = config["steps"].as_array().cloned().unwrap_or_default();
         std::thread::spawn(move || {
             for step in steps {
@@ -124,7 +140,10 @@ fn main() {
                     let start = end - step["durMs"].as_i64().unwrap_or(1000) * MILLI;
                     out.send(json!({"t": "segment", "session": 1, "start_ns": start, "end_ns": end, "text": text}));
                 } else if let Some(text) = step["partial"].as_str() {
-                    out.send(json!({"t": "partial", "session": 1, "text": text}));
+                    let e = step["epoch"]
+                        .as_u64()
+                        .unwrap_or_else(|| epoch.load(Ordering::SeqCst));
+                    out.send(json!({"t": "partial", "session": 1, "text": text, "epoch": e}));
                 } else if let Some(raw) = step["raw"].as_str() {
                     out.raw(raw);
                 } else if step["began"].as_bool() == Some(true) {
@@ -165,7 +184,13 @@ fn main() {
                 out.send(json!({"t": "ack", "id": msg["id"], "ok": true}));
             }
             Some("start") | Some("listening") => {
-                eprintln!("listening={}", msg["listening"].as_bool().unwrap_or(true));
+                let on = msg["listening"].as_bool().unwrap_or(false);
+                let e = msg["epoch"].as_u64().unwrap_or(0);
+                eprintln!("listening={on} epoch={e} confirmed={}", msg["confirmed"]);
+                let new = epoch.swap(e, Ordering::SeqCst) != e;
+                if confirm && e > 0 && new {
+                    out.send(json!({"t": "mic", "epoch": e, "open": on}));
+                }
             }
             Some("clock") => out.send(json!({"t": "clock", "id": msg["id"], "now_ns": now_ns()})),
             Some("stop") => {

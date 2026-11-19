@@ -37,6 +37,8 @@ pub enum Audio {
 pub struct Live {
     epoch: AtomicU64,
     allowed: AtomicBool,
+    /// The core's listening epoch that the current open serves, keyed by this side's epoch.
+    core: std::sync::Mutex<(u64, u64)>,
 }
 
 impl Live {
@@ -61,6 +63,12 @@ impl Live {
     /// True while audio tagged `epoch` may still be used.
     pub fn current(&self, epoch: u64) -> bool {
         self.allowed() && self.epoch() == epoch
+    }
+
+    /// The core's epoch for audio tagged `epoch`, while that open is still the current one.
+    pub fn core_epoch(&self, epoch: u64) -> Option<u64> {
+        let (e, core) = *self.core.lock().unwrap_or_else(|e| e.into_inner());
+        (e == epoch && core > 0 && self.epoch() == epoch).then_some(core)
     }
 
     pub(crate) fn bump(&self) -> u64 {
@@ -180,10 +188,10 @@ pub trait AudioInput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MicEvent {
-    /// `start` from the core; nothing opens before it.
-    Start(bool),
-    /// `listening` from the core.
-    Listening(bool),
+    /// `start` from the core, with its epoch; nothing opens before it.
+    Start(bool, Option<u64>),
+    /// `listening` from the core, with its epoch.
+    Listening(bool, Option<u64>),
     /// The speech engine can take audio.
     Ready,
     /// `stop`: close, transcribe what was heard, and stay closed.
@@ -203,6 +211,8 @@ pub struct MicGate {
     pub core_listening: Option<bool>,
     pub ready: bool,
     pub stopped: bool,
+    /// The core's latest epoch; `mic` reports go out only once the core has sent one.
+    pub core_epoch: Option<u64>,
 }
 
 impl MicGate {
@@ -212,11 +222,17 @@ impl MicGate {
 
     pub fn apply(&mut self, ev: &MicEvent) {
         match ev {
-            MicEvent::Start(on) => {
+            MicEvent::Start(on, epoch) => {
                 self.started = true;
                 self.core_listening = Some(*on);
+                self.core_epoch = *epoch;
             }
-            MicEvent::Listening(on) => self.core_listening = Some(*on),
+            MicEvent::Listening(on, epoch) => {
+                self.core_listening = Some(*on);
+                if epoch.is_some() {
+                    self.core_epoch = *epoch;
+                }
+            }
             MicEvent::Ready => self.ready = true,
             MicEvent::Stop | MicEvent::Disconnect => self.stopped = true,
             MicEvent::Failed { .. } => {}
@@ -236,16 +252,21 @@ pub struct MicController<I: AudioInput> {
     retry_at: Option<Instant>,
     failing: bool,
     status: Box<dyn FnMut(bool, String) + Send>,
+    /// `mic(epoch, open)`: the state the core was last told, per epoch.
+    mic: Box<dyn FnMut(u64, bool) + Send>,
+    reported: Option<(u64, bool)>,
 }
 
 impl<I: AudioInput> MicController<I> {
-    /// `status(ready, reason)` reports open failures and recoveries; `events` is where a failing stream reports.
+    /// `status(ready, reason)` reports open failures and recoveries; `events` is where a failing stream reports;
+    /// `mic(epoch, open)` sends the protocol's `mic` message.
     pub fn new(
         input: I,
         live: Arc<Live>,
         tx: SyncSender<Audio>,
         events: mpsc::Sender<MicEvent>,
         status: Box<dyn FnMut(bool, String) + Send>,
+        mic: Box<dyn FnMut(u64, bool) + Send>,
     ) -> Self {
         MicController {
             gate: MicGate::default(),
@@ -257,6 +278,18 @@ impl<I: AudioInput> MicController<I> {
             retry_at: None,
             failing: false,
             status,
+            mic,
+            reported: None,
+        }
+    }
+
+    /// Tells the core the microphone state for its current epoch, once per change (and once per new epoch).
+    fn report(&mut self, open: bool) {
+        if let Some(e) = self.gate.core_epoch
+            && self.reported != Some((e, open))
+        {
+            self.reported = Some((e, open));
+            (self.mic)(e, open);
         }
     }
 
@@ -270,6 +303,13 @@ impl<I: AudioInput> MicController<I> {
 
     pub fn handle(&mut self, ev: MicEvent) {
         self.gate.apply(&ev);
+        self.handle_inner(ev);
+        if self.gate.started {
+            self.report(self.running);
+        }
+    }
+
+    fn handle_inner(&mut self, ev: MicEvent) {
         match ev {
             MicEvent::Failed { epoch } => {
                 if self.running && epoch == self.live.epoch() {
@@ -301,6 +341,7 @@ impl<I: AudioInput> MicController<I> {
         if self.retry_at.is_some_and(|t| now >= t) {
             self.retry_at = None;
             self.apply();
+            self.report(self.running);
         }
     }
 
@@ -310,6 +351,10 @@ impl<I: AudioInput> MicController<I> {
         let wanted = self.gate.wanted() && self.live.allowed();
         if wanted && !self.running && self.retry_at.is_none() {
             let epoch = self.live.bump();
+            let core = self.gate.core_epoch.unwrap_or(0);
+            *self.live.core.lock().unwrap_or_else(|e| e.into_inner()) = (epoch, core);
+            // Said before the device starts, so the core hears of it before any text from this epoch.
+            self.report(true);
             let sink = AudioSink {
                 tx: self.tx.clone(),
                 epoch,
@@ -362,8 +407,9 @@ pub fn run_mic<I: AudioInput>(
     tx: SyncSender<Audio>,
     events: mpsc::Sender<MicEvent>,
     status: Box<dyn FnMut(bool, String) + Send>,
+    mic: Box<dyn FnMut(u64, bool) + Send>,
 ) {
-    let mut ctl = MicController::new(make(), live, tx, events, status);
+    let mut ctl = MicController::new(make(), live, tx, events, status, mic);
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(ev) => {
@@ -441,14 +487,68 @@ mod tests {
         let (etx, _erx) = mpsc::channel();
         let statuses = Arc::new(Mutex::new(vec![]));
         let s = statuses.clone();
+        // `mic` reports go into the device log, so their order against open and close shows.
+        let l = input.log.clone();
         let ctl = MicController::new(
             input.clone(),
             live.clone(),
             tx,
             etx,
             Box::new(move |ok, r| s.lock().unwrap().push((ok, r))),
+            Box::new(move |e, open| l.lock().unwrap().push(format!("mic {e} {open}"))),
         );
         (ctl, input, rx, statuses, live)
+    }
+
+    #[test]
+    fn reports_the_microphone_for_each_core_epoch() {
+        let (mut c, input, _rx, _, live) = controller();
+        c.handle(MicEvent::Start(false, Some(1)));
+        c.handle(MicEvent::Ready);
+        // The protocol thread allows audio before the mic thread gets the resume.
+        live.allow();
+        c.handle(MicEvent::Listening(true, Some(2)));
+        assert_eq!(live.core_epoch(live.epoch()), Some(2));
+        live.revoke();
+        c.handle(MicEvent::Listening(false, Some(3)));
+        // A repeat of the same epoch (a confirmation, a new `until`) says nothing new.
+        c.handle(MicEvent::Listening(false, Some(3)));
+        assert_eq!(
+            log(&input),
+            [
+                "mic 1 false",
+                "mic 2 true",
+                "open 1",
+                "close at epoch 3",
+                "mic 3 false"
+            ]
+        );
+        assert_eq!(
+            live.core_epoch(1),
+            None,
+            "audio from the closed open is stale"
+        );
+    }
+
+    #[test]
+    fn a_failed_open_is_reported_closed_and_a_retry_open() {
+        let (mut c, input, _rx, _, _) = controller();
+        input.fail_next.store(true, Ordering::SeqCst);
+        c.handle(MicEvent::Ready);
+        c.handle(MicEvent::Start(true, Some(1)));
+        assert!(!c.is_running());
+        c.tick(Instant::now() + RETRY);
+        assert!(c.is_running());
+        assert_eq!(
+            log(&input),
+            [
+                "mic 1 true",
+                "open failed",
+                "mic 1 false",
+                "mic 1 true",
+                "open 3"
+            ]
+        );
     }
 
     fn log(i: &FakeInput) -> Vec<String> {
@@ -461,22 +561,22 @@ mod tests {
         assert!(!g.wanted());
         g.apply(&MicEvent::Ready);
         assert!(!g.wanted(), "the core has not said yet");
-        g.apply(&MicEvent::Listening(true));
+        g.apply(&MicEvent::Listening(true, None));
         assert!(!g.wanted(), "`listening` before `start` opens nothing");
-        g.apply(&MicEvent::Start(false));
+        g.apply(&MicEvent::Start(false, None));
         assert!(!g.wanted());
-        g.apply(&MicEvent::Listening(true));
+        g.apply(&MicEvent::Listening(true, None));
         assert!(g.wanted());
         g.apply(&MicEvent::Stop);
         assert!(!g.wanted());
-        g.apply(&MicEvent::Listening(true));
+        g.apply(&MicEvent::Listening(true, None));
         assert!(!g.wanted(), "nothing reopens after stop");
     }
 
     #[test]
     fn start_paused_never_opens() {
         let (mut c, input, _rx, _, _) = controller();
-        c.handle(MicEvent::Start(false));
+        c.handle(MicEvent::Start(false, None));
         c.handle(MicEvent::Ready);
         assert!(log(&input).is_empty());
         assert!(!c.is_running());
@@ -486,9 +586,9 @@ mod tests {
     fn pause_invalidates_audio_before_closing_then_resume_reopens() {
         let (mut c, input, _rx, _, _) = controller();
         c.handle(MicEvent::Ready);
-        c.handle(MicEvent::Start(true));
-        c.handle(MicEvent::Listening(false));
-        c.handle(MicEvent::Listening(true));
+        c.handle(MicEvent::Start(true, None));
+        c.handle(MicEvent::Listening(false, None));
+        c.handle(MicEvent::Listening(true, None));
         assert_eq!(log(&input), ["open 1", "close at epoch 2", "open 3"]);
         assert!(c.is_running());
     }
@@ -496,11 +596,11 @@ mod tests {
     #[test]
     fn a_queued_start_does_not_open_after_a_pause_or_lost_core() {
         // The protocol thread already revoked (pause, or EOF) while Ready and Start(true) were still queued.
-        for last in [MicEvent::Listening(false), MicEvent::Disconnect] {
+        for last in [MicEvent::Listening(false, None), MicEvent::Disconnect] {
             let (mut c, input, _rx, _, live) = controller();
             live.revoke();
             c.handle(MicEvent::Ready);
-            c.handle(MicEvent::Start(true));
+            c.handle(MicEvent::Start(true, None));
             c.handle(last);
             assert!(log(&input).is_empty(), "{:?}", log(&input));
             assert!(!c.is_running());
@@ -512,7 +612,7 @@ mod tests {
         let (mut c, input, _rx, _, _) = controller();
         input.revoke_during_open.store(true, Ordering::SeqCst);
         c.handle(MicEvent::Ready);
-        c.handle(MicEvent::Start(true));
+        c.handle(MicEvent::Start(true, None));
         assert!(!c.is_running());
         assert_eq!(log(&input), ["built, not started", "close at epoch 2"]);
     }
@@ -521,8 +621,8 @@ mod tests {
     fn repeated_listening_does_not_reopen() {
         let (mut c, input, _rx, _, _) = controller();
         c.handle(MicEvent::Ready);
-        c.handle(MicEvent::Start(true));
-        c.handle(MicEvent::Listening(true));
+        c.handle(MicEvent::Start(true, None));
+        c.handle(MicEvent::Listening(true, None));
         assert_eq!(log(&input), ["open 1"]);
     }
 
@@ -530,7 +630,7 @@ mod tests {
     fn stop_closes_keeps_epoch_and_asks_engine_to_finish() {
         let (mut c, input, rx, _, _) = controller();
         c.handle(MicEvent::Ready);
-        c.handle(MicEvent::Start(true));
+        c.handle(MicEvent::Start(true, None));
         let engine = std::thread::spawn(move || match rx.recv().unwrap() {
             Audio::Finish { epoch, done } => {
                 done.send(()).unwrap();
@@ -544,7 +644,7 @@ mod tests {
             1,
             "audio from the open epoch is finished"
         );
-        c.handle(MicEvent::Listening(true));
+        c.handle(MicEvent::Listening(true, None));
         assert_eq!(log(&input), ["open 1", "close at epoch 1"]);
     }
 
@@ -552,11 +652,11 @@ mod tests {
     fn disconnect_drops_audio_without_finishing() {
         let (mut c, input, rx, _, _) = controller();
         c.handle(MicEvent::Ready);
-        c.handle(MicEvent::Start(true));
+        c.handle(MicEvent::Start(true, None));
         c.handle(MicEvent::Disconnect);
         assert_eq!(log(&input), ["open 1", "close at epoch 2"]);
         assert!(rx.try_recv().is_err(), "no finish request");
-        c.handle(MicEvent::Listening(true));
+        c.handle(MicEvent::Listening(true, None));
         assert!(!c.is_running());
     }
 
@@ -565,7 +665,7 @@ mod tests {
         let (mut c, input, _rx, statuses, _) = controller();
         input.fail_next.store(true, Ordering::SeqCst);
         c.handle(MicEvent::Ready);
-        c.handle(MicEvent::Start(true));
+        c.handle(MicEvent::Start(true, None));
         assert!(!c.is_running());
         assert!(!statuses.lock().unwrap()[0].0);
         c.tick(Instant::now());
@@ -580,8 +680,8 @@ mod tests {
         let (mut c, input, _rx, _, _) = controller();
         input.fail_next.store(true, Ordering::SeqCst);
         c.handle(MicEvent::Ready);
-        c.handle(MicEvent::Start(true));
-        c.handle(MicEvent::Listening(false));
+        c.handle(MicEvent::Start(true, None));
+        c.handle(MicEvent::Listening(false, None));
         c.tick(Instant::now() + RETRY);
         assert!(!c.is_running());
         assert_eq!(log(&input), ["open failed"]);
@@ -591,7 +691,7 @@ mod tests {
     fn stream_failure_closes_then_reopens() {
         let (mut c, input, _rx, _, _) = controller();
         c.handle(MicEvent::Ready);
-        c.handle(MicEvent::Start(true));
+        c.handle(MicEvent::Start(true, None));
         c.handle(MicEvent::Failed { epoch: 99 });
         assert!(c.is_running(), "a stale failure is ignored");
         c.handle(MicEvent::Failed { epoch: 1 });

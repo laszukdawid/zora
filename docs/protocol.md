@@ -117,7 +117,9 @@ off. A new `hello` starts again at 1. A `listening` message that only changes `u
   started again on resume; while listening, its segments are accepted and its partials (which carry no epoch)
   dropped. The attached macOS app can't be stopped; it must close its engine on its own on a pause or when the
   connection is lost, and the core only reports a missing confirmation. Each failure sends a `degraded`
-  notification naming the plugin. Confirmations and timeouts for an epoch that is no longer current are ignored.
+  notification naming the plugin. Confirmations and timeouts for an epoch that is no longer current are ignored. A `mic{open: true}` for a
+  paused epoch is a failure too: a spawned plugin is stopped until resume. If several transitions happen before
+  the core can tell a plugin, it still sends each one, so every transition gets its own epoch.
 - Whatever a plugin still sends while paused, the core drops: segments and partial text are neither stored nor
   matched (this takes precedence over storing old-generation segments), and an open capture ends. Final segments
   keep their capture-time check after a resume. Commands completed before the pause still run.

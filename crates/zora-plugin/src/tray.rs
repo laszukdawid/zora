@@ -97,6 +97,8 @@ pub struct TrayModel {
     /// As last reported by the core; None until it has said.
     listening: Option<bool>,
     paused_until: Option<f64>,
+    /// Whether the core confirmed the pause (every microphone closed); None while it waits.
+    confirmed: Option<bool>,
     /// Shown instead of the state line until the core next reports its listening state.
     notice: Option<String>,
     history: VecDeque<String>,
@@ -118,6 +120,7 @@ impl TrayModel {
             state: State::Idle,
             listening: None,
             paused_until: None,
+            confirmed: Some(true),
             notice: None,
             history: VecDeque::new(),
             reset_at: None,
@@ -134,8 +137,24 @@ impl TrayModel {
         self.listening
     }
 
-    /// `start` / `listening` from the core.
+    /// `start` / `listening` from the core. A pause carrying an epoch is "pausing" until the core confirms it; an
+    /// older core sends no epoch and never confirms.
+    pub fn set_core_listening(
+        &mut self,
+        on: bool,
+        until: Option<f64>,
+        epoch: Option<u64>,
+        confirmed: Option<bool>,
+    ) {
+        self.set_listening(on, until);
+        if !on && epoch.is_some() {
+            self.confirmed = confirmed;
+        }
+    }
+
+    /// Listening state without pause confirmation.
     pub fn set_listening(&mut self, on: bool, until: Option<f64>) {
+        self.confirmed = Some(true);
         self.listening = Some(on);
         self.paused_until = if on { None } else { until };
         self.pending_until = None;
@@ -226,9 +245,13 @@ impl TrayModel {
     pub fn view(&self) -> View {
         let paused = self.listening == Some(false);
         let (icon, label) = if paused && self.state == State::Idle {
-            let label = match self.paused_until {
-                Some(t) => format!("Zora: paused until {}", crate::clock::local_hhmm(t)),
-                None => "Zora: paused (not listening)".into(),
+            let label = match (self.confirmed, self.paused_until) {
+                (None, _) => "Zora: pausing…".into(),
+                (Some(false), _) => {
+                    return self.view_with(Icon::Degraded, "Zora: pause not confirmed".into());
+                }
+                (_, Some(t)) => format!("Zora: paused until {}", crate::clock::local_hhmm(t)),
+                (_, None) => "Zora: paused (not listening)".into(),
             };
             (Icon::Paused, label)
         } else if self.listening.is_none() && self.state == State::Idle {
@@ -236,6 +259,11 @@ impl TrayModel {
         } else {
             (self.state.icon(), self.state.label().into())
         };
+        self.view_with(icon, label)
+    }
+
+    fn view_with(&self, icon: Icon, label: String) -> View {
+        let paused = self.listening == Some(false);
         View {
             icon,
             tooltip: label.clone(),
@@ -317,6 +345,23 @@ mod tests {
         assert_eq!(m.view().icon, Icon::Paused);
         assert!(!m.handle("captureDiscarded", "Zora", "paused", t));
         assert!(m.view().history.is_empty());
+    }
+
+    #[test]
+    fn a_pause_shows_pausing_until_the_core_confirms_it() {
+        let mut m = TrayModel::new();
+        m.set_core_listening(true, None, Some(1), None);
+        m.set_core_listening(false, None, Some(2), None);
+        assert_eq!(m.view().state_line, "Zora: pausing…");
+        m.set_core_listening(false, None, Some(2), Some(true));
+        assert_eq!(m.view().state_line, "Zora: paused (not listening)");
+        m.set_core_listening(false, None, Some(2), Some(false));
+        assert_eq!(m.view().state_line, "Zora: pause not confirmed");
+        assert_eq!(m.view().icon, Icon::Degraded);
+        assert_eq!(m.view().pause_label, "Resume Listening");
+        // An older core never confirms.
+        m.set_core_listening(false, None, None, None);
+        assert_eq!(m.view().state_line, "Zora: paused (not listening)");
     }
 
     #[test]
