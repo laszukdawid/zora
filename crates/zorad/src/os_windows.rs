@@ -288,6 +288,12 @@ impl Group {
         let _ = self.job.terminate();
     }
 
+    /// Ends the group after its leader exited: the job handle names only its own processes.
+    pub fn finish_blocking(&self, grace: Duration, leader: Leader) -> (bool, ExitInfo) {
+        let ok = self.reap_blocking(grace);
+        (ok, Some((exit_code(&leader.0), None)))
+    }
+
     /// For a group that already failed to reap. The job handle can't name another process, so it is safe to
     /// terminate again.
     pub fn retry_reap(&self) -> bool {
@@ -579,11 +585,11 @@ impl Held {
         resume(&self.thread)
     }
 
-    /// Blocks until the leader exits: (exit code, signal).
-    pub fn wait(self) -> Option<(Option<i32>, Option<i32>)> {
+    /// Blocks until the leader exits.
+    pub fn wait_exit(self) -> Leader {
         // SAFETY: valid process handle.
         unsafe { WaitForSingleObject(self.process.as_raw_handle(), u32::MAX) };
-        Some((exit_code(&self.process), None))
+        Leader(self.process)
     }
 }
 
@@ -634,6 +640,28 @@ pub fn detach(cmd: &mut tokio::process::Command) {
 
 /// Nothing extra to kill: the guard's death closes its job handle, which kills the job.
 pub fn kill_detached(_pid: i32) {}
+
+/// A leader's (exit code, signal), when known.
+pub type ExitInfo = Option<(Option<i32>, Option<i32>)>;
+
+/// A job's leader that has exited.
+pub struct Leader(OwnedHandle);
+
+/// Stops a plugin and its job. True once the job is verifiably empty.
+pub async fn stop_plugin(child: &mut PluginChild, group: &Group) -> bool {
+    // Wait for the leader first, then the job; the job handle can't name another process.
+    group.term();
+    if tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+    let group = group.clone();
+    tokio::task::spawn_blocking(move || group.reap_blocking(Duration::from_secs(3)))
+        .await
+        .unwrap_or(false)
+}
 
 /// A plugin process, with the parts of `tokio::process::Child` the plugin host uses.
 pub struct PluginChild {

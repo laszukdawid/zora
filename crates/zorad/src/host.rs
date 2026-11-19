@@ -241,6 +241,10 @@ impl Classify for Item {
     fn is_loss_marker(&self) -> bool {
         matches!(self, Item::Loss)
     }
+    fn must_deliver(&self) -> bool {
+        // Teardown results: a lost unverified reap would let a pause count that group as closed.
+        matches!(self, Item::PluginDown { .. } | Item::Reaped { .. })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -328,39 +332,20 @@ pub async fn run_plugin(
                     )
                     .await;
                     // Reap the whole plugin group (TERM, grace, KILL, verify) before any restart.
-                    {
-                        let pgid = group.id();
-                        // Wait for the leader first: an unreaped (zombie) leader still counts as a group member.
-                        group.term();
-                        if tokio::time::timeout(Duration::from_secs(3), child.wait())
-                            .await
-                            .is_err()
-                        {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                        }
-                        let (group, ok) = match tokio::task::spawn_blocking(move || {
-                            let ok = group.reap_blocking(Duration::from_secs(3));
-                            (group, ok)
-                        })
-                        .await
-                        {
-                            Ok((g, ok)) => (Some(g), ok),
-                            Err(_) => (None, false),
-                        };
-                        reaped = ok;
-                        if !reaped {
-                            eprintln!("[zorad] plugin {} left processes in group {pgid}", spec.id);
-                            if let Some(group) = group {
-                                tokio::spawn(reap_later(
-                                    group,
-                                    spec.id.clone(),
-                                    generation,
-                                    queue.clone(),
-                                    stop.clone(),
-                                ));
-                            }
-                        }
+                    reaped = crate::os::stop_plugin(&mut child, &group).await;
+                    if !reaped {
+                        eprintln!(
+                            "[zorad] plugin {} left processes in group {}",
+                            spec.id,
+                            group.id()
+                        );
+                        tokio::spawn(reap_later(
+                            group,
+                            spec.id.clone(),
+                            generation,
+                            queue.clone(),
+                            stop.clone(),
+                        ));
                     }
                     let _ = child.kill().await;
                     let _ = child.wait().await;
@@ -372,7 +357,8 @@ pub async fn run_plugin(
                 }
             },
         };
-        let _ = queue.send(Item::PluginDown {
+        // Forced past the caps: a lost teardown result could let a pause count an unreaped group as closed.
+        queue.force(Item::PluginDown {
             id: spec.id.clone(),
             generation,
             reaped,
@@ -806,6 +792,10 @@ async fn connected(
             }
             epoch = new_epoch;
             sent = next;
+            // Stopped at once; it doesn't need the message (and can't confirm it).
+            if !sent.listen.listening && stop_when_paused {
+                return paused_out();
+            }
             if let Some(at) = stop_at {
                 match tokio::time::timeout_at(at, out.send(&msg)).await {
                     Ok(r) => r?,
@@ -813,9 +803,6 @@ async fn connected(
                 }
             } else {
                 out.send(&msg).await?;
-            }
-            if !sent.listen.listening && stop_when_paused {
-                return paused_out();
             }
         }
         let msg = tokio::select! {
@@ -1077,6 +1064,41 @@ async fn connected(
 #[cfg(test)]
 mod listening_tests {
     use super::*;
+
+    #[test]
+    fn teardown_results_get_through_a_full_control_queue() {
+        let (q, mut rx) = InputQueue::<Item>::new(1, 1);
+        q.send(Item::Notice("fills the control cap".into()))
+            .unwrap();
+        assert!(q.send(Item::Notice("over".into())).is_err());
+        let down = Item::PluginDown {
+            id: "listen".into(),
+            generation: 3,
+            reaped: false,
+            may_record: true,
+        };
+        assert!(q.send(down).is_ok());
+        assert!(
+            q.send(Item::Reaped {
+                id: "listen".into(),
+                generation: 3
+            })
+            .is_ok()
+        );
+        let mut got = vec![];
+        while let Ok(i) = rx.try_recv() {
+            got.push(i);
+        }
+        assert!(matches!(
+            got[1],
+            Item::PluginDown {
+                reaped: false,
+                generation: 3,
+                ..
+            }
+        ));
+        assert!(matches!(got[2], Item::Reaped { generation: 3, .. }));
+    }
     use crate::pause::Listen;
 
     fn state(listening: bool, turn: u64) -> ListenState {
