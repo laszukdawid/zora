@@ -12,17 +12,21 @@ the menu-bar icon. [design.md](design.md) explains the architecture and the deci
 |---|---|
 | `crates/zora-core` | Platform-neutral logic: detector, dictation suppression, coordinator, store, config, harness argv |
 | `crates/zorad` | Daemon and CLI: plugin host, job guard/gate, recovery, pause state. `zora-script-plugin` is a reference plugin; `zora-acdc` puts voice commands on the ACDC task board. |
+| `crates/zora-plugin` | The plugin side of the protocol, shared by native plugins: framing, the microphone gate, the listening engine, dictation health rules, the tray model. No OS APIs. |
+| `crates/zora-listen` | The speech plugin `zora-listen` (Linux; its file mode builds everywhere). A crate of its own so only it links the ONNX runtime. |
+| `crates/zora-linux` | The other Linux plugins: `zora-dictation` (PipeWire) and `zora-desktop` (notifications and tray) |
 | `Sources/ZoraMac`, `Sources/zora` | macOS plugin (Swift): SpeechAnalyzer, CoreAudio dictation monitor, notifications, menu bar and Settings window. This is `Zora.app`'s main executable. |
 | `fixtures/behavior` | Golden behaviour fixtures: transcript and dictation events in, expected commands out |
-| `packaging/macos`, `packaging/linux` | App bundle and signing; systemd user unit |
+| `packaging/macos`, `packaging/linux` | App bundle and signing; systemd user unit, installer and example config |
 
 ## Build and test
 
 ```bash
 cargo test --workspace     # golden fixtures, core units, end-to-end tests with the reference plugin
 swift build                # the macOS app (Swift); its logic lives in the Rust core and is tested there
-docker run --rm --platform linux/arm64 -v "$PWD":/src:ro -w /src rust:1.98 \
-  bash -c 'cp -r /src /w && cd /w && cargo test --workspace'   # the Rust suite on Linux
+docker run --rm --platform linux/arm64 -v "$PWD":/src:ro -w /src rust:1.98 bash -c \
+  'apt-get update && apt-get install -y pkg-config clang libclang-dev libasound2-dev libpipewire-0.3-dev \
+   && cp -r /src /w && cd /w && cargo test --workspace'        # the Rust suite on Linux, with the Linux plugins
 packaging/macos/bundle.sh --install                            # build, sign and install Zora.app
 ```
 
@@ -57,9 +61,9 @@ Secrets of the `release` environment:
 Anyone who can push a `v*` tag can run the signing job, and it runs scripts from the tagged commit. So keep the
 secrets behind two repository settings: the `release` environment requires your approval (Settings →
 Environments → release → Required reviewers), and a tag ruleset lets only maintainers create `v*` tags and nobody
-move or delete them. The build job also refuses a tag whose commit isn't on `main` or whose CI run on `main` hasn't passed, so wait
-for CI to finish before you push the tag. Approve
-the signing job only for a tag you pushed yourself.
+move or delete them. The build job also refuses a tag whose commit isn't on `main` or whose CI run on `main`
+hasn't passed, so wait for CI to finish before you push the tag. Approve the signing job only for a tag you pushed
+yourself.
 
 To build a release locally instead, store the notarization credentials once with
 `xcrun notarytool store-credentials zora-notary --key <path.p8> --key-id <id> --issuer <issuer>`, then run
@@ -67,15 +71,77 @@ To build a release locally instead, store the notarization credentials once with
 
 ## Linux
 
-The core and its packaging are ready; the speech, dictation and notification plugins are not written yet.
+Targets are Ubuntu 24.04 or newer and Arch, with PipeWire as the sound server (the default on both). Three plugins
+do the OS work; `zorad` starts them from the config's `"plugins"` map:
+
+| Plugin | Capability | How |
+|---|---|---|
+| `zora-listen` | transcript | Microphone through cpal (PipeWire, or ALSA as a fallback); speech to text with sherpa-onnx's streaming Zipformer (`sherpa-onnx-streaming-zipformer-en-20M-2023-02-17`, int8, one thread, its own endpointing). English only. Audio stays in the process and is never written anywhere. |
+| `zora-dictation` | dictation | Binds PipeWire nodes and watches capture streams (`Stream/Input/Audio`) whose `application.process.binary`, `application.name` or `application.id` equals a name in `dictation.linuxApps`. A stream in the running state means the app is dictating. |
+| `zora-desktop` | notify | Desktop notifications (`org.freedesktop.Notifications` on the session bus) and the tray icon (StatusNotifierItem). |
+
+### Build
 
 ```bash
-packaging/linux/install.sh          # builds zorad into ~/.local/bin, installs a systemd user unit
+# Ubuntu 24.04+
+sudo apt install build-essential curl pkg-config clang libclang-dev libasound2-dev libpipewire-0.3-dev bzip2
+# Arch
+sudo pacman -S --needed base-devel curl pkgconf clang alsa-lib pipewire bzip2
+packaging/linux/install.sh          # builds, installs into ~/.local/bin, downloads the speech model, installs the unit
 systemctl --user enable --now zora
 ```
 
-Plugins are listed in the config under `"plugins"`, each as a command that speaks the protocol. Without a
-dictation tool, set `"dictation": {"monitor": "none"}`.
+The build downloads sherpa-onnx's prebuilt static library from its GitHub release (the `sherpa-onnx-sys` crate does
+this), so it needs network access. Ubuntu 22.04 is too old: its PipeWire headers predate what cpal needs.
+
+At run time the plugins need PipeWire with its session manager (WirePlumber), `curl` and `bzip2` for
+`zora-listen setup`, and for the tray a desktop that shows StatusNotifierItem icons: KDE Plasma and most panels do;
+on GNOME it needs the AppIndicator extension (preinstalled on Ubuntu; `gnome-shell-extension-appindicator` on Arch).
+The tray's Settings dialogs use `zenity` or `kdialog`; without either, the tray says which command to run instead.
+
+### Config
+
+`packaging/linux/config.json` is a complete starting config; `install.sh` copies it when there is none yet.
+
+```json
+"dictation": { "linuxApps": ["nerd-dictation"], "monitor": "plugin" },
+"plugins": {
+  "listen":    { "command": ["~/.local/bin/zora-listen"] },
+  "dictation": { "command": ["~/.local/bin/zora-dictation"] },
+  "desktop":   { "command": ["~/.local/bin/zora-desktop"] }
+}
+```
+
+- The plugin named `desktop` gets the events listed under `notifications.desktop` (by default the same ones the
+  macOS app shows). Its config takes `tray` and `notifications` (both default `true`), `zorad` (path to `zorad`,
+  default: next to the plugin, then `PATH`) and `zoradConfig` (a `--config` path for the tray's `zorad` calls).
+- `zora-listen` takes `model` (a model directory; default `$XDG_DATA_HOME/zora/models/<model>`), `threads` (default
+  1), `endpointSeconds` (silence that ends an utterance, default 1.0) and `partials` (live text for the early
+  "listening" notice, default `true`).
+- `linuxApps` lists the dictation tool by process binary, application name or id; `pw-dump | grep application.`
+  while it records shows what it reports. With no names listed, the monitor reports itself unhealthy and no command
+  runs. Without a dictation tool, set `"dictation": {"monitor": "none"}` and drop the `dictation` plugin.
+
+### How the pieces behave
+
+- **Microphone.** `zora-listen` opens the microphone only after its model has loaded and the core has said
+  `listening: true`, closes it on a pause, and drops audio it has not transcribed yet. It also closes it when the
+  core goes away (it is the core's child and exits when its input closes). Open, close and stop run in one thread in
+  message order, so a late resume can never reopen it after a pause or a stop.
+- **Dictation monitor.** It fails closed: health is unknown until the first complete snapshot (a PipeWire core
+  `sync` round trip after binding every node), when PipeWire is not running or the connection drops (it reconnects
+  every second), and when observations stall for more than 1.5 s. A pure PulseAudio or ALSA system is not supported
+  and stays unknown, so no command runs there.
+- **Tray.** `zora-desktop` is a notify plugin that `zorad` starts, not a separate autostart program: the protocol
+  already delivers the listening state and every event it shows, and the icon goes away with the service instead of
+  claiming a state nobody reports. Its menu matches the macOS one (state, Pause Listening / Resume Listening, Pause
+  for 1 Hour, Settings, the last five results, Restart Zora) and changes things only through `zorad pause`, `resume`
+  and `settings set`. Unlike on macOS the tray can't close the microphone itself; the core passes a pause on within
+  a second. Settings edits the names and the project folder; phrases are edited with `zorad settings set`.
+- **Testing without a microphone.** `zora-listen --file x.wav` plays a WAV file as the microphone (in real time, so
+  it goes through the same pause handling). `zora-listen transcribe x.wav` prints what the model hears.
+  `--fake-stt <script>` (tests only) replaces the model: each stretch of sound becomes the next line of the script;
+  `crates/zora-listen/tests/e2e_file.rs` runs `zorad` with it.
 
 ## Command line
 
@@ -108,7 +174,8 @@ itself, so validation and the pause rules live in one place. The running core pi
 `zorad pause` writes `pause.json` next to the transcript store; `zorad resume` deletes it. The core checks it once a
 second and tells the plugins (`start` and `listening` messages in [protocol.md](protocol.md)). While paused:
 
-- the macOS plugin releases the microphone and throws away audio it had not transcribed yet,
+- the speech plugin (`Zora.app` on macOS, `zora-listen` on Linux) releases the microphone and throws away audio it
+  had not transcribed yet,
 - the core drops any transcript text that still arrives, and anything that started before the last resume,
 - an open capture ends; a command already completed before the pause still runs.
 

@@ -73,10 +73,10 @@ plugin(s) ──JSON lines──► PluginHost ──► InputQueue (ordered, bo
 | Plugin | OS | Language | Capabilities | Notes |
 |---|---|---|---|---|
 | `zora-macos` (= `Zora.app` main) | macOS 26+ | Swift | transcript, dictation, notify | SpeechAnalyzer + SpeechDetector; CoreAudio process objects; UserNotifications. It spawns `zorad --attached-plugin` (fds 3/4) and restarts it with backoff. Keeps the v1 identity: signed bundle, `NSMicrophoneUsageDescription`, `SMAppService.agent` called by the same app. |
-| `pipewire-dictation` | Linux | Rust (native `pipewire` crate) | dictation | Binds matching input-stream nodes (`application.process.binary` / `application.name` / `application.id` from config). Running state comes from node info. Requires a synchronized initial snapshot; handles removal and reconnection. Applications using pipewire-pulse are covered; a pure PulseAudio server or direct ALSA is unsupported (health unknown). |
+| `zora-dictation` (was `pipewire-dictation`) | Linux | Rust (native `pipewire` crate), `crates/zora-linux` | dictation | Binds every node; matching input-stream nodes (`application.process.binary` / `application.name` / `application.id` from config) count as dictating while their node state is running. A core `sync` round trip is the complete snapshot (initial, every second, and for each `sync`). Handles removal and reconnection. Applications using pipewire-pulse are covered; a pure PulseAudio server or direct ALSA is unsupported (health unknown). |
 | `zora-acdc` | macOS, Linux | Rust (`zorad` package, std-only HTTP to loopback) | notify | Puts each voice command on the local ACDC task board as a task and moves it with the job. Uses the notify message's `job` field. |
-| `freedesktop-notify` | Linux | Rust (`zbus` on tokio) | notify | `org.freedesktop.Notifications`. |
-| `local-stt` | Linux (macOS fallback) | Rust, separate crate and executable | transcript | cpal with its PipeWire backend (cpal ≥ 0.18), plus **sherpa-onnx streaming Zipformer `sherpa-onnx-streaming-zipformer-en-20M-2023-02-17` int8**, 1 thread, native endpointing. Times are anchored to captured samples. Silero gating and whisper.cpp are only added if measurements justify them. |
+| `zora-desktop` (was `freedesktop-notify`) | Linux | Rust (`zbus` + `ksni` on tokio), `crates/zora-linux` | notify | `org.freedesktop.Notifications`, plus the StatusNotifierItem tray with the macOS menu. Spawned by `zorad` like any plugin, so it gets `start`/`listening` and every event over the protocol; changes go through `zorad pause/resume/settings`. |
+| `zora-listen` (was `local-stt`) | Linux (file mode everywhere) | Rust, `crates/zora-listen` on `crates/zora-plugin` | transcript | cpal with its PipeWire backend (cpal ≥ 0.18), plus **sherpa-onnx streaming Zipformer `sherpa-onnx-streaming-zipformer-en-20M-2023-02-17` int8**, 1 thread, native endpointing. Times are anchored to captured samples. Silero gating and whisper.cpp are only added if measurements justify them. |
 
 ### Migration from v1
 
@@ -87,6 +87,6 @@ The Swift v1 core was removed once the Rust core passed the shared golden-fixtur
 | Area | Gate |
 |---|---|
 | macOS | Launch-at-login TCC and notification identity through `SMAppService`; real TypeWhisper dictation; sleep/wake; whole-system power. |
-| Linux, on the user's machine | Live mic coexistence with the dictation tool; observing that tool's PipeWire stream behaviour (idle, push-to-talk, release, persistent streams); notifications on the real desktop; the systemd user unit across login; suspend/resume. |
+| Linux, on the user's machine | Live mic coexistence with the dictation tool; observing that tool's PipeWire stream behaviour (idle, push-to-talk, release, persistent streams); notifications and the tray icon/menu/Settings dialogs on the real desktop (GNOME with AppIndicator, KDE); the systemd user unit across login, including the tray appearing when the service starts before the desktop; suspend/resume; a USB microphone unplugged and replugged. |
 | Linux STT targets | Idle CPU < 3% of one core, RSS < 150 MB, end phrase to dispatch < 4 s, plus missed/false command rates on a fixture set. |
 | Jobs | SIGKILL the core mid-job (and after the leader has exited, with a TERM-ignoring descendant still alive): the descendant must be dead before the next dispatch. |
