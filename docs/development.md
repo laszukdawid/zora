@@ -250,15 +250,17 @@ itself, so validation and the pause rules live in one place. The running core pi
 
 `zorad settings set` and `zorad names add|remove` change only the keys they set, in the file's own JSON: other
 keys, including ones this version doesn't know, are kept. They hold an exclusive lock on `config.json.lock` (next
-to the config) from reading the file to replacing it, so two writers never lose each other's change. An editor
+to the config) from reading the file to replacing it, so two writers never lose each other's change. Writing the default config on first run takes the same lock. An editor
 that shows the settings before saving sends the values it loaded for the fields it changes under `expect`:
 
 ```json
 {"wakeNames": ["zora", "jarvis"], "expect": {"wakeNames": ["zora", "nova"]}}
 ```
 
-`expect` takes `wakeNames`, `phrases` (any of `start`, `end`, `cancel`) and `workspace`, compared exactly with the
-values `zorad settings` printed. If the file now holds something else for any of them (a hand edit, another
+`expect` takes `wakeNames`, `phrases` (any of `start`, `end`, `cancel`), `workspace` and `harness`, compared
+exactly with the values `zorad settings` printed. Send `harness` with every workspace change
+(`{"workspace": "~/p", "expect": {"harness": "claude", "workspace": "~/old"}}`): the workspace belongs to the
+default harness, and if that changed since loading, the edit would land on another one. If the file now holds something else for any of them (a hand edit, another
 window), nothing is saved and the command exits with status 3, naming the fields; reload and let the user retry.
 Status 2 means the change was invalid (the problems are on stderr), 1 that the file couldn't be read or written.
 

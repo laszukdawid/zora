@@ -20,6 +20,11 @@ const MAX_LINE: usize = 64 * 1024;
 const HEARTBEAT_LEASE: Ns = 6 * SECOND;
 /// Ends a session whose plugin must stay off until listening resumes.
 const PAUSED_OUT: &str = "stopped while paused";
+/// A spawned transcript plugin that hasn't confirmed a pause by then is stopped, however its connection is doing.
+/// Longer than the service's 5 s, so the service reports it first.
+const PAUSE_STOP: Duration = Duration::from_secs(7);
+/// A plugin that doesn't take a message within this long isn't reading its input.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Messages from a plugin. Some fields are part of the protocol but unused by the core.
 #[allow(dead_code)]
@@ -180,6 +185,8 @@ pub enum Item {
     PluginDown {
         id: String,
         generation: u64,
+        /// Its processes are verifiably gone (a spawned plugin's group was reaped).
+        reaped: bool,
     },
     PluginStopped {
         id: String,
@@ -271,6 +278,7 @@ pub async fn run_plugin(
         }
         generation += 1;
         let started = tokio::time::Instant::now();
+        let mut reaped = false;
         let result = match &spec.connection {
             Connection::Attached => match crate::os::attached_plugin() {
                 Ok((r, w)) => {
@@ -307,7 +315,7 @@ pub async fn run_plugin(
                             let _ = child.kill().await;
                             let _ = child.wait().await;
                         }
-                        let reaped = tokio::task::spawn_blocking(move || {
+                        reaped = tokio::task::spawn_blocking(move || {
                             group.reap_blocking(Duration::from_secs(3))
                         })
                         .await
@@ -320,12 +328,16 @@ pub async fn run_plugin(
                     let _ = child.wait().await;
                     res
                 }
-                Err(e) => Err(ProtocolError(format!("cannot start: {e}"))),
+                Err(e) => {
+                    reaped = true; // nothing was started
+                    Err(ProtocolError(format!("cannot start: {e}")))
+                }
             },
         };
         let _ = queue.send(Item::PluginDown {
             id: spec.id.clone(),
             generation,
+            reaped,
         });
         if *stop.borrow() {
             return; // service shutdown: the group above is already reaped
@@ -476,12 +488,27 @@ async fn read_message(
 struct Writer(mpsc::Sender<String>);
 
 impl Writer {
+    /// Bounded, so a plugin that stops reading can't stall the session (and with it pause enforcement).
     async fn send(&self, msg: &ToPlugin) -> Result<(), ProtocolError> {
-        self.0
-            .send(msg.line())
-            .await
-            .map_err(|_| ProtocolError("plugin input closed".into()))
+        match tokio::time::timeout(SEND_TIMEOUT, self.0.send(msg.line())).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(ProtocolError("plugin input closed".into())),
+            Err(_) => Err(ProtocolError("plugin is not reading its input".into())),
+        }
     }
+}
+
+/// The epoch and message for a new listening state. Transitions the plugin never saw are skipped, not replayed:
+/// the epoch jumps past them, which invalidates everything before, and only the latest state is sent.
+fn listening_update(sent: &ListenState, next: &ListenState, epoch: u64) -> (u64, ToPlugin) {
+    let epoch = epoch + next.turn.saturating_sub(sent.turn);
+    let msg = ToPlugin::Listening {
+        listening: next.listen.listening,
+        until: next.listen.until,
+        epoch,
+        confirmed: next.confirmed,
+    };
+    (epoch, msg)
 }
 
 async fn session(
@@ -684,6 +711,10 @@ async fn connected(
     }
     let mut listen_open = true;
     let mut pending_listen: Option<ListenState> = None;
+    // When a spawned transcript plugin is stopped unless it has confirmed the current pause.
+    let enforce = transcript && !attached;
+    let mut stop_at =
+        (enforce && !sent.listen.listening).then(|| tokio::time::Instant::now() + PAUSE_STOP);
     control(Item::PluginUp {
         id: spec.id.clone(),
         generation,
@@ -696,29 +727,23 @@ async fn connected(
     let mut lease = tokio::time::Instant::now() + Duration::from_nanos(HEARTBEAT_LEASE as u64);
     loop {
         if let Some(next) = pending_listen.take() {
-            if next.turn != sent.turn {
-                if next.listen.listening == sent.listen.listening {
-                    // Transitions coalesced in the watch: the plugin still sees each one.
-                    epoch += 1;
-                    out.send(&ToPlugin::Listening {
-                        listening: !next.listen.listening,
-                        until: None,
-                        epoch,
-                        confirmed: None,
-                    })
-                    .await?;
-                }
-                epoch += 1;
+            let (new_epoch, msg) = listening_update(&sent, &next, epoch);
+            if new_epoch != epoch {
                 mic_closed = false;
+                // The deadline runs from here, whether or not the plugin takes the message.
+                stop_at = (enforce && !next.listen.listening)
+                    .then(|| tokio::time::Instant::now() + PAUSE_STOP);
             }
-            out.send(&ToPlugin::Listening {
-                listening: next.listen.listening,
-                until: next.listen.until,
-                epoch,
-                confirmed: next.confirmed,
-            })
-            .await?;
+            epoch = new_epoch;
             sent = next;
+            if let Some(at) = stop_at {
+                match tokio::time::timeout_at(at, out.send(&msg)).await {
+                    Ok(r) => r?,
+                    Err(_) => return Err(ProtocolError(PAUSED_OUT.into())),
+                }
+            } else {
+                out.send(&msg).await?;
+            }
             if !sent.listen.listening {
                 if stop_when_paused {
                     return paused_out();
@@ -733,6 +758,10 @@ async fn connected(
             m = read_message(lines, Duration::from_secs(24 * 3600)) => m?,
             _ = stop.wait_for(|s| *s) => return Err(ProtocolError("service shutdown".into())),
             _ = &mut broken => return Err(ProtocolError("plugin input closed".into())),
+            _ = tokio::time::sleep_until(stop_at.unwrap_or_else(tokio::time::Instant::now)), if stop_at.is_some() => {
+                // Not confirmed in time; the service has reported it.
+                return Err(ProtocolError(PAUSED_OUT.into()));
+            }
             changed = listen.changed(), if listen_open => {
                 if changed.is_err() {
                     listen_open = false;
@@ -848,6 +877,9 @@ async fn connected(
                     })?;
                     if !sent.listen.listening {
                         mic_closed = !open;
+                        if mic_closed {
+                            stop_at = None;
+                        }
                         if open {
                             control(Item::Notice(format!(
                                 "plugin {} opened its microphone while paused",
@@ -981,6 +1013,48 @@ async fn connected(
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod listening_tests {
+    use super::*;
+    use crate::pause::Listen;
+
+    fn state(listening: bool, turn: u64) -> ListenState {
+        ListenState {
+            listen: Listen {
+                listening,
+                until: None,
+            },
+            turn,
+            confirmed: None,
+        }
+    }
+
+    fn sent(msg: ToPlugin) -> (bool, u64) {
+        match msg {
+            ToPlugin::Listening {
+                listening, epoch, ..
+            } => (listening, epoch),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missed_resume_is_never_replayed() {
+        // Paused at turn 1 (epoch 2); the host missed the resume (turn 2) and sees the next pause (turn 3).
+        let (epoch, msg) = listening_update(&state(false, 1), &state(false, 3), 2);
+        assert_eq!(epoch, 4);
+        assert_eq!(sent(msg), (false, 4));
+        // Listening, missed a pause: the plugin gets a new epoch, which invalidates what it heard before.
+        let (_, msg) = listening_update(&state(true, 0), &state(true, 2), 1);
+        assert_eq!(sent(msg), (true, 3));
+        // A new `until` or a confirmation keeps the epoch.
+        let mut confirmed = state(false, 1);
+        confirmed.confirmed = Some(true);
+        let (epoch, _) = listening_update(&state(false, 1), &confirmed, 2);
+        assert_eq!(epoch, 2);
     }
 }
 

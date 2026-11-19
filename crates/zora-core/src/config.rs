@@ -308,6 +308,17 @@ impl Config {
         )
     }
 
+    /// Writes the default config unless a file is already there, under the same lock as `update`, so it never
+    /// replaces a config another writer just created. Returns whether it wrote.
+    pub fn create_default(path: &Path) -> Result<bool, String> {
+        let _lock = lock_config(path)?;
+        if path.exists() {
+            return Ok(false);
+        }
+        Config::default().write(path)?;
+        Ok(true)
+    }
+
     /// Changes the config file in place: `edit` patches the file's own JSON, so keys it doesn't touch (including
     /// ones this version doesn't know) are kept. `accept` sees the config before and after and may refuse. An
     /// exclusive lock on `<config>.lock` is held from the read to the rename, so concurrent writers serialize.
@@ -316,19 +327,7 @@ impl Config {
         edit: impl FnOnce(&mut serde_json::Value, &Config) -> Result<(), UpdateError>,
         accept: impl FnOnce(&Config, &Config) -> Result<(), UpdateError>,
     ) -> Result<Config, UpdateError> {
-        let io = |e: std::io::Error| UpdateError::Io(e.to_string());
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(io)?;
-        }
-        let lock_path = path.with_extension("json.lock");
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(io)?;
-        lock.lock().map_err(io)?;
+        let lock = lock_config(path).map_err(UpdateError::Io)?;
         let mut doc = match std::fs::read(path) {
             Ok(data) => serde_json::from_slice(&data)
                 .map_err(|e| UpdateError::Io(format!("cannot parse {}: {e}", path.display())))?,
@@ -370,6 +369,22 @@ pub enum UpdateError {
     /// The change would make the config invalid.
     Invalid(Vec<String>),
     Io(String),
+}
+
+/// Takes the exclusive lock on `<config>.lock`; it is released when the returned file is dropped.
+fn lock_config(path: &Path) -> Result<std::fs::File, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("json.lock"))
+        .map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| e.to_string())?;
+    Ok(lock)
 }
 
 /// Writes through a private temp file and an atomic rename; a replaced file keeps its own mode.
