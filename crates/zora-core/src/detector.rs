@@ -512,7 +512,7 @@ impl CommandDetector {
 }
 
 /// Unicode punctuation (general category P*) for the characters transcripts contain; symbols such as `$` or
-/// a backtick are not punctuation, matching Foundation's `punctuationCharacters` used by the Swift core.
+/// a backtick are not punctuation, matching Foundation's `punctuationCharacters` (what the macOS speech output was tested against).
 fn is_punctuation(c: char) -> bool {
     if c.is_ascii() {
         return matches!(

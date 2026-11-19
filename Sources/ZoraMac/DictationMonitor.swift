@@ -1,6 +1,5 @@
 import CoreAudio
 import Foundation
-import ZoraCore
 import os
 
 private let log = Logger(subsystem: "dev.zora.agent", category: "dictation")

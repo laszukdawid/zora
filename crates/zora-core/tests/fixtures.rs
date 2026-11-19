@@ -1,4 +1,4 @@
-//! Golden behaviour fixtures shared with the Swift v1 core (Tests/ZoraCoreTests/FixtureTests.swift).
+//! Golden behaviour fixtures (`fixtures/behavior`), first written to prove parity with the removed Swift v1 core.
 
 use serde_json::Value;
 use zora_core::clock::{Ns, secs};
@@ -36,7 +36,7 @@ fn run_case(case: &Value) -> (Vec<String>, Vec<String>) {
     let mut c = Coordinator::new(&config, now);
     let (mut out, mut kinds) = (Vec::new(), Vec::new());
 
-    // Answer sync barriers immediately with the monitor's current state (the Swift core's equivalent check).
+    // Answer sync barriers immediately with the monitor's current state.
     let run = |c: &mut Coordinator,
                input: Input,
                now: Ns,

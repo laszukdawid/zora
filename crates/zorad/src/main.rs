@@ -89,13 +89,17 @@ fn load_config(path: Option<PathBuf>, create: bool) -> Result<Config, String> {
     Config::load(&path)
 }
 
+/// `zorad run` refused to start because of the config (EX_CONFIG). Supervisors don't restart on it: the menu bar
+/// shows the problem, and systemd has `RestartPreventExitStatus=78`.
+const EXIT_CONFIG: i32 = 78;
+
 fn cmd_run(path: Option<PathBuf>, rest: &[String]) -> i32 {
     let path_for_run = path.clone();
     let mut config = match load_config(path, true) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("zorad: {e}");
-            return 0; // clean exit: no restart loop for a broken config
+            return EXIT_CONFIG;
         }
     };
     if rest.iter().any(|a| a == "--dry-run") {
@@ -106,7 +110,7 @@ fn cmd_run(path: Option<PathBuf>, rest: &[String]) -> i32 {
         for p in &problems {
             eprintln!("config: {p}");
         }
-        return 0;
+        return EXIT_CONFIG;
     }
     let attached = rest.iter().any(|a| a == "--attached-plugin");
     let config_path = path_for_run.unwrap_or_else(Config::default_path);
@@ -383,6 +387,8 @@ fn settings_json(config: &Config, path: &std::path::Path) -> serde_json::Value {
         "harness": config.default_harness,
         "workspace": workspace,
         "configPath": path,
+        "locale": config.locale,
+        "dictationBundleIDs": config.dictation.bundle_ids,
         "problems": config.validate(),
     })
 }

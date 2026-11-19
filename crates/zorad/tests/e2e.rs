@@ -801,3 +801,26 @@ fn acdc_plugin_puts_the_command_on_the_board() {
         "command text leaked into logs:\n{err}"
     );
 }
+
+#[test]
+fn an_invalid_config_exits_with_ex_config_and_settings_lists_the_problem() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), "true");
+    std::fs::remove_dir_all(env.home.join("ws")).unwrap();
+    let mut child = env.start(&cfg);
+    let status = wait_for(Duration::from_secs(10), || child.try_wait().ok().flatten());
+    assert_eq!(status.and_then(|s| s.code()), Some(78));
+    let out = Command::new(ZORAD)
+        .args(["settings", "--config"])
+        .arg(&cfg)
+        .env("HOME", &env.home)
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["problems"][0].as_str().unwrap().contains("workspace"),
+        "{v}"
+    );
+    assert_eq!(v["locale"], "en-US");
+    assert!(v["dictationBundleIDs"].is_array());
+}

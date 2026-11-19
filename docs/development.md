@@ -13,15 +13,14 @@ the menu-bar icon. [design.md](design.md) explains the architecture and the deci
 | `crates/zora-core` | Platform-neutral logic: detector, dictation suppression, coordinator, store, config, harness argv |
 | `crates/zorad` | Daemon and CLI: plugin host, job guard/gate, recovery, pause state. `zora-script-plugin` is a reference plugin; `zora-acdc` puts voice commands on the ACDC task board. |
 | `Sources/ZoraMac`, `Sources/zora` | macOS plugin (Swift): SpeechAnalyzer, CoreAudio dictation monitor, notifications, menu bar and Settings window. This is `Zora.app`'s main executable. |
-| `Sources/ZoraCore`, `Tests/ZoraCoreTests` | The v1 Swift core, kept until the Rust port has proven parity |
-| `fixtures/behavior` | Golden behaviour fixtures that both cores must pass |
+| `fixtures/behavior` | Golden behaviour fixtures: transcript and dictation events in, expected commands out |
 | `packaging/macos`, `packaging/linux` | App bundle and signing; systemd user unit |
 
 ## Build and test
 
 ```bash
 cargo test --workspace     # golden fixtures, core units, end-to-end tests with the reference plugin
-swift test                 # macOS adapters and the v1 core, including the same golden fixtures
+swift build                # the macOS app (Swift); its logic lives in the Rust core and is tested there
 docker run --rm --platform linux/arm64 -v "$PWD":/src:ro -w /src rust:1.98 \
   bash -c 'cp -r /src /w && cd /w && cargo test --workspace'   # the Rust suite on Linux
 packaging/macos/bundle.sh --install                            # build, sign and install Zora.app
@@ -60,6 +59,10 @@ dictation tool, set `"dictation": {"monitor": "none"}`.
 | `zora install` / `uninstall` (macOS) | Start Zora at login, or stop doing so |
 
 On macOS both live in `~/Applications/Zora.app/Contents/MacOS/`.
+
+`zorad run` exits with status 78 (`EX_CONFIG`) when the config is invalid. Supervisors must not restart it in a
+loop: the macOS app shows "needs setup" in the menu bar and starts the core again once `zorad settings` reports no
+problems, and the systemd unit sets `RestartPreventExitStatus=78`.
 
 The menu bar on every platform should go through `zorad` (`pause`, `resume`, `settings`) rather than edit files
 itself, so validation and the pause rules live in one place. The running core picks up changes within a second.

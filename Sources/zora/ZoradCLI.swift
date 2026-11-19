@@ -75,6 +75,36 @@ struct ZoradCLI: Sendable {
     }
 }
 
+/// What `zorad settings` prints: the settings the menu bar edits, plus what the app needs to know about the config.
+struct CoreSettings: Decodable, Sendable {
+    struct Phrases: Decodable, Sendable { var start: [String]; var end: [String]; var cancel: [String] }
+    var wakeNames: [String]
+    var phrases: Phrases
+    var workspace: String
+    var locale: String
+    var dictationBundleIDs: [String]
+    var problems: [String]
+
+    static func decode(_ out: String) -> CoreSettings? {
+        try? JSONDecoder().decode(CoreSettings.self, from: Data(out.utf8))
+    }
+}
+
+extension ZoradCLI {
+    /// Reads the settings (creating a default config file if there is none).
+    func settings() async throws -> CoreSettings {
+        let r = await run(["settings"])
+        guard r.ok else { throw SettingsError(message: r.message) }
+        guard let s = CoreSettings.decode(r.out) else { throw SettingsError(message: "unexpected output from zorad settings") }
+        return s
+    }
+}
+
+struct SettingsError: Error, CustomStringConvertible {
+    let message: String
+    var description: String { message }
+}
+
 /// Written by one reader thread, read only after `DispatchGroup.wait()`.
 private final class DataBox: @unchecked Sendable {
     var value = Data()

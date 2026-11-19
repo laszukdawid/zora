@@ -1,6 +1,6 @@
 # Zora design (v2): cross-platform core with native plugins
 
-Agreed with GPT-6-Astra (Codex) on 2026-11-17. v1 was a macOS-only Swift build, reviewed and approved; this design keeps all of its behaviour and safety rules. **Gates** are checks that need real hardware or a desktop session before release.
+v1 was a macOS-only Swift build. v2 keeps all of its behaviour and safety rules and moves the logic into a cross-platform Rust core. **Gates** are checks that need real hardware or a desktop session before release.
 
 ## Goal
 
@@ -80,7 +80,7 @@ plugin(s) ──JSON lines──► PluginHost ──► InputQueue (ordered, bo
 
 ### Migration from v1
 
-The Swift v1 core stays until a **shared golden-fixture suite** (`fixtures/behavior/*.json`) passes on both the Swift and Rust cores. The fixtures cover input events (including Unicode, dictation, unknown intervals, gaps and ticks) and the expected outputs. Process-group and shutdown regressions must also pass on both platforms. The config and database formats are unchanged.
+The Swift v1 core was removed once the Rust core passed the shared golden-fixture suite (`fixtures/behavior/*.json`: input events, including Unicode, dictation, unknown intervals, gaps and ticks, with the expected outputs). The config and database formats are unchanged, so v1 config files still load.
 
 ## Gates
 
@@ -90,11 +90,3 @@ The Swift v1 core stays until a **shared golden-fixture suite** (`fixtures/behav
 | Linux, on the user's machine | Live mic coexistence with the dictation tool; observing that tool's PipeWire stream behaviour (idle, push-to-talk, release, persistent streams); notifications on the real desktop; the systemd user unit across login; suspend/resume. |
 | Linux STT targets | Idle CPU < 3% of one core, RSS < 150 MB, end phrase to dispatch < 4 s, plus missed/false command rates on a fixture set. |
 | Jobs | SIGKILL the core mid-job (and after the leader has exited, with a TERM-ignoring descendant still alive): the descendant must be dead before the next dispatch. |
-
-## This session's scope
-
-1. The Rust core, protocol and `zorad`, including guard and gate.
-2. The Swift plugin with inverted launch (the macOS vertical slice).
-3. Golden fixtures run on both cores.
-4. The Rust tests also run in linux/arm64 Docker.
-5. Stretch: synthetic PipeWire dictation tests and a mock D-Bus notifier; a WAV-based STT spike.
