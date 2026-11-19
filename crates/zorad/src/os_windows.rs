@@ -355,10 +355,19 @@ fn command_line(program: &str, args: &[String]) -> io::Result<Vec<u16>> {
     Ok(wide(&line))
 }
 
-/// A sorted, case-insensitively unique environment block (later entries win).
-fn env_block(env: &[(String, String)]) -> Vec<u16> {
+/// A sorted, case-insensitively unique environment block (later entries win). Refuses a name that is empty or
+/// holds `=` (except Windows' own leading one, as in `=C:`) or NUL, and a value with NUL: either would cut the
+/// block short or smuggle in another variable.
+fn env_block(env: &[(String, String)]) -> io::Result<Vec<u16>> {
     let mut vars: Vec<(String, &String, &String)> = Vec::new();
     for (k, v) in env {
+        let name = k.strip_prefix('=').unwrap_or(k);
+        if name.is_empty() || name.contains(['=', '\0']) || v.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid environment variable {k:?}"),
+            ));
+        }
         let key = k.to_uppercase();
         vars.retain(|(u, _, _)| *u != key);
         vars.push((key, k, v));
@@ -373,7 +382,7 @@ fn env_block(env: &[(String, String)]) -> Vec<u16> {
         block.push(0);
     }
     block.push(0);
-    block
+    Ok(block)
 }
 
 /// An anonymous pipe: (our end, the child's inheritable end). `child_reads` picks the direction.
@@ -436,7 +445,7 @@ fn create_in_job(
         .is_absolute()
         .then(|| wide(program));
     let cwd = cwd.map(wide);
-    let mut env = env.map(env_block);
+    let mut env = env.map(env_block).transpose()?;
     let (stdin_ours, stdin_theirs) = if stdin_pipe {
         let (o, t) = pipe(true)?;
         (Some(o), t)
@@ -701,7 +710,10 @@ pub fn reap_job(id: &str, _pgid: i32, _gate_start: i64, grace: Duration) -> bool
 }
 
 /// Asks the job's guard to cancel it, so the outcome is recorded as cancelled.
-pub fn cancel_job(job: &zora_core::store::JobRecord) -> Result<(), String> {
+pub fn cancel_job(
+    job: &zora_core::store::JobRecord,
+    _marker: &std::path::Path,
+) -> Result<(), String> {
     let name = wide(&cancel_name(&job.id));
     // SAFETY: the name is NUL-terminated; the handle is owned below.
     let event = owned(unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) })
@@ -764,5 +776,21 @@ mod tests {
         let mut s = String::new();
         quote("", &mut s);
         assert_eq!(s, r#""""#);
+    }
+
+    #[test]
+    fn environment_block_refuses_names_and_values_that_would_split_it() {
+        let var = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
+        assert!(env_block(&var("A", "1")).is_ok());
+        assert!(env_block(&var("=C:", "C:\\x")).is_ok());
+        for (k, v) in [
+            ("A=B", "1"),
+            ("", "1"),
+            ("=", "1"),
+            ("A\0B", "1"),
+            ("A", "1\0B=2"),
+        ] {
+            assert!(env_block(&var(k, v)).is_err(), "{k:?}={v:?}");
+        }
     }
 }
