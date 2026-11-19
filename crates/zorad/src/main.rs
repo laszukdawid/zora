@@ -87,11 +87,12 @@ fn load_config(path: Option<PathBuf>, create: bool) -> Result<Config, String> {
         if !create {
             return Ok(Config::default());
         }
-        Config::default().write(&path)?;
-        eprintln!(
-            "wrote default config to {}; set harnesses.claude.workspace before running without --dry-run",
-            path.display()
-        );
+        if Config::create_default(&path)? {
+            eprintln!(
+                "wrote default config to {}; set harnesses.claude.workspace before running without --dry-run",
+                path.display()
+            );
+        }
     }
     Config::load(&path)
 }
@@ -389,6 +390,8 @@ struct SettingsChange {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SettingsExpect {
+    /// The default harness the workspace was loaded from, so a workspace edit never lands on another harness.
+    harness: Option<String>,
     wake_names: Option<Vec<String>>,
     phrases: Option<PhrasesChange>,
     workspace: Option<String>,
@@ -426,6 +429,13 @@ fn workspace_of(config: &Config) -> Option<&String> {
 /// The fields whose current value differs from what the caller expected.
 fn conflicts(expect: &SettingsExpect, current: &Config) -> Vec<&'static str> {
     let mut out = Vec::new();
+    if expect
+        .harness
+        .as_ref()
+        .is_some_and(|h| *h != current.default_harness)
+    {
+        out.push("harness");
+    }
     if expect
         .wake_names
         .as_ref()

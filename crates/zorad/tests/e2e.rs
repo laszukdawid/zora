@@ -965,6 +965,67 @@ fn concurrent_config_writers_do_not_lose_changes() {
 }
 
 #[test]
+fn first_run_default_config_never_replaces_a_concurrent_change() {
+    let env = Env::new();
+    let cfg = env.home.join("fresh").join("config.json");
+    for round in 0..3 {
+        let _ = std::fs::remove_file(&cfg);
+        // Readers that create the default file race writers that add names.
+        let children: Vec<(Option<String>, Child)> = (0..8)
+            .map(|i| {
+                let name = (i % 2 == 0).then(|| format!("round{round}name{i}"));
+                let mut c = env.cmd();
+                match &name {
+                    Some(n) => c.args(["names", "add", n.as_str()]),
+                    None => c.args(["settings"]),
+                };
+                let child = c
+                    .arg("--config")
+                    .arg(&cfg)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                (name, child)
+            })
+            .collect();
+        let mut names = vec![];
+        for (n, mut c) in children {
+            assert!(c.wait().unwrap().success());
+            names.extend(n);
+        }
+        let have = read_json(&cfg)["wakeNames"].clone();
+        for n in &names {
+            assert!(
+                have.as_array().unwrap().contains(&json!(n)),
+                "{n} lost: {have}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_workspace_edit_for_another_harness_is_refused() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let before = std::fs::read(&cfg).unwrap();
+    let ws = env.home.join("ws").display().to_string();
+    // Loaded while "claude" was the default; the file's default is now "sh".
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"workspace": ws, "expect": {"harness": "claude", "workspace": ws}}),
+    );
+    assert_eq!(code, Some(3), "{err}");
+    assert!(err.contains("harness"), "{err}");
+    assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"workspace": ws, "expect": {"harness": "sh", "workspace": ws}}),
+    );
+    assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
 fn live_text_from_before_a_pause_does_not_notify_after_resume() {
     let env = Env::new();
     let cfg = env.config(
