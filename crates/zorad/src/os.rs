@@ -173,14 +173,21 @@ impl Group {
     /// leader still pins the id, then the leader is reaped. True once the group is verifiably empty; also the
     /// leader's (exit code, signal).
     pub fn finish_blocking(&self, grace: Duration, leader: Leader) -> (bool, ExitInfo) {
-        stop_pinned_group_blocking(self.0, grace);
-        let mut child = leader.0;
+        // Without a pinned leader the id may already be someone else's: check only.
+        if leader.pinned {
+            stop_pinned_group_blocking(self.0, grace);
+        }
+        let mut child = leader.child;
         let status = child.wait().ok().map(|s| (s.code(), s.signal()));
         (wait_group_empty(self.0, Duration::from_secs(2)), status)
     }
 
     /// For a group that already failed to reap: only checks whether it is gone, never signals it, since its
     /// number may since belong to an unrelated group.
+    pub fn leader_waitable(&self) -> bool {
+        wait_exit_unreaped(self.0, Some(Duration::ZERO)).is_some()
+    }
+
     pub fn retry_reap(&self) -> bool {
         group_empty(self.0)
     }
@@ -215,8 +222,11 @@ impl Held {
 
     /// Blocks until the leader exits, leaving it unreaped so the group id stays ours until `finish_blocking`.
     pub fn wait_exit(self) -> Leader {
-        let _ = wait_exit_unreaped(self.child.id() as i32, None);
-        Leader(self.child)
+        let pinned = wait_exit_unreaped(self.child.id() as i32, None) == Some(true);
+        Leader {
+            child: self.child,
+            pinned,
+        }
     }
 }
 
@@ -418,7 +428,21 @@ fn wait_group_empty(pgid: i32, limit: Duration) -> bool {
 pub type ExitInfo = Option<(Option<i32>, Option<i32>)>;
 
 /// A job's group leader that has exited but isn't reaped yet; see `Group::finish_blocking`.
-pub struct Leader(Child);
+pub struct Leader {
+    child: Child,
+    /// Seen exited and still unreaped, so it holds the group id.
+    pinned: bool,
+}
+
+/// Children must stay waitable until we reap them: with SIGCHLD inherited as ignored (or SA_NOCLDWAIT) the kernel
+/// reaps them itself, and nothing would pin a group id. Called first thing in every zorad process.
+pub fn default_sigchld() {
+    // SAFETY: a zeroed sigaction is SIG_DFL with no flags and an empty mask.
+    unsafe {
+        let sa: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut());
+    }
+}
 
 /// Stops a plugin and its process group. Every signal goes out while the leader is unreaped (a live process or a
 /// zombie pins the group id); the leader is reaped last and the group then only checked. True once it is
@@ -430,6 +454,8 @@ pub async fn stop_plugin(child: &mut PluginChild, group: &Group) -> bool {
     };
     let pid = pid as i32;
     let exited = tokio::task::spawn_blocking(move || {
+        // No signal before the leader is known to be waitable: otherwise nothing pins the id.
+        wait_exit_unreaped(pid, Some(Duration::ZERO))?;
         signal_group(pgid, libc::SIGTERM);
         let mut exited = wait_exit_unreaped(pid, Some(Duration::from_secs(3)));
         if exited == Some(false) {
@@ -439,12 +465,20 @@ pub async fn stop_plugin(child: &mut PluginChild, group: &Group) -> bool {
         if exited == Some(true) {
             stop_pinned_group_blocking(pgid, Duration::from_secs(3));
         }
-        exited == Some(true)
+        Some(exited == Some(true))
     })
     .await
-    .unwrap_or(false);
-    if !exited {
-        return false;
+    .unwrap_or(Some(false));
+    match exited {
+        None => {
+            return tokio::task::spawn_blocking(move || {
+                wait_group_empty(pgid, Duration::from_secs(2))
+            })
+            .await
+            .unwrap_or(false);
+        }
+        Some(false) => return false,
+        Some(true) => {}
     }
     if tokio::time::timeout(Duration::from_secs(2), child.wait())
         .await
@@ -730,6 +764,34 @@ pub fn attached_plugin() -> Result<
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_leader_that_was_not_seen_exiting_leaves_check_only_cleanup() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        child.wait().unwrap(); // reaped: nothing pins the id any more
+        let group = Group(pgid, None);
+        assert!(!group.leader_waitable());
+        let started = Instant::now();
+        while others_in_group(pgid, pgid) == Some(0) && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let leader = Leader {
+            child,
+            pinned: false,
+        };
+        let (ok, _) = group.finish_blocking(Duration::ZERO, leader);
+        assert!(!ok, "a member is left");
+        assert!(
+            others_in_group(pgid, pgid).is_some_and(|n| n >= 1),
+            "an unpinned group is never signalled"
+        );
+        signal_group(pgid, libc::SIGKILL); // test cleanup
+    }
 
     #[test]
     fn a_group_is_stopped_while_its_exited_leader_still_pins_the_id() {

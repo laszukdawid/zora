@@ -347,8 +347,9 @@ pub async fn run_plugin(
                             stop.clone(),
                         ));
                     }
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    // Never awaited further: dropping the child kills and reaps it in the background, and
+                    // PluginDown (unverified if need be) goes out now.
+                    drop(child);
                     res
                 }
                 Err(e) => {

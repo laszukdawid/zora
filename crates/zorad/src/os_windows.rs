@@ -294,6 +294,10 @@ impl Group {
         (ok, Some((exit_code(&leader.0), None)))
     }
 
+    pub fn leader_waitable(&self) -> bool {
+        true
+    }
+
     /// For a group that already failed to reap. The job handle can't name another process, so it is safe to
     /// terminate again.
     pub fn retry_reap(&self) -> bool {
@@ -655,7 +659,7 @@ pub async fn stop_plugin(child: &mut PluginChild, group: &Group) -> bool {
         .await
         .is_err()
     {
-        let _ = child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.kill()).await;
     }
     let group = group.clone();
     tokio::task::spawn_blocking(move || group.reap_blocking(Duration::from_secs(3)))
