@@ -10,8 +10,18 @@ fn main() {
     use std::sync::Arc;
     use zora_plugin::dictation::apps_from_config;
     use zora_plugin::proto::{CoreMsg, Out, clock_reply, handshake, parse, read_line};
+    use zora_windows::com::Apartment;
     use zora_windows::sessions::{Req, SessionSource, Watcher, run};
     use zora_windows::wasapi::Reconnecting;
+
+    // Entered once for this thread, and left after everything below has released its interfaces.
+    let _com = match Apartment::enter(true) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("zora-win-dictation: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -19,7 +29,8 @@ fn main() {
             println!(
                 "Capture sessions (Ctrl+C to stop). Dictate now; put the program name into dictation.windowsApps."
             );
-            let mut src = Reconnecting::default();
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let mut src = Reconnecting::new(tx);
             let mut last = None;
             loop {
                 let now = src.snapshot();
@@ -61,6 +72,7 @@ fn main() {
     let apps = apps_from_config(&session.config);
     eprintln!("zora-win-dictation: watching {} app name(s)", apps.len());
     let (tx, rx) = std::sync::mpsc::channel::<Req>();
+    let mut src = Reconnecting::new(tx.clone());
     {
         let out = out.clone();
         std::thread::spawn(move || {
@@ -82,7 +94,6 @@ fn main() {
             let _ = tx.send(Req::Quit);
         });
     }
-    let mut src = Reconnecting::default();
     run(Watcher::new(apps), &mut src, rx, |msgs| {
         for m in msgs {
             out.send(m.to_json());
