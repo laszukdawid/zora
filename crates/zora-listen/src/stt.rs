@@ -46,9 +46,63 @@ fn expand_tilde(p: &str) -> String {
 
 /// Every model file is there and not empty.
 pub fn model_present(dir: &Path) -> bool {
-    FILES
-        .iter()
-        .all(|f| std::fs::metadata(dir.join(f)).is_ok_and(|m| m.is_file() && m.len() > 0))
+    let sizes = manifest(dir).map(|m| {
+        m.into_iter()
+            .map(|(name, size, _)| (name, size))
+            .collect::<std::collections::HashMap<_, _>>()
+    });
+    FILES.iter().all(|f| {
+        std::fs::metadata(dir.join(f)).is_ok_and(|m| {
+            m.is_file() && m.len() > 0 && sizes.as_ref().is_none_or(|s| s.get(*f) == Some(&m.len()))
+        })
+    })
+}
+
+/// Written into each version setup installs: every model file's name, size and SHA-256, taken right after the
+/// downloaded archive passed its checksum.
+const MANIFEST: &str = "manifest";
+
+fn write_manifest(dir: &Path) -> Result<(), String> {
+    let mut text = String::new();
+    for f in FILES {
+        let path = dir.join(f);
+        let size = std::fs::metadata(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .len();
+        text.push_str(&format!("{f} {size} {}\n", sha256_file(&path)?));
+    }
+    std::fs::write(dir.join(MANIFEST), text).map_err(|e| e.to_string())
+}
+
+/// The manifest's entries, or None when there is none (a version from before manifests, or not setup's).
+fn manifest(dir: &Path) -> Option<Vec<(String, u64, String)>> {
+    let text = std::fs::read_to_string(dir.join(MANIFEST)).ok()?;
+    text.lines()
+        .map(|l| {
+            let mut it = l.split(' ');
+            Some((
+                it.next()?.to_string(),
+                it.next()?.parse().ok()?,
+                it.next()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Every model file matches the manifest, byte for byte (by size and SHA-256).
+fn verify(dir: &Path) -> Result<(), String> {
+    let entries = manifest(dir).ok_or_else(|| format!("{} has no manifest", dir.display()))?;
+    for f in FILES {
+        let Some((_, size, sum)) = entries.iter().find(|(n, ..)| n == f) else {
+            return Err(format!("{f} is not in the manifest"));
+        };
+        let path = dir.join(f);
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if len != *size || sha256_file(&path)? != *sum {
+            return Err(format!("{} does not match the manifest", path.display()));
+        }
+    }
+    Ok(())
 }
 
 pub struct Sherpa {
@@ -197,10 +251,9 @@ pub fn prune(config: &Value) -> Result<usize, String> {
         ));
     };
     // The fallbacks go only when the version kept is whole.
-    if !model_present(&dir) {
+    if let Err(e) = verify(&dir) {
         return Err(format!(
-            "the current model in {} is incomplete; nothing removed (run `zora-listen setup --force`)",
-            dir.display()
+            "{e}; nothing removed (run `zora-listen setup --force`)"
         ));
     }
     let mut removed = 0;
@@ -263,7 +316,7 @@ fn install(
         .and_then(|()| fetch(&model))
         .and_then(|()| {
             if model_present(&model) {
-                Ok(())
+                write_manifest(&model)
             } else {
                 Err("the downloaded model is incomplete; nothing was installed".into())
             }
@@ -448,6 +501,24 @@ mod tests {
         assert!(!model_present(Path::new("/nonexistent")));
     }
 
+    #[test]
+    fn a_truncated_file_fails_the_manifest() {
+        let r = root("manifest");
+        let live = r.join(MODEL);
+        install(&live, false, |m: &Path| {
+            fake_model(m, true);
+            std::fs::write(m.join(FILES[1]), b"a longer decoder").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(model_present(&live) && verify(&live).is_ok());
+        std::fs::write(live.join(FILES[1]), b"a longer").unwrap();
+        assert!(!model_present(&live), "size no longer matches");
+        assert!(verify(&live).is_err());
+        assert!(prune(&serde_json::json!({"model": live})).is_err());
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
     fn fake_model(dir: &Path, complete: bool) {
         std::fs::create_dir_all(dir).unwrap();
         let n = if complete { FILES.len() } else { 2 };
@@ -511,9 +582,13 @@ mod tests {
         assert_eq!(version_numbers(&r), [3]);
         assert_eq!(tag(&live), "c");
         assert_eq!(prune(&config).unwrap(), 0);
-        // A damaged current version keeps its fallbacks.
+        // A damaged current version keeps its fallbacks: truncated but not empty, or changed in place.
         install(&live, true, fetch_tagged("d")).unwrap();
+        assert!(verify(&live).is_ok());
         std::fs::write(live.join(FILES[0]), b"").unwrap();
+        assert!(prune(&config).is_err());
+        std::fs::write(live.join(FILES[0]), b"y").unwrap();
+        assert!(!model_present(&live) || verify(&live).is_err());
         assert!(prune(&config).is_err());
         assert_eq!(version_numbers(&r), [3, 4]);
         let _ = std::fs::remove_dir_all(&r);
