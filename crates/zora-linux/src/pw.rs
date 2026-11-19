@@ -94,7 +94,12 @@ impl Shared {
             // observation (the stall rule turns that into unknown) and answer a waiting `sync` unhealthy.
             if now - issued < RETRY_WINDOW {
                 if let Err(e) = self.request(purpose, issued) {
+                    // `fail` answers the syncs still pending; this one was already taken out.
                     self.fail(&format!("PipeWire round trip failed: {e}"), now);
+                    if let Purpose::Sync(id) = purpose {
+                        let reply = self.graph.monitor.synced(id, now);
+                        self.send(vec![reply]);
+                    }
                 }
                 return;
             }
@@ -398,4 +403,54 @@ pub fn run(
 
     mainloop.run();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_retry_answers_the_sync_once_unhealthy() {
+        let buf = Buf::default();
+        let mut sh = Shared {
+            graph: Graph::new(vec!["rec".into()]),
+            pending: HashMap::new(),
+            tick_outstanding: false,
+            // No connection, so the retry's round trip can't be sent.
+            core: None,
+            broken: None,
+            out: Arc::new(Out::new(Box::new(buf.clone()))),
+            watch: false,
+        };
+        let now = 100 * SECOND;
+        sh.graph.monitor.observe(false, now);
+        // A node without state keeps the snapshot incomplete, so the sync's round trip is retried.
+        sh.graph.discovered(1, None, None, now);
+        sh.pending.insert(7, (Purpose::Sync(42), now));
+        sh.done(7, now);
+        let lines: Vec<serde_json::Value> = String::from_utf8(buf.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let synced: Vec<_> = lines.iter().filter(|l| l["t"] == "synced").collect();
+        assert_eq!(synced.len(), 1, "{lines:?}");
+        assert_eq!(synced[0]["id"], 42);
+        assert_eq!(synced[0]["healthy"], false);
+        assert!(sh.broken.is_some());
+    }
 }
