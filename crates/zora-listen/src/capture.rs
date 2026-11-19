@@ -78,6 +78,11 @@ impl AudioInput for CpalInput {
             return Ok(());
         }
         stream.play().map_err(|e| e.to_string())?;
+        // play() only queues the start (PipeWire, WASAPI): a pause that came meanwhile stops it right away.
+        if !current.current() {
+            let _ = stream.pause();
+            return Ok(());
+        }
         eprintln!(
             "zora-listen: microphone open ({:?} host, {} Hz, {} ch)",
             host.id(),

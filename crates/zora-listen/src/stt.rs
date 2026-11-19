@@ -60,11 +60,11 @@ fn home() -> PathBuf {
 /// The model files in use. On Unix `dir` is a link setup made (or a plain directory). Links need privileges on
 /// Windows, so there setup names the version in `<dir>.version` instead, and `dir` counts only as a plain
 /// directory.
-pub fn resolve(dir: &Path) -> PathBuf {
+pub fn resolve(dir: &Path) -> Result<PathBuf, String> {
     if cfg!(windows) {
-        return read_pointer(dir).unwrap_or_else(|| dir.to_path_buf());
+        return Ok(read_pointer(dir)?.unwrap_or_else(|| dir.to_path_buf()));
     }
-    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+    Ok(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()))
 }
 
 fn pointer_file(dir: &Path) -> PathBuf {
@@ -72,23 +72,86 @@ fn pointer_file(dir: &Path) -> PathBuf {
     dir.with_file_name(format!("{}.version", name.unwrap_or_default()))
 }
 
-/// The managed version `<dir>.version` names, when it is a plain version name of an existing version.
-fn read_pointer(dir: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(pointer_file(dir)).ok()?;
-    let name = text.trim();
-    let n: u64 = name.strip_prefix(&format!("{MODEL}-"))?.parse().ok()?;
-    let version = dir.parent()?.join(VERSIONS).join(format!("{MODEL}-{n}"));
-    std::fs::symlink_metadata(&version)
-        .is_ok_and(|m| m.is_dir())
-        .then_some(version)
+/// A real directory or regular file: never a link, and on Windows never any reparse point (junctions too).
+fn plain(path: &Path, dir: bool) -> bool {
+    let Ok(m) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    !m.file_type().is_symlink() && if dir { m.is_dir() } else { m.is_file() }
 }
 
-/// Points `<dir>.version` at `name`, replacing the file in one rename (the commit point on Windows).
+/// The managed version `<dir>.version` names. `Ok(None)` only when there is no such file; a file that can't be
+/// read, names anything but a version, or points into a versions directory setup didn't make is damaged.
+fn read_pointer(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let file = pointer_file(dir);
+    let damaged = |why: &str| {
+        format!(
+            "{} is damaged ({why}); run `zora-listen setup --force`",
+            file.display()
+        )
+    };
+    match std::fs::symlink_metadata(&file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", file.display())),
+        Ok(_) if !plain(&file, false) => return Err(damaged("not a regular file")),
+        Ok(_) => {}
+    }
+    let text = std::fs::read_to_string(&file).map_err(|_| damaged("unreadable"))?;
+    let n: u64 = text
+        .trim()
+        .strip_prefix(&format!("{MODEL}-"))
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| damaged("not a version name"))?;
+    let root = dir.parent().ok_or_else(|| damaged("no models directory"))?;
+    let versions = root.join(VERSIONS);
+    let marker = versions.join(MARKER);
+    let marked = plain(&versions, true)
+        && plain(&marker, false)
+        && std::fs::read(&marker).is_ok_and(|t| t == MARKER_TEXT);
+    if !marked {
+        return Err(damaged("its versions directory is not setup's"));
+    }
+    let version = versions.join(format!("{MODEL}-{n}"));
+    if !plain(&version, true) {
+        return Err(damaged("the version it names is missing"));
+    }
+    Ok(Some(version))
+}
+
+/// Points `<dir>.version` at `name`: a new, uniquely named temp file, renamed over it (the commit point on
+/// Windows).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn write_pointer(dir: &Path, name: &str) -> Result<(), String> {
+    use std::io::Write;
     let file = pointer_file(dir);
-    let tmp = file.with_extension("version.tmp");
-    std::fs::write(&tmp, format!("{name}\n")).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let tmp = file.with_extension(format!(
+        "version.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(format!("{name}\n").as_bytes())
+                .and_then(|()| f.sync_all())
+        });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", tmp.display()));
+    }
     std::fs::rename(&tmp, &file).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {e}", file.display())
@@ -207,7 +270,7 @@ impl Sherpa {
     pub fn load(config: &Value) -> Result<Sherpa, String> {
         let dir = model_dir(config);
         // Resolve the link once, so every file comes from the same version even if setup swaps it meanwhile.
-        let dir = resolve(&dir);
+        let dir = resolve(&dir)?;
         if let Err(e) = model_status(&dir) {
             return Err(format!(
                 "speech model not usable in {} ({e}); run `zora-listen setup`",
@@ -342,7 +405,7 @@ pub fn prune(config: &Value) -> Result<usize, String> {
         ));
     };
     // The fallbacks go only when the version kept is whole.
-    if let Err(e) = verify(&resolve(&dir)) {
+    if let Err(e) = resolve(&dir).and_then(|d| verify(&d)) {
         return Err(format!(
             "{e}; nothing removed (run `zora-listen setup --force`)"
         ));
@@ -370,7 +433,7 @@ fn install(
 ) -> Result<PathBuf, String> {
     let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     let plain = |d: &Path| std::fs::symlink_metadata(d).is_ok_and(|m| m.is_dir());
-    if model_present(&resolve(dir)) && !force {
+    if resolve(dir).is_ok_and(|d| model_present(&d)) && !force {
         return Ok(dir.to_path_buf());
     }
     if plain(dir) {
@@ -383,7 +446,7 @@ fn install(
     std::fs::create_dir_all(root).map_err(|e| err(root, e))?;
     let _lock = lock(&root.join(".setup.lock"))?;
     // Another run may have finished while this one waited.
-    if model_present(&resolve(dir)) && !force {
+    if resolve(dir).is_ok_and(|d| model_present(&d)) && !force {
         return Ok(dir.to_path_buf());
     }
     let versions = managed_versions(root)?;
@@ -517,7 +580,7 @@ fn newest(versions: &Path) -> u64 {
 
 /// The version `dir` links (or on Windows points) to, if it is one of the managed ones.
 fn current_version(dir: &Path, versions: &Path) -> Option<u64> {
-    let target = std::fs::canonicalize(resolve(dir)).ok()?;
+    let target = std::fs::canonicalize(resolve(dir).ok()?).ok()?;
     let versions = std::fs::canonicalize(versions).ok()?;
     if target.parent()? != versions {
         return None;
@@ -585,16 +648,23 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 mod pointer_tests {
     use super::*;
 
+    fn setup(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("zora-pointer-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let versions = root.join(VERSIONS);
+        std::fs::create_dir_all(versions.join(format!("{MODEL}-2"))).unwrap();
+        std::fs::write(versions.join(MARKER), MARKER_TEXT).unwrap();
+        (root.clone(), root.join(MODEL))
+    }
+
     #[test]
     fn the_version_file_names_only_a_managed_version() {
-        let root = std::env::temp_dir().join(format!("zora-pointer-{}", std::process::id()));
-        let dir = root.join(MODEL);
-        std::fs::create_dir_all(root.join(VERSIONS).join(format!("{MODEL}-2"))).unwrap();
-        assert_eq!(read_pointer(&dir), None);
+        let (root, dir) = setup("names");
+        assert_eq!(read_pointer(&dir), Ok(None));
         write_pointer(&dir, &format!("{MODEL}-2")).unwrap();
         assert_eq!(
             read_pointer(&dir),
-            Some(root.join(VERSIONS).join(format!("{MODEL}-2")))
+            Ok(Some(root.join(VERSIONS).join(format!("{MODEL}-2"))))
         );
         for bad in [
             format!("{MODEL}-3"),
@@ -602,8 +672,47 @@ mod pointer_tests {
             format!("{MODEL}-2/.."),
         ] {
             write_pointer(&dir, &bad).unwrap();
-            assert_eq!(read_pointer(&dir), None, "{bad}");
+            assert!(read_pointer(&dir).is_err(), "{bad}");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unmarked_versions_directory_is_damage_not_absence() {
+        let (root, dir) = setup("unmarked");
+        write_pointer(&dir, &format!("{MODEL}-2")).unwrap();
+        std::fs::write(root.join(VERSIONS).join(MARKER), b"someone else's\n").unwrap();
+        assert!(read_pointer(&dir).is_err());
+        std::fs::remove_file(root.join(VERSIONS).join(MARKER)).unwrap();
+        assert!(read_pointer(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_versions_directory_is_refused() {
+        let (root, dir) = setup("linked");
+        write_pointer(&dir, &format!("{MODEL}-2")).unwrap();
+        let elsewhere = root.join("elsewhere");
+        std::fs::rename(root.join(VERSIONS), &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join(VERSIONS)).unwrap();
+        assert!(read_pointer(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn writing_never_reuses_a_predictable_temp_file() {
+        let (root, dir) = setup("tmp");
+        let old_tmp = pointer_file(&dir).with_extension("version.tmp");
+        std::fs::write(&old_tmp, b"keep me").unwrap();
+        write_pointer(&dir, &format!("{MODEL}-2")).unwrap();
+        assert_eq!(std::fs::read(&old_tmp).unwrap(), b"keep me");
+        let temps = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temps, 1, "only the file that was already there");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

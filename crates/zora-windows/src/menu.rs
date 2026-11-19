@@ -132,7 +132,7 @@ impl Options {
             zorad,
             zorad_config: config["zoradConfig"].as_str().map(String::from),
             notifications: config["notifications"].as_bool().unwrap_or(true),
-            task: config["task"].as_str().unwrap_or("Zora").to_string(),
+            task: config["task"].as_str().unwrap_or(r"\Zora\Zora").to_string(),
         }
     }
 
@@ -235,7 +235,7 @@ mod tests {
             o.zorad_args(&["pause".into()]),
             ["pause", "--config", "C:/c.json"]
         );
-        assert_eq!(o.task, "Zora");
+        assert_eq!(o.task, r"\Zora\Zora");
         assert!(o.notifications);
     }
 }
