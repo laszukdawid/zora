@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
-use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::Shell::{
@@ -246,30 +246,79 @@ fn zorad(opts: &Options, args: &[String]) -> Result<String, String> {
     run_bounded(cmd, &opts.zorad)
 }
 
+/// Runs `cmd` for at most 10 s. On timeout the process is terminated and reaped before this returns, so a late
+/// `zorad` can never land after a later request.
 fn run_bounded(mut cmd: std::process::Command, name: &str) -> Result<String, String> {
-    let child = cmd
+    use std::io::Read;
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run {name}: {e}"))?;
-    let (tx, rx) = channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    match rx.recv_timeout(Duration::from_secs(10)) {
-        Err(_) => Err(format!(
-            "{name} did not answer within 10 s; the change may or may not have been saved"
-        )),
-        Ok(Err(e)) => Err(format!("cannot run {name}: {e}")),
-        Ok(Ok(o)) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
-        Ok(Ok(o)) => {
-            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Ok(s),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("{name} did not answer within 10 s and was stopped"));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("cannot run {name}: {e}"));
+            }
+        }
+    };
+    let (out, err) = (
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    );
+    match status? {
+        s if s.success() => Ok(String::from_utf8_lossy(&out).into_owned()),
+        s => {
+            let err = String::from_utf8_lossy(&err).trim().to_string();
             Err(if err.is_empty() {
-                format!("{name} exited with {}", o.status)
+                format!("{name} exited with {s}")
             } else {
                 err
             })
         }
+    }
+}
+
+/// After a pause or resume that failed or timed out: what `zorad status` says now, for the notice. The next
+/// request is enabled only after this.
+fn reconcile(opts: &Options, failed: String) -> String {
+    match zorad(opts, &["status".into()]) {
+        Ok(s) => match s.lines().find_map(|l| l.strip_prefix("listening: ")) {
+            Some(state) => format!("{failed}; listening is now {state}"),
+            None => failed,
+        },
+        Err(e) => format!("{failed}; and its state couldn't be read: {e}"),
     }
 }
 
@@ -340,7 +389,9 @@ fn act(action: Action) {
     if let Some(req) = menu::pause_request(action, toggle) {
         if with_app(|a| a.model.begin()) == Some(true) {
             std::thread::spawn(move || {
-                let r = zorad(&opts, &req.args()).map(|_| ());
+                let r = zorad(&opts, &req.args())
+                    .map(|_| ())
+                    .map_err(|e| reconcile(&opts, e));
                 let _ = tx.send(Ev::PauseDone(req, r));
             });
         }
@@ -582,9 +633,16 @@ unsafe extern "system" fn tray_proc(
 /// Runs the tray until the core closes the connection. `core` carries the core's messages, then `None` at EOF.
 pub fn run(config: &Value, out: Arc<Out>, core: Receiver<Option<CoreMsg>>) -> i32 {
     let class = wide("ZoraTray");
+    // The folder picker needs a single-threaded apartment; entered once, left when `run` returns.
+    let _com = match crate::com::Apartment::enter(false) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("zora-tray: {e}");
+            return 1;
+        }
+    };
     // SAFETY: window and message-loop setup on this thread.
     unsafe {
-        let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
         let inst = GetModuleHandleW(std::ptr::null());
         let mut wc: WNDCLASSW = std::mem::zeroed();
         wc.lpfnWndProc = Some(tray_proc);
