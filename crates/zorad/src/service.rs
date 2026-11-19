@@ -411,12 +411,38 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                 );
                 vec![]
             }
-            Item::PluginDown { id, generation } => {
-                if plugins.get(&id).is_some_and(|p| p.generation == generation) {
+            Item::PluginDown {
+                id,
+                generation,
+                reaped,
+            } => {
+                if let Some(p) = plugins.get(&id)
+                    && p.generation == generation
+                {
+                    let transcript = p.transcript();
                     plugins.remove(&id);
-                    // Reaped (or, attached, about to restart the core): its microphone is closed.
-                    if let Some(Awaiting { waiting, .. }) = &mut awaiting {
-                        waiting.remove(&id);
+                    if reaped {
+                        // Its processes are gone, so is its microphone.
+                        if let Some(Awaiting { waiting, .. }) = &mut awaiting {
+                            waiting.remove(&id);
+                        }
+                    } else if transcript
+                        && !listen.listening
+                        && awaiting.is_none()
+                        && listen_state.confirmed == Some(true)
+                    {
+                        // An attached app that went away, or a group that couldn't be reaped: the pause is no
+                        // longer confirmed. (While still waiting, it stays unconfirmed and times out.)
+                        notifier.notify(
+                            &ZoraEvent::Degraded {
+                                reason: format!(
+                                    "plugin {id} went away while paused; its microphone may still be on"
+                                ),
+                            },
+                            &mut plugins,
+                        );
+                        listen_state.confirmed = Some(false);
+                        let _ = listen_tx.send(listen_state);
                     }
                 }
                 if let Some((_, waiting)) = &mut shutting_down {

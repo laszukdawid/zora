@@ -255,6 +255,8 @@ pub struct MicController<I: AudioInput> {
     /// `mic(epoch, open)`: the state the core was last told, per epoch.
     mic: Box<dyn FnMut(u64, bool) + Send>,
     reported: Option<(u64, bool)>,
+    /// The core epoch the open device serves.
+    opened_for: Option<u64>,
 }
 
 impl<I: AudioInput> MicController<I> {
@@ -280,6 +282,7 @@ impl<I: AudioInput> MicController<I> {
             status,
             mic,
             reported: None,
+            opened_for: None,
         }
     }
 
@@ -349,9 +352,14 @@ impl<I: AudioInput> MicController<I> {
         // The gate reflects the events handled so far; `Live` reflects the latest one the core sent, which may still
         // be queued behind them. Open only when both agree.
         let wanted = self.gate.wanted() && self.live.allowed();
+        // The core skipped epochs (a pause it never sent): what the open device heard is from before, so reopen.
+        if wanted && self.running && self.opened_for != self.gate.core_epoch {
+            self.close(true);
+        }
         if wanted && !self.running && self.retry_at.is_none() {
             let epoch = self.live.bump();
             let core = self.gate.core_epoch.unwrap_or(0);
+            self.opened_for = self.gate.core_epoch;
             *self.live.core.lock().unwrap_or_else(|e| e.into_inner()) = (epoch, core);
             // Said before the device starts, so the core hears of it before any text from this epoch.
             self.report(true);
@@ -615,6 +623,26 @@ mod tests {
         c.handle(MicEvent::Start(true, None));
         assert!(!c.is_running());
         assert_eq!(log(&input), ["built, not started", "close at epoch 2"]);
+    }
+
+    #[test]
+    fn a_skipped_epoch_reopens_the_device() {
+        let (mut c, input, _rx, _, live) = controller();
+        c.handle(MicEvent::Ready);
+        c.handle(MicEvent::Start(true, Some(1)));
+        // The core paused and resumed before telling this plugin: epoch 3 arrives while still listening.
+        c.handle(MicEvent::Listening(true, Some(3)));
+        assert_eq!(
+            log(&input),
+            [
+                "mic 1 true",
+                "open 1",
+                "close at epoch 2",
+                "mic 3 true",
+                "open 3"
+            ]
+        );
+        assert_eq!(live.core_epoch(live.epoch()), Some(3));
     }
 
     #[test]

@@ -97,7 +97,10 @@ Unix seconds; it is absent for a pause that lasts until resumed. The state is al
 never opens the microphone just to close it again.
 
 **Epochs.** `epoch` belongs to one connection: it is 1 in `start` and goes up by one each time listening turns on or
-off. A new `hello` starts again at 1. A `listening` message that only changes `until` keeps the epoch.
+off. A new `hello` starts again at 1. A `listening` message that only changes `until` keeps the epoch. If listening
+turned on and off again before the core could tell a plugin, the core sends only the latest state, with the epoch
+advanced past every transition the plugin missed: it never replays a superseded state. An epoch that jumps
+invalidates everything before it, so a plugin still listening under an older epoch restarts its capture.
 
 - A `transcript` plugin must declare the `listening` capability in `ready`: it releases the microphone while paused,
   never starts it before `start` says `listening: true`, and drops audio heard but not yet transcribed rather than
@@ -117,9 +120,11 @@ off. A new `hello` starts again at 1. A `listening` message that only changes `u
   started again on resume; while listening, its segments are accepted and its partials (which carry no epoch)
   dropped. The attached macOS app can't be stopped; it must close its engine on its own on a pause or when the
   connection is lost, and the core only reports a missing confirmation. Each failure sends a `degraded`
-  notification naming the plugin. Confirmations and timeouts for an epoch that is no longer current are ignored. A `mic{open: true}` for a
-  paused epoch is a failure too: a spawned plugin is stopped until resume. If several transitions happen before
-  the core can tell a plugin, it still sends each one, so every transition gets its own epoch.
+  notification naming the plugin. Confirmations and timeouts for an epoch that is no longer current are ignored. A
+  `mic{open: true}` for a paused epoch is a failure too: a spawned plugin is stopped until resume. The core stops a
+  spawned plugin that hasn't confirmed within a few seconds even if the plugin isn't reading its input. Only a
+  confirmation or a verified reap of the plugin's processes counts as closed; an attached app that disconnects, or
+  a plugin whose processes couldn't be reaped, leaves the pause unconfirmed (`confirmed: false` and `degraded`).
 - Whatever a plugin still sends while paused, the core drops: segments and partial text are neither stored nor
   matched (this takes precedence over storing old-generation segments), and an open capture ends. Final segments
   keep their capture-time check after a resume. Commands completed before the pause still run.
