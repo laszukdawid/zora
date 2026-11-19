@@ -60,7 +60,7 @@ pub fn model_status(dir: &Path) -> Result<(), String> {
             _ => return Err(format!("{} is missing or empty", path.display())),
         };
         if let Some(entries) = &entries
-            && !entries.iter().any(|(n, size, _)| n == f && *size == len)
+            && entries.get(f).map(|(size, _)| *size) != Some(len)
         {
             return Err(format!("{} does not match the manifest", path.display()));
         }
@@ -72,8 +72,9 @@ pub fn model_status(dir: &Path) -> Result<(), String> {
 /// downloaded archive passed its checksum.
 const MANIFEST: &str = "manifest";
 
-/// A manifest line: file name, size, SHA-256.
-type Entry = (String, u64, String);
+/// A parsed manifest: model file name to its size and SHA-256. Load, setup and prune all read it through
+/// `manifest`.
+type Manifest = std::collections::HashMap<String, (u64, String)>;
 
 fn write_manifest(dir: &Path) -> Result<(), String> {
     let mut text = String::new();
@@ -89,30 +90,32 @@ fn write_manifest(dir: &Path) -> Result<(), String> {
 
 /// The manifest's entries; `None` when there is no manifest. A manifest that can't be read, doesn't parse, or
 /// doesn't list every model file is an error, never "no manifest".
-fn manifest(dir: &Path) -> Result<Option<Vec<Entry>>, String> {
+fn manifest(dir: &Path) -> Result<Option<Manifest>, String> {
     let path = dir.join(MANIFEST);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
+    let bad = || format!("{} is damaged", path.display());
+    // Only an absent entry means "no manifest"; a dangling link or anything but a regular file is damaged.
+    match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    let bad = || format!("{} is damaged", path.display());
-    let entries: Vec<Entry> = text
-        .lines()
-        .map(|l| {
-            let f: Vec<&str> = l.split(' ').collect();
-            match f[..] {
-                [name, size, sum]
-                    if sum.len() == 64 && sum.bytes().all(|b| b.is_ascii_hexdigit()) =>
-                {
-                    Some((name.to_string(), size.parse().ok()?, sum.to_string()))
-                }
-                _ => None,
-            }
-        })
-        .collect::<Option<_>>()
-        .ok_or_else(bad)?;
-    if !FILES.iter().all(|f| entries.iter().any(|(n, ..)| n == f)) {
+        Ok(m) if !m.is_file() => return Err(bad()),
+        Ok(_) => {}
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut entries = Manifest::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        let [name, size, sum] = f[..] else {
+            return Err(bad());
+        };
+        let size: u64 = size.parse().map_err(|_| bad())?;
+        let valid_sum = sum.len() == 64 && sum.bytes().all(|b| b.is_ascii_hexdigit());
+        // Exactly one entry for each model file, and nothing else.
+        if !valid_sum || !FILES.contains(&name) || entries.contains_key(name) {
+            return Err(bad());
+        }
+        entries.insert(name.to_string(), (size, sum.to_string()));
+    }
+    if entries.len() != FILES.len() {
         return Err(bad());
     }
     Ok(Some(entries))
@@ -122,7 +125,7 @@ fn manifest(dir: &Path) -> Result<Option<Vec<Entry>>, String> {
 fn verify(dir: &Path) -> Result<(), String> {
     let entries = manifest(dir)?.ok_or_else(|| format!("{} has no manifest", dir.display()))?;
     for f in FILES {
-        let Some((_, size, sum)) = entries.iter().find(|(n, ..)| n == f) else {
+        let Some((size, sum)) = entries.get(f) else {
             return Err(format!("{f} is not in the manifest"));
         };
         let path = dir.join(f);
@@ -574,6 +577,37 @@ mod tests {
         assert!(!model_present(&live));
         std::fs::remove_file(live.join(MANIFEST)).unwrap();
         assert!(model_present(&live));
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn a_manifest_that_is_not_a_regular_file_or_has_duplicates_is_damaged() {
+        let r = root("manifest-shape");
+        let live = r.join(MODEL);
+        install(&live, false, fetch_tagged("a")).unwrap();
+        let good = std::fs::read_to_string(live.join(MANIFEST)).unwrap();
+        // A dangling link in its place, with a truncated file: damaged, not "no manifest".
+        std::fs::remove_file(live.join(MANIFEST)).unwrap();
+        std::os::unix::fs::symlink(r.join("nowhere"), live.join(MANIFEST)).unwrap();
+        std::fs::write(live.join(FILES[0]), b"t").unwrap();
+        assert!(model_status(&live).unwrap_err().contains("damaged"));
+        assert!(prune(&serde_json::json!({"model": live})).is_err());
+        // Duplicate entries that disagree: damaged, for load and prune alike.
+        std::fs::remove_file(live.join(MANIFEST)).unwrap();
+        let first = good.lines().next().unwrap();
+        let (name, rest) = first.split_once(' ').unwrap();
+        let (_, sum) = rest.split_once(' ').unwrap();
+        let conflicting = format!("{good}{name} 1 {sum}\n");
+        std::fs::write(live.join(MANIFEST), conflicting).unwrap();
+        assert!(model_status(&live).unwrap_err().contains("damaged"));
+        assert!(verify(&live).is_err());
+        // An entry for a file the model doesn't have is damaged too.
+        std::fs::write(
+            live.join(MANIFEST),
+            format!("{good}extra.bin 1 {}\n", "0".repeat(64)),
+        )
+        .unwrap();
+        assert!(model_status(&live).is_err());
         let _ = std::fs::remove_dir_all(&r);
     }
 
