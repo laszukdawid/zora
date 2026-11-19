@@ -2,12 +2,7 @@
 name = "zora-linux"
 version.workspace = true
 edition.workspace = true
-description = "Linux plugins for zorad: speech (zora-listen), dictation monitor (zora-dictation), notifications and tray (zora-desktop)"
-
-# Speech to text: cpal capture and a streaming sherpa-onnx model. Also builds elsewhere for the file-mode e2e test.
-[[bin]]
-name = "zora-listen"
-path = "src/bin/zora-listen.rs"
+description = "Linux plugins for zorad: dictation monitor (zora-dictation), notifications and tray (zora-desktop)"
 
 # Watches PipeWire for capture streams of the configured dictation apps.
 [[bin]]
@@ -24,17 +19,8 @@ zora-plugin = { path = "../zora-plugin" }
 serde_json.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cpal = { version = "0.18", features = ["pipewire"] }
-sherpa-onnx = "2.0"
 pipewire = "0.10"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 ksni = { version = "0.3", default-features = false, features = ["tokio"] }
-tokio = { workspace = true }
+tokio.workspace = true
 serde.workspace = true
-sha2 = "0.10"
-libc.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
-hound.workspace = true
-libc.workspace = true

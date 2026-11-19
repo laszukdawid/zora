@@ -32,7 +32,7 @@ struct Env {
 impl Env {
     fn new(tag: &str) -> Env {
         let home = std::env::temp_dir().join(format!(
-            "zora-linux-e2e-{tag}-{}-{}",
+            "zora-listen-e2e-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/zora-core", "crates/zorad", "crates/zora-plugin", "crates/zora-linux"]
+members = ["crates/zora-core", "crates/zorad", "crates/zora-plugin", "crates/zora-listen", "crates/zora-linux"]
 
 [workspace.package]
 version = "0.2.0"

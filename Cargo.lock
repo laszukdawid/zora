@@ -2788,17 +2788,25 @@ dependencies = [
 name = "zora-linux"
 version = "0.2.0"
 dependencies = [
- "cpal",
- "hound",
  "ksni",
- "libc",
  "pipewire",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "sherpa-onnx",
  "tokio",
  "zbus",
+ "zora-plugin",
+]
+
+[[package]]
+name = "zora-listen"
+version = "0.2.0"
+dependencies = [
+ "cpal",
+ "hound",
+ "libc",
+ "serde_json",
+ "sha2 0.10.9",
+ "sherpa-onnx",
  "zora-plugin",
 ]
 

@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use zora_plugin::clock::now_ns;
-use zora_plugin::dictation::{CAPTURE_CLASS, Monitor, Msg, matches_app};
+use zora_plugin::dictation::{Monitor, Msg, StreamNode};
 use zora_plugin::proto::Out;
 
 /// From the stdin thread into the loop.
@@ -27,17 +27,10 @@ enum Purpose {
     Sync(u64),
 }
 
-#[derive(Default)]
-struct Stream {
-    capture: bool,
-    matches: bool,
-    running: bool,
-}
-
 struct Shared {
     monitor: Monitor,
     apps: Vec<String>,
-    streams: HashMap<u32, Stream>,
+    streams: HashMap<u32, StreamNode>,
     pending: HashMap<i32, Purpose>,
     tick_outstanding: bool,
     broken: bool,
@@ -52,9 +45,7 @@ impl Shared {
     }
 
     fn capturing(&self) -> bool {
-        self.streams
-            .values()
-            .any(|s| s.capture && s.matches && s.running)
+        self.streams.values().any(StreamNode::dictating)
     }
 }
 
@@ -131,8 +122,7 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                         let apps = sh.apps.clone();
                         let entry = sh.streams.entry(id).or_default();
                         if let Some(props) = info.props() {
-                            entry.capture = props.get("media.class") == Some(CAPTURE_CLASS);
-                            entry.matches = matches_app(|k| props.get(k), &apps);
+                            entry.update_props(props.iter(), &apps);
                         }
                         entry.running = matches!(info.state(), NodeState::Running);
                     })

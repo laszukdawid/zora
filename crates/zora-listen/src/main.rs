@@ -1,5 +1,10 @@
 //! The `transcript` plugin: local speech to text. Nothing is sent anywhere and no audio is stored.
 
+#[cfg(target_os = "linux")]
+mod capture;
+#[cfg(target_os = "linux")]
+mod stt;
+
 use std::path::PathBuf;
 use zora_plugin::listen::{FileInput, ScriptedRecognizer, run_listen_plugin};
 
@@ -71,10 +76,10 @@ fn plugin(args: &[String]) -> i32 {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::capture::CpalInput;
+    use crate::stt::{self, Sherpa};
     use serde_json::json;
     use std::path::Path;
-    use zora_linux::capture::CpalInput;
-    use zora_linux::stt::{self, Sherpa};
     use zora_plugin::listen::{FileInput, Recognizer, run_listen_plugin};
 
     pub fn run(file: Option<FileInput>) -> i32 {

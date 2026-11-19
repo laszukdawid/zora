@@ -29,6 +29,35 @@ pub fn matches_app<'a>(prop: impl Fn(&str) -> Option<&'a str>, apps: &[String]) 
     })
 }
 
+/// One audio node as seen through its info updates.
+#[derive(Debug, Default, Clone)]
+pub struct StreamNode {
+    props: std::collections::HashMap<String, String>,
+    capture: bool,
+    matches: bool,
+    pub running: bool,
+}
+
+impl StreamNode {
+    /// PipeWire info updates carry only the properties that changed, so they are merged, never replaced.
+    pub fn update_props<'a>(
+        &mut self,
+        props: impl IntoIterator<Item = (&'a str, &'a str)>,
+        apps: &[String],
+    ) {
+        for (k, v) in props {
+            self.props.insert(k.to_string(), v.to_string());
+        }
+        self.capture = self.props.get("media.class").map(String::as_str) == Some(CAPTURE_CLASS);
+        self.matches = matches_app(|k| self.props.get(k).map(String::as_str), apps);
+    }
+
+    /// A configured dictation app is capturing through this node right now.
+    pub fn dictating(&self) -> bool {
+        self.capture && self.matches && self.running
+    }
+}
+
 /// Configured app names from `hello.config.apps`.
 pub fn apps_from_config(config: &Value) -> Vec<String> {
     config["apps"]
@@ -170,7 +199,12 @@ impl Monitor {
 
     /// Observation is impossible (server gone, not running, unsupported audio system).
     pub fn lost(&mut self, reason: &str, now: Ns) -> Vec<Msg> {
-        let mut out = self.stall_check(now);
+        // Once unhealthy the core treats everything as unknown; the interval is reported when observation resumes.
+        let mut out = if self.healthy {
+            self.stall_check(now)
+        } else {
+            vec![]
+        };
         if self.healthy || self.reason != reason {
             self.healthy = false;
             self.reason = reason.into();
@@ -255,6 +289,38 @@ mod tests {
             !m(&p, &["nerd-dictation"]),
             "only application properties count"
         );
+    }
+
+    #[test]
+    fn partial_property_updates_keep_the_match() {
+        let apps = vec!["pw-record".to_string()];
+        let mut n = StreamNode::default();
+        n.update_props(
+            [
+                ("media.class", CAPTURE_CLASS),
+                ("application.name", "pw-record"),
+            ],
+            &apps,
+        );
+        n.running = true;
+        assert!(n.dictating());
+        n.update_props([("node.latency", "1024/48000")], &apps);
+        assert!(
+            n.dictating(),
+            "a later update without the app name changes nothing"
+        );
+        n.running = false;
+        assert!(!n.dictating());
+        let mut other = StreamNode::default();
+        other.update_props(
+            [
+                ("media.class", "Audio/Source"),
+                ("application.name", "pw-record"),
+            ],
+            &apps,
+        );
+        other.running = true;
+        assert!(!other.dictating(), "only capture streams count");
     }
 
     #[test]
@@ -389,5 +455,30 @@ mod tests {
         assert_eq!(mon.lost("no server", t).len(), 1);
         assert!(mon.lost("no server", t).is_empty());
         assert_eq!(mon.lost("other", t).len(), 1);
+    }
+
+    #[test]
+    fn losing_the_server_reports_the_stall_once_then_again_on_recovery() {
+        let mut mon = Monitor::new(true);
+        let t = 10 * SECOND;
+        mon.observe(false, t);
+        let out = mon.lost("gone", t + 2 * SECOND);
+        assert!(matches!(out[0], Msg::Unknown { .. }));
+        assert!(matches!(out[1], Msg::Health { healthy: false, .. }));
+        assert!(mon.lost("gone", t + 3 * SECOND).is_empty());
+        assert!(
+            !mon.tick(t + 5 * SECOND)
+                .iter()
+                .any(|m| matches!(m, Msg::Unknown { .. }))
+        );
+        let out = mon.observe(false, t + 6 * SECOND);
+        assert_eq!(
+            out[0],
+            Msg::Unknown {
+                from_ns: t,
+                to_ns: t + 6 * SECOND
+            }
+        );
+        assert!(matches!(out[1], Msg::Health { healthy: true, .. }));
     }
 }
