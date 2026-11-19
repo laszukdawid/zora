@@ -156,8 +156,11 @@ review or blocked when the agent finishes. The board's Zora tab also shows recen
 
 ## Platforms
 
-macOS works today. Linux (Ubuntu, Arch) is next: Zora's core already runs there, but the speech and menu-bar parts
-are still to be written. Windows comes after that.
+macOS works today. Linux (Ubuntu 24.04 or newer, and Arch) has its own speech, dictation and tray plugins: speech is
+recognized on your machine by a small English model, and the tray icon has the same menu as on macOS. It needs
+PipeWire, which both use by default. On GNOME the tray icon needs the AppIndicator extension (Ubuntu has it already).
+Linux support is new and hasn't been tried on many machines yet; see [docs/development.md](docs/development.md#linux)
+to install it. Windows comes after that.
 
 ## For developers
 
