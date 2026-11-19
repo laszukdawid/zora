@@ -873,6 +873,78 @@ fn speech_from_the_pause_that_arrives_after_resume_is_dropped() {
     assert_eq!(commands[0].1, "say hi");
 }
 
+#[test]
+fn live_text_from_before_a_pause_does_not_notify_after_resume() {
+    let env = Env::new();
+    let cfg = env.config(
+        // Tagged with epoch 1 (before the pause), delivered after the resume (epoch 3).
+        json!([{"delayMs": 7000, "partial": "Hey Nova", "epoch": 1}]),
+        sh("echo ran", &["print", "ran"]),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(2000));
+    env.zorad(&["resume"]);
+    std::thread::sleep(Duration::from_millis(6000));
+    let (_, err) = term_and_collect(child);
+    assert!(err.contains("listening=true epoch=3"), "{err}");
+    assert!(err.contains("pause confirmed=true"), "{err}");
+    assert!(!err.contains("notify kind=captureStarted"), "{err}");
+}
+
+#[test]
+fn a_plugin_without_pause_support_is_stopped_while_paused_and_restarted_on_resume() {
+    let env = Env::new();
+    let cfg = env.config_with(
+        // Each connection replays the script: the first is stopped before speaking, the restarted one speaks.
+        json!([{"delayMs": 6000, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 800}]),
+        sh("echo \"ran: $1\"", &["ran"]),
+        json!({"listeningCapability": false}),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1000));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(5000));
+    env.zorad(&["resume"]);
+    let done = wait_for(Duration::from_secs(25), || {
+        env.commands().into_iter().find(|c| c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    assert!(
+        err.contains("plugin script can't confirm its microphone is off"),
+        "{err}"
+    );
+    assert_eq!(err.matches("listening=true epoch=1 ").count(), 2, "{err}");
+    assert!(!err.contains("listening=false"), "{err}");
+    assert_eq!(done.map(|c| c.1).as_deref(), Some("say hi"), "{err}");
+}
+
+#[test]
+fn a_plugin_that_never_confirms_a_pause_is_stopped_and_reported() {
+    let env = Env::new();
+    let cfg = env.config_with(
+        json!([]),
+        sh("true", &["print", "ok"]),
+        json!({"confirmPause": false}),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    // The 5 s deadline, plus up to a second each to notice the pause and the timeout.
+    std::thread::sleep(Duration::from_millis(9000));
+    env.zorad(&["resume"]);
+    std::thread::sleep(Duration::from_millis(3000));
+    let (_, err) = term_and_collect(child);
+    assert!(
+        err.contains("plugin script did not confirm its microphone is off"),
+        "{err}"
+    );
+    assert!(err.contains("pause confirmed=false"), "{err}");
+    // Stopped on the timeout, started again on resume.
+    assert_eq!(err.matches("listening=true epoch=1 ").count(), 2, "{err}");
+}
+
 /// Requests the fake board saw: (path, Host header, JSON body).
 type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, Value)>>>;
 
