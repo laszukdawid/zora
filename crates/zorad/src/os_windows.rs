@@ -213,9 +213,12 @@ impl Group {
         self.leader as i32
     }
 
-    /// The closest thing to SIGTERM: Ctrl+Break to the leader's process group (console programs only).
+    /// The closest thing to SIGTERM: Ctrl+Break to the leader's process group. A plugin is on its own console,
+    /// which Ctrl+Break can't reach, so it is terminated (it has had `stop`, or broke the protocol).
     pub fn term(&self) {
-        if self.console && self.leader != 0 {
+        if !self.console {
+            self.kill();
+        } else if self.leader != 0 {
             // SAFETY: no pointers involved.
             unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, self.leader) };
         }
