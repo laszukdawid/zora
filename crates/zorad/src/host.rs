@@ -187,6 +187,13 @@ pub enum Item {
         generation: u64,
         /// Its processes are verifiably gone (a spawned plugin's group was reaped).
         reaped: bool,
+        /// It may hold a microphone: it declared `transcript`, or never got as far as saying.
+        may_record: bool,
+    },
+    /// A plugin group that failed to reap at `PluginDown` is gone after all.
+    Reaped {
+        id: String,
+        generation: u64,
     },
     PluginStopped {
         id: String,
@@ -279,11 +286,20 @@ pub async fn run_plugin(
         generation += 1;
         let started = tokio::time::Instant::now();
         let mut reaped = false;
+        let mut may_record = true;
         let result = match &spec.connection {
             Connection::Attached => match crate::os::attached_plugin() {
                 Ok((r, w)) => {
                     until_stop(
-                        session(&spec, generation, r, w, &queue, stop.clone()),
+                        session(
+                            &spec,
+                            generation,
+                            r,
+                            w,
+                            &queue,
+                            stop.clone(),
+                            &mut may_record,
+                        ),
                         stop.clone(),
                     )
                     .await
@@ -299,7 +315,15 @@ pub async fn run_plugin(
                     // Shutdown is observed in every phase (negotiation, clock probes, running); cancelling the
                     // session drops it and falls through to the group cleanup below.
                     let res = until_stop(
-                        session(&spec, generation, r, w, &queue, stop.clone()),
+                        session(
+                            &spec,
+                            generation,
+                            r,
+                            w,
+                            &queue,
+                            stop.clone(),
+                            &mut may_record,
+                        ),
                         stop.clone(),
                     )
                     .await;
@@ -315,13 +339,27 @@ pub async fn run_plugin(
                             let _ = child.kill().await;
                             let _ = child.wait().await;
                         }
-                        reaped = tokio::task::spawn_blocking(move || {
-                            group.reap_blocking(Duration::from_secs(3))
+                        let (group, ok) = match tokio::task::spawn_blocking(move || {
+                            let ok = group.reap_blocking(Duration::from_secs(3));
+                            (group, ok)
                         })
                         .await
-                        .unwrap_or(false);
+                        {
+                            Ok((g, ok)) => (Some(g), ok),
+                            Err(_) => (None, false),
+                        };
+                        reaped = ok;
                         if !reaped {
                             eprintln!("[zorad] plugin {} left processes in group {pgid}", spec.id);
+                            if let Some(group) = group {
+                                tokio::spawn(reap_later(
+                                    group,
+                                    spec.id.clone(),
+                                    generation,
+                                    queue.clone(),
+                                    stop.clone(),
+                                ));
+                            }
                         }
                     }
                     let _ = child.kill().await;
@@ -338,6 +376,7 @@ pub async fn run_plugin(
             id: spec.id.clone(),
             generation,
             reaped,
+            may_record,
         });
         if *stop.borrow() {
             return; // service shutdown: the group above is already reaped
@@ -372,6 +411,38 @@ pub async fn run_plugin(
             _ = stop_wait.wait_for(|s| *s) => return,
         }
         backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
+/// Keeps trying to reap a group that outlived its plugin; the pause counts it until this succeeds.
+async fn reap_later(
+    group: crate::os::Group,
+    id: String,
+    generation: u64,
+    queue: Arc<InputQueue<Item>>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut group = Some(group);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = stop.wait_for(|s| *s) => return,
+        }
+        let Some(g) = group.take() else { return };
+        let Ok((g, ok)) = tokio::task::spawn_blocking(move || {
+            let ok = g.reap_blocking(Duration::ZERO);
+            (g, ok)
+        })
+        .await
+        else {
+            return;
+        };
+        if ok {
+            eprintln!("[zorad] plugin {id} group reaped late");
+            queue.force(Item::Reaped { id, generation });
+            return;
+        }
+        group = Some(g);
     }
 }
 
@@ -518,6 +589,7 @@ async fn session(
     mut writer: impl AsyncWrite + Unpin + Send + 'static,
     queue: &InputQueue<Item>,
     stop: tokio::sync::watch::Receiver<bool>,
+    may_record: &mut bool,
 ) -> Result<(), ProtocolError> {
     let (tx, mut rx) = mpsc::channel::<String>(64);
     // A failed write is a broken connection: the reader side must not stay half-open.
@@ -596,6 +668,7 @@ async fn session(
 
     let has = |c: &str| capabilities.iter().any(|x| x == c);
     let (transcript, dictation) = (has("transcript"), has("dictation"));
+    *may_record = transcript;
     let mut state = Conn {
         healthy: false,
         capturing: false,

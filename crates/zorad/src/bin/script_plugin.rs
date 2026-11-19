@@ -12,6 +12,7 @@
 //!   "capturingAtStart": false,
 //!   "listeningCapability": true,            // declare `listening` with `transcript` (false: an old plugin)
 //!   "confirmPause": true,                   // answer each epoch with `mic` (false: never confirm)
+//!   "confirmDelayMs": 6000,                 // confirm a pause that late
 //!   // {"partial": "hey zora"} carries the current epoch; {"partial": ..., "epoch": 1} a given (stale) one
 //! }
 
@@ -189,7 +190,17 @@ fn main() {
                 eprintln!("listening={on} epoch={e} confirmed={}", msg["confirmed"]);
                 let new = epoch.swap(e, Ordering::SeqCst) != e;
                 if confirm && e > 0 && new {
-                    out.send(json!({"t": "mic", "epoch": e, "open": on}));
+                    // "confirmDelayMs": a pause confirmed late.
+                    match config["confirmDelayMs"].as_u64().filter(|_| !on) {
+                        Some(ms) => {
+                            let out = out.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_millis(ms));
+                                out.send(json!({"t": "mic", "epoch": e, "open": on}));
+                            });
+                        }
+                        None => out.send(json!({"t": "mic", "epoch": e, "open": on})),
+                    }
                 }
             }
             Some("clock") => out.send(json!({"t": "clock", "id": msg["id"], "now_ns": now_ns()})),

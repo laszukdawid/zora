@@ -1073,6 +1073,34 @@ fn a_plugin_without_pause_support_is_stopped_while_paused_and_restarted_on_resum
 }
 
 #[test]
+fn a_late_confirmation_clears_pause_not_confirmed() {
+    let env = Env::new();
+    let cfg = env.config_with(
+        json!([]),
+        sh("true", &["print", "ok"]),
+        json!({"confirmDelayMs": 6000}),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(9000));
+    let (_, err) = term_and_collect(child);
+    let unconfirmed = err.find("pause confirmed=false");
+    let confirmed = err.find("pause confirmed=true");
+    assert!(
+        unconfirmed.is_some() && confirmed > unconfirmed,
+        "the timeout is reported, then the late confirmation clears it:\n{err}"
+    );
+    assert_eq!(
+        err.matches("did not confirm its microphone is off").count(),
+        1,
+        "{err}"
+    );
+    // The plugin confirmed in time for the stop deadline, so it kept running.
+    assert_eq!(err.matches("listening=true epoch=1 ").count(), 1, "{err}");
+}
+
+#[test]
 fn a_plugin_that_never_confirms_a_pause_is_stopped_and_reported() {
     let env = Env::new();
     let cfg = env.config_with(
