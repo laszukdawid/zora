@@ -295,6 +295,7 @@ impl JobManager {
         let mut registration: Option<(i32, i64)> = None;
         let mut exited: Option<GuardMsg> = None;
         let mut cleaned: Option<bool> = None;
+        let mut failed: Option<String> = None;
         let mut timed_out = false;
         let mut cancel_sent = false;
         loop {
@@ -328,7 +329,7 @@ impl JobManager {
                         }
                         Ok(m @ GuardMsg::Exited { .. }) => exited = Some(m),
                         Ok(GuardMsg::Cleaned { ok }) => { cleaned = Some(ok); break; }
-                        Ok(GuardMsg::Failed { error }) => { let _ = child.wait().await; return (fail(error), true); }
+                        Ok(GuardMsg::Failed { error }) => failed = Some(error),
                         Err(_) => {}
                     }
                 }
@@ -386,6 +387,7 @@ impl JobManager {
         }
 
         let result = match exited {
+            _ if failed.is_some() => fail(failed.unwrap_or_default()),
             _ if timed_out => fail(format!("timed out after {}s", self.timeout.as_secs())),
             Some(GuardMsg::Exited {
                 cancelled: true, ..
@@ -419,7 +421,6 @@ pub async fn recover(store: &StoreHandle) -> Result<usize, String> {
         .call(|s| s.non_final_jobs())
         .await
         .ok_or("store unavailable")??;
-    let boot = os::boot_id();
     let mut recovered = 0;
     for job in jobs {
         let id = job.id.clone();
@@ -427,11 +428,20 @@ pub async fn recover(store: &StoreHandle) -> Result<usize, String> {
             let id = id.clone();
             store.send_critical(move |s| s.set_status(&id, status));
         };
-        // A different boot means none of the recorded processes can still exist: no signals, no manual check.
-        if job.boot_id.as_deref().is_some_and(|b| b != boot) {
-            mark("interrupted");
-            recovered += 1;
-            continue;
+        match os::owner(job.boot_id.as_deref()) {
+            // A different boot means none of the recorded processes can still exist: no signals, no manual check.
+            os::Owner::OtherBoot => {
+                mark("interrupted");
+                recovered += 1;
+                continue;
+            }
+            // Not visible from here, so not provably gone: admission stays closed.
+            os::Owner::Elsewhere(why) => {
+                return Err(format!(
+                    "job {id} {why}; check it, then run `zora jobs clear {id}`"
+                ));
+            }
+            os::Owner::Here => {}
         }
         if job.status == "ambiguous" {
             return Err(format!(

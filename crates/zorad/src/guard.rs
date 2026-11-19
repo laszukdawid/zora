@@ -9,9 +9,7 @@
 
 use crate::os;
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,19 +24,6 @@ pub struct JobSpec {
     /// The job id; names the Job Object on Windows.
     #[serde(default)]
     pub name: String,
-}
-
-/// The job's command with its workspace, exact environment and captured output.
-pub fn command(program: &OsStr, args: &[String], spec: &JobSpec) -> Command {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(&spec.cwd)
-        .env_clear()
-        .envs(spec.env.iter().cloned())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -187,8 +172,9 @@ pub fn guard_main() -> i32 {
     let group = held.group.clone();
     let pgid = group.id();
     let grace = Duration::from_millis(spec.kill_grace_ms);
-    let stdout_h = capped_reader(held.child.stdout.take().unwrap(), spec.capture_limit);
-    let stderr_h = capped_reader(held.child.stderr.take().unwrap(), spec.capture_limit);
+    let (job_out, job_err) = held.take_output();
+    let stdout_h = capped_reader(job_out, spec.capture_limit);
+    let stderr_h = capped_reader(job_err, spec.capture_limit);
     let me = std::process::id() as i32;
     send(
         &out,
@@ -201,41 +187,43 @@ pub fn guard_main() -> i32 {
     );
 
     // Fence: nothing executes until the core has committed ownership and says go.
-    match rx.recv_timeout(Duration::from_secs(5)) {
+    let released = match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Some(CoreMsg::Go)) => held.release(),
-        _ => {
-            group.kill();
-            let _ = held.child.wait();
-            let ok = group.reap_blocking(Duration::ZERO);
-            send(&out, &GuardMsg::Cleaned { ok });
-            return 1;
+        _ => Err(String::new()),
+    };
+    if let Err(error) = released {
+        group.kill();
+        let _ = held.wait();
+        let ok = group.reap_blocking(Duration::ZERO);
+        if !error.is_empty() {
+            send(&out, &GuardMsg::Failed { error });
         }
+        send(&out, &GuardMsg::Cleaned { ok });
+        return 1;
     }
-    let mut child = held.child;
 
     // Wait for the leader while watching for cancel / liveness loss.
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = done_tx.send(child.wait());
+        let _ = done_tx.send(held.wait());
     });
     let mut cancelled = false;
     let status = loop {
         if let Ok(s) = done_rx.recv_timeout(Duration::from_millis(100)) {
-            break s.ok();
+            break s;
         }
-        match rx.try_recv() {
+        let stop = matches!(
+            rx.try_recv(),
             Ok(Some(CoreMsg::Cancel)) | Ok(None) | Err(mpsc::TryRecvError::Disconnected)
-                if !cancelled =>
-            {
-                cancelled = true;
-                group.term();
-                let (killer, killer_grace) = (group.clone(), grace);
-                std::thread::spawn(move || {
-                    std::thread::sleep(killer_grace);
-                    killer.kill();
-                });
-            }
-            _ => {}
+        ) || group.cancel_requested();
+        if stop && !cancelled {
+            cancelled = true;
+            group.term();
+            let (killer, killer_grace) = (group.clone(), grace);
+            std::thread::spawn(move || {
+                std::thread::sleep(killer_grace);
+                killer.kill();
+            });
         }
     };
     // The job is over only when its whole group is gone.
@@ -254,8 +242,8 @@ pub fn guard_main() -> i32 {
     send(
         &out,
         &GuardMsg::Exited {
-            code: status.and_then(|s| s.code()),
-            signal: status.and_then(|s| os::exit_signal(&s)),
+            code: status.and_then(|s| s.0),
+            signal: status.and_then(|s| s.1),
             stdout: out_text,
             stderr: err_text,
             truncated: t1 || t2 || cut1 || cut2,
@@ -270,6 +258,7 @@ pub fn guard_main() -> i32 {
 #[cfg(unix)]
 pub fn gate_main(argv: &[String]) -> i32 {
     use std::os::unix::process::CommandExt;
+    use std::process::Command;
     let mut b = [0u8; 1];
     // SAFETY: fd 3 was set up by the guard.
     let n = unsafe { libc::read(3, b.as_mut_ptr().cast(), 1) };

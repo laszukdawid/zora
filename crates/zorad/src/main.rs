@@ -523,17 +523,17 @@ fn cmd_jobs(rest: &[String]) -> i32 {
             eprintln!("no running job {id}");
             return 1;
         };
-        // Signal only a job that is provably this one; its guard then reaps it and the core records the outcome.
-        match (job.job_pgid, job.gate_start) {
-            (Some(pgid), Some(start)) if os::cancel_job(&job.id, pgid as i32, start) => {
+        // Ask the job's guard, so the outcome is recorded as cancelled; it then reaps the job.
+        return match os::cancel_job(job) {
+            Ok(()) => {
                 println!("job {} cancelled", job.id);
-                return 0;
+                0
             }
-            _ => {
-                eprintln!("job {} has no verifiable running process group", job.id);
-                return 1;
+            Err(e) => {
+                eprintln!("job {} {e}", job.id);
+                1
             }
-        }
+        };
     }
     if rest.first().map(String::as_str) == Some("clear") {
         let Some(id) = rest.get(1) else {
