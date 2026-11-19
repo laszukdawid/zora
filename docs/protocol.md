@@ -27,7 +27,7 @@ The domains must match.
 ```
 core → hello{protocol:1, generation, clock, now_ns, config}
 plugin → ready{protocol:1, generation, capabilities:[...], clock, now_ns}
-core → start{listening, until?}
+core → start{listening, until?, epoch}
 ... events / requests ...
 core → stop
 plugin → stopped        (after finalizing transcript audio; deadline 5 s)
@@ -49,7 +49,7 @@ plugin exits on stdin/fd EOF
 | `segment` | `seq, generation, session, start_ns, end_ns, text` | Final results only, never revised. Requires `end_ns ≥ start_ns`, both within `[now − 15 min, now + 1 s]`. |
 | `gap` | `seq, generation, at_ns, reason` | Audio continuity was lost (dropped audio, device change, sleep/wake, engine error). |
 | `status` | `seq, generation, ready, reason` | e.g. model missing. |
-| `partial` | `seq, generation, session, text` | Optional live, unfinished text (at most ~4/s). The core uses it **only** to show the "listening" notification early; it never affects commands and may be dropped under load. |
+| `partial` | `seq, generation, session, text, epoch` | Optional live, unfinished text (at most ~4/s). The core uses it **only** to show the "listening" notification early; it never affects commands and may be dropped under load. `epoch` is the listening epoch in force when the audio was captured; the core drops a partial whose epoch isn't the current one, or that has none. |
 
 Sessions are scoped to a generation. After a new `hello`, the plugin must start a new speech session.
 
@@ -89,19 +89,33 @@ At most 16 notifications may be awaiting an ack. The core never waits for an ack
 
 | Message | Fields |
 |---|---|
-| `start` | `listening, until?` |
-| `listening` | `listening, until?` |
+| `start` | `listening, until?, epoch` |
+| `listening` | `listening, until?, epoch` |
 
 `listening: false` means the user paused Zora (`zorad pause`, or the tray). `until` is the end of a timed pause in
 Unix seconds; it is absent for a pause that lasts until resumed. The state is also sent with `start`, so a plugin
-never opens the microphone just to close it again.
+never opens the microphone just to close it again. `epoch` starts at 1 with `start` and goes up by one with every
+`listening` message on that connection.
 
-- A `transcript` plugin must release the microphone while paused and must not start it before `start` says
-  `listening: true`. It should drop audio heard but not yet transcribed rather than finish it.
+- A `transcript` plugin must declare the `listening` capability in `ready`: it releases the microphone while paused,
+  never starts it before `start` says `listening: true`, and drops audio heard but not yet transcribed rather than
+  finishing it.
+- After applying an epoch, the plugin answers `mic{seq, generation, epoch, open}`: `open` says whether its
+  microphone is actually open now. It sends this once the change has taken effect (the device is released, or
+  opened, or failed to open), and again with the same epoch whenever its microphone opens or closes for another
+  reason (a device failure, a restart after a device change).
+- The core waits up to 5 s for `mic{open: false}` after a pause. A plugin that doesn't confirm, or a `transcript`
+  plugin without the `listening` capability, is stopped while paused and started again on resume (an attached
+  plugin can't be stopped, so the core only reports it). Either way the user gets a `degraded` notification
+  naming the plugin.
 - Whatever a plugin still sends while paused, the core drops: segments and partial text are neither stored nor
   matched, and an open capture ends. Commands completed before the pause still run.
 - Dictation monitoring continues while paused; it never records audio.
 - Trays use the same messages to show the paused state.
+
+| Message (plugin → core) | Fields | Notes |
+|---|---|---|
+| `mic` | `seq, generation, epoch, open` | Microphone state after applying `epoch`, or after it changed on its own. |
 
 ### Clock probe
 
