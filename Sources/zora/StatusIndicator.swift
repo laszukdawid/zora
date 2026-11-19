@@ -99,6 +99,7 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         item.menu = menu
+        setEnabled()
         render()
     }
 
@@ -120,9 +121,14 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
     /// The core is gone (exited, restarting): until a new one reports, the menu says it is starting rather than
     /// claiming to listen.
     func coreStopped() {
-        guard listening != nil else { return }
         listening = nil
         pausedUntil = nil
+        pendingTask?.cancel()
+        pendingTask = nil
+        resetTask?.cancel()
+        notice = nil
+        state = .idle
+        setEnabled()
         render()
     }
 
@@ -250,9 +256,10 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         }
     }
 
-    /// A pause or resume still running keeps the items disabled, whatever else changed meanwhile.
+    /// The items work only with a core that has said whether it listens, and never while a pause or resume
+    /// is still running.
     private func setEnabled() {
-        let on = setupProblems == nil && !requestInFlight
+        let on = setupProblems == nil && !requestInFlight && listening != nil
         pauseItem.isEnabled = on
         pauseHourItem.isEnabled = on
     }

@@ -54,9 +54,11 @@ Secrets of the `release` environment:
 | `NOTARY_KEY` | Contents of an App Store Connect API key (`AuthKey_<id>.p8`) with the Developer role |
 | `NOTARY_KEY_ID`, `NOTARY_ISSUER` | That key's ID and the issuer ID shown on App Store Connect → Users and Access → Integrations |
 
-Anyone who can push a `v*` tag can run the signing job, so keep the secrets behind two repository settings:
-the `release` environment requires your approval (Settings → Environments → release → Required reviewers), and a
-tag ruleset lets only maintainers create, move or delete `v*` tags.
+Anyone who can push a `v*` tag can run the signing job, and it runs scripts from the tagged commit. So keep the
+secrets behind two repository settings: the `release` environment requires your approval (Settings →
+Environments → release → Required reviewers), and a tag ruleset lets only maintainers create `v*` tags and nobody
+move or delete them. The build job also refuses a tag whose commit isn't on `main` or hasn't passed CI. Approve
+the signing job only for a tag you pushed yourself.
 
 To build a release locally instead, store the notarization credentials once with
 `xcrun notarytool store-credentials zora-notary --key <path.p8> --key-id <id> --issuer <issuer>`, then run

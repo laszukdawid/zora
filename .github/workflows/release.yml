@@ -15,7 +15,27 @@ jobs:
     # No secrets here: this job compiles the tagged code.
     runs-on: macos-26
     timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: read
     steps:
+      - name: Check the tagged commit is on main and passed CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)
+          if [[ "$status" != identical && "$status" != behind ]]; then
+            echo "$GITHUB_SHA is not on main ($status)." >&2
+            exit 1
+          fi
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.app.slug == "github-actions" and (.name | startswith("Rust") or startswith("macOS app")))]')
+          if [[ $(jq length <<<"$runs") -lt 3 ]] || ! jq -e 'all(.conclusion == "success")' <<<"$runs" >/dev/null; then
+            echo "CI has not passed on $GITHUB_SHA:" >&2
+            jq -r '.[] | "  \(.name): \(.conclusion // .status)"' <<<"$runs" >&2
+            exit 1
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
@@ -30,7 +50,8 @@ jobs:
         with:
           name: unsigned-app
           path: Zora.app.tar
-          retention-days: 1
+          # Long enough for the release approval to wait over a weekend.
+          retention-days: 7
 
   sign:
     needs: build
@@ -63,6 +84,10 @@ jobs:
 
           password=$(uuidgen)
           printf '%s' "$CERT_P12" | base64 --decode > "$secrets/cert.p12"
+          printf '%s' "$NOTARY_KEY" > "$secrets/notary.p8"
+          export ZORA_NOTARY_KEY="$secrets/notary.p8"
+          # Only the credentials need the private umask; the app keeps normal permissions.
+          umask 022
           security create-keychain -p "$password" "$ZORA_KEYCHAIN"
           security set-keychain-settings -lut 3600 "$ZORA_KEYCHAIN"
           security unlock-keychain -p "$password" "$ZORA_KEYCHAIN"
@@ -78,8 +103,6 @@ jobs:
           [[ -n "$ZORA_SIGN_IDENTITY" ]] || { echo "No Developer ID identity in MACOS_CERT_P12" >&2; exit 1; }
           export ZORA_SIGN_IDENTITY
 
-          export ZORA_NOTARY_KEY="$secrets/notary.p8"
-          printf '%s' "$NOTARY_KEY" > "$ZORA_NOTARY_KEY"
           tar -C "$secrets" -xf Zora.app.tar
           packaging/macos/release.sh "$secrets/Zora.app"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -105,7 +128,7 @@ jobs:
         run: |
           set -euo pipefail
           # The tag must still point at the commit that was built; never let gh create or move it.
-          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$GITHUB_REF_NAME" --jq .sha)
           if [[ "$tagged" != "$GITHUB_SHA" ]]; then
             echo "$GITHUB_REF_NAME now points at $tagged, not the built $GITHUB_SHA." >&2
             exit 1

@@ -388,6 +388,7 @@ struct StderrLines {
 
 const MAX_STDERR_LINE: usize = 1024;
 const BUDGET_PER_SECOND: usize = 4096;
+const LINE_OVERHEAD: usize = 16;
 
 impl StderrLines {
     fn push(&mut self, bytes: &[u8], now: std::time::Instant) -> Vec<String> {
@@ -426,8 +427,10 @@ impl StderrLines {
             self.window = Some(now);
             self.budget = BUDGET_PER_SECOND;
         }
-        if line.len() <= self.budget {
-            self.budget -= line.len();
+        // Every line costs at least its prefix and newline, so a flood of empty lines is limited too.
+        let cost = line.len() + LINE_OVERHEAD;
+        if cost <= self.budget {
+            self.budget -= cost;
             out.push(String::from_utf8_lossy(&line).into_owned());
         }
     }
@@ -910,10 +913,18 @@ mod stderr_tests {
     fn lines_over_the_budget_are_dropped_whole_until_the_next_second() {
         let mut l = StderrLines::default();
         let t = Instant::now();
-        let line = [vec![b'x'; 999], vec![b'\n']].concat();
+        let line = [vec![b'x'; 1008], vec![b'\n']].concat();
         let out = l.push(&line.repeat(5), t);
         assert_eq!(out.len(), 4);
-        assert!(out.iter().all(|s| s.len() == 999));
+        assert!(out.iter().all(|s| s.len() == 1008));
+        assert!(l.push(&[b'\n'; 100], t).is_empty());
         assert_eq!(l.push(&line, t + Duration::from_secs(1)).len(), 1);
+    }
+
+    #[test]
+    fn empty_lines_are_limited_too() {
+        let mut l = StderrLines::default();
+        let out = l.push(&[b'\n'; 10_000], Instant::now());
+        assert_eq!(out.len(), BUDGET_PER_SECOND / LINE_OVERHEAD);
     }
 }
