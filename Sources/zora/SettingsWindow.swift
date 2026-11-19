@@ -133,15 +133,13 @@ final class SettingsModel {
             expect["phrases"] = oldPhrases
         }
         guard !change.isEmpty else { return close() }
-        guard let plain = Self.json(change), let json = Self.json(change.merging(["expect": expect]) { a, _ in a }) else { return }
+        guard let json = Self.json(change.merging(["expect": expect]) { a, _ in a }) else { return }
         busy = true
         error = nil
-        var r = await cli.run(["settings", "set", json])
-        // A zorad from before `expect` rejects it as an unknown field; it can't check for conflicts anyway.
-        if !r.ok && r.message.contains("unknown field `expect`") { r = await cli.run(["settings", "set", plain]) }
+        let r = await cli.run(["settings", "set", json])
         busy = false
         guard r.ok else {
-            if r.message.localizedCaseInsensitiveContains("conflict") {
+            if r.code == 3 { // zorad: the file changed since it was loaded
                 // Someone else saved meanwhile: show their values rather than overwrite them.
                 await load()
                 if error == nil { error = "Settings changed elsewhere — reloaded" }
