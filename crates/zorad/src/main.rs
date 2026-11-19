@@ -10,7 +10,9 @@ mod store_thread;
 
 use std::path::PathBuf;
 use zora_core::clock::{now_ns, secs};
-use zora_core::config::{Config, UpdateError};
+use zora_core::config::{
+    BUILTIN_HARNESSES, CUSTOM_HARNESS, Config, Harness, UpdateError, custom_harness, join_command,
+};
 use zora_core::coordinator::{Coordinator, Effect, Input};
 use zora_core::model::{Segment, ZoraEvent};
 use zora_core::store::Store;
@@ -33,8 +35,10 @@ const USAGE: &str = "usage: zorad <command> [options]
   resume                    Start listening again.
   settings [set <json>] [--dry-run]
                             Print, or change, the settings the menu bar edits, as JSON: wakeNames,
-                            phrases {start,end,cancel} and workspace (of the default harness).
-                            An `expect` object with the values you loaded refuses (exit 3) if they changed.
+                            phrases {start,end,cancel}, harness (claude, codex, pi or custom),
+                            customCommand (e.g. `opencode run {prompt}`) and workspace (of the
+                            default harness). An `expect` object with the values you loaded refuses
+                            (exit 3) if they changed.
                             --dry-run lists problems as `run --dry-run` sees them.
   simulate <script>         Feed a scripted transcript through the command logic (dry run).
 
@@ -385,6 +389,10 @@ struct SettingsChange {
     wake_names: Option<Vec<String>>,
     phrases: Option<PhrasesChange>,
     workspace: Option<String>,
+    /// The default harness: a configured id, or a built-in (`claude`, `codex`, `pi`) added on first use.
+    harness: Option<String>,
+    /// The command line of the `custom` harness.
+    custom_command: Option<String>,
     /// The values the editor loaded for the fields it changes; the change is refused if the file differs.
     expect: Option<SettingsExpect>,
 }
@@ -487,6 +495,17 @@ fn settings_json(config: &Config, path: &std::path::Path, dry_run: bool) -> serd
         "wakeNames": config.wake_names,
         "phrases": config.phrases,
         "harness": config.default_harness,
+        "customCommand": config
+            .harnesses
+            .get(CUSTOM_HARNESS)
+            .filter(|h| h.kind == "argv")
+            .map(|h| join_command(&[&[h.program().to_string()], &h.args[..]].concat()))
+            .unwrap_or_default(),
+        "harnessWorkspaces": config
+            .harnesses
+            .iter()
+            .map(|(id, h)| (id.clone(), h.workspace.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
         "workspace": workspace,
         "configPath": path,
         "locale": config.locale,
@@ -586,6 +605,23 @@ fn apply_settings(
             }
         }
     }
+    // The agent first, so a folder in the same change lands on the agent it was chosen for.
+    let mut after = before.clone();
+    apply_harness_change(&mut after, change.harness, change.custom_command)
+        .map_err(|e| UpdateError::Invalid(vec![format!("settings: {e}")]))?;
+    if after.harnesses != before.harnesses || after.default_harness != before.default_harness {
+        // Harnesses that come from the defaults are written out; otherwise only the entries that changed.
+        if !doc["harnesses"].is_object() {
+            doc["harnesses"] = json!(before.harnesses);
+        }
+        for (id, h) in &after.harnesses {
+            if before.harnesses.get(id) != Some(h) {
+                doc["harnesses"][id] = json!(h);
+            }
+        }
+        doc["defaultHarness"] = json!(after.default_harness);
+    }
+    let before = &after;
     if let Some(ws) = change.workspace {
         let id = before.default_harness.clone();
         if workspace_of(before).is_none() {
@@ -599,6 +635,48 @@ fn apply_settings(
         }
         doc["harnesses"][&id]["workspace"] = json!(ws.trim());
     }
+    Ok(())
+}
+
+/// Sets the custom command and switches the default harness. A harness that is new, or has no project folder
+/// yet, takes the current one's, so switching agents keeps working on the same project.
+fn apply_harness_change(
+    config: &mut Config,
+    harness: Option<String>,
+    custom_command: Option<String>,
+) -> Result<(), String> {
+    let current_ws = workspace_of(config).cloned().unwrap_or_default();
+    if let Some(line) = custom_command {
+        let old = config.harnesses.get(CUSTOM_HARNESS);
+        let ws = old.map_or(current_ws.clone(), |h| h.workspace.clone());
+        let mut new = custom_harness(&line, &ws)?;
+        // Variables set for one program (perhaps its credentials) never pass to another one.
+        if let Some(old) = old.filter(|o| o.program() == new.program()) {
+            new.env = old.env.clone();
+        }
+        config.harnesses.insert(CUSTOM_HARNESS.into(), new);
+    }
+    let Some(id) = harness.map(|h| h.trim().to_string()) else {
+        return Ok(());
+    };
+    if !config.harnesses.contains_key(&id) {
+        let preset = Harness::preset(&id).ok_or_else(|| {
+            if id == CUSTOM_HARNESS {
+                "type a command for the custom agent (customCommand)".to_string()
+            } else {
+                format!(
+                    "unknown harness '{id}': choose {}, {CUSTOM_HARNESS} or one defined in harnesses",
+                    BUILTIN_HARNESSES.join(", ")
+                )
+            }
+        })?;
+        config.harnesses.insert(id.clone(), preset);
+    }
+    let h = config.harnesses.get_mut(&id).expect("inserted above");
+    if h.workspace.trim().is_empty() {
+        h.workspace = current_ws;
+    }
+    config.default_harness = id;
     Ok(())
 }
 

@@ -7,7 +7,7 @@ v1 was a macOS-only Swift build. v2 keeps all of its behaviour and safety rules 
 Zora is an always-on background service that does two things:
 
 1. **Rolling transcript.** It keeps a rolling local transcript of everything the microphone hears (default: the last 4 hours, as text only).
-2. **Voice commands.** It runs commands spoken between "Hey Zora" and "Do it Zora" on a configurable AI harness. Claude Code is the first; others are configured as argv. Results are reported through notifications, because the user is usually mid-conversation.
+2. **Voice commands.** It runs commands spoken between "Hey Zora" and "Do it Zora" on a configurable AI harness. Claude Code, Codex and Pi are built in, and any other agent is a custom command (argv). Results are reported through notifications, because the user is usually mid-conversation.
 
 Constraints:
 

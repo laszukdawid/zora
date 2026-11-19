@@ -887,6 +887,39 @@ fn a_new_project_folder_applies_without_restart() {
 }
 
 #[test]
+fn a_custom_agent_chosen_in_settings_applies_without_restart() {
+    let env = Env::new();
+    let cfg = env.config(
+        json!([{"delayMs": 6000, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 800}]),
+        sh("echo old", &["print", "old"]),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_secs(2));
+    let (exe, args) = sh("echo \"ran: $1\"", &["ran"]).command();
+    // The settings place the prompt themselves when the command leaves it out.
+    let args: Vec<String> = args.into_iter().filter(|a| a != "{prompt}").collect();
+    let line = zora_core::config::join_command(&[vec![exe], args].concat());
+    let change = json!({"harness": "custom", "customCommand": line}).to_string();
+    let out = env
+        .cmd()
+        .args(["settings", "set", &change, "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let done = wait_for(Duration::from_secs(20), || {
+        env.commands().into_iter().find(|c| c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    let summary = done.and_then(|c| c.3).unwrap_or_default();
+    assert!(summary.starts_with("ran: "), "{summary:?}\n{err}");
+}
+
+#[test]
 fn speech_from_the_pause_that_arrives_after_resume_is_dropped() {
     let env = Env::new();
     env.zorad(&["pause"]);

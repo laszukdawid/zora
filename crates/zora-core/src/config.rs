@@ -88,9 +88,12 @@ impl Default for Dictation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Harness {
+    /// "claude", "codex", "pi" (built-in command lines) or "argv" (`executable` + `args`).
     #[serde(rename = "type")]
     pub kind: String,
     pub workspace: String,
+    /// Empty: the type's own program (`claude`, `codex`, `pi`); for `argv`, `claude` as before.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub executable: String,
     pub args: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -105,12 +108,58 @@ impl Default for Harness {
         Harness {
             kind: "claude".into(),
             workspace: String::new(),
-            executable: "claude".into(),
+            executable: String::new(),
             args: vec![],
             permission_mode: None,
             allowed_tools: vec![],
             extra_args: vec![],
             env: BTreeMap::new(),
+        }
+    }
+}
+
+/// Harness types with a built-in command line; the settings offer each one under its own id.
+pub const BUILTIN_HARNESSES: [&str; 3] = ["claude", "codex", "pi"];
+
+/// The harness id the settings use for a user-supplied command line.
+pub const CUSTOM_HARNESS: &str = "custom";
+
+impl Harness {
+    /// A built-in harness type with its defaults.
+    pub fn preset(kind: &str) -> Option<Harness> {
+        BUILTIN_HARNESSES.contains(&kind).then(|| Harness {
+            kind: kind.into(),
+            ..Harness::default()
+        })
+    }
+
+    /// The program to run: `executable`, else the type's own (an `argv` entry without one ran `claude`).
+    pub fn program(&self) -> &str {
+        match (self.executable.is_empty(), self.kind.as_str()) {
+            (false, _) => &self.executable,
+            (true, "argv") => "claude",
+            (true, kind) => kind,
+        }
+    }
+
+    /// The agent this harness starts, by type or by the program's file name.
+    fn agent(&self) -> &str {
+        match self.kind.as_str() {
+            "argv" => {
+                let file = self
+                    .program()
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or_default();
+                let stem = file.split('.').next().unwrap_or_default();
+                match stem.to_ascii_lowercase().as_str() {
+                    "claude" => "claude",
+                    "codex" => "codex",
+                    "pi" => "pi",
+                    _ => "",
+                }
+            }
+            kind => kind,
         }
     }
 }
@@ -487,6 +536,18 @@ impl Config {
                     "harnesses.{}.workspace must be an existing directory (got '{}')",
                     self.default_harness, harness.workspace
                 ));
+            } else if harness.kind == "codex"
+                && !harness
+                    .extra_args
+                    .iter()
+                    .any(|a| a == "--skip-git-repo-check")
+                && !Path::new(&ws).ancestors().any(|d| d.join(".git").exists())
+            {
+                problems.push(format!(
+                    "harnesses.{}.workspace must be inside a Git repository for Codex (got '{}'), or add \
+                     --skip-git-repo-check to its extraArgs",
+                    self.default_harness, harness.workspace
+                ));
             }
         }
         problems
@@ -504,9 +565,43 @@ pub fn policy_problems(name: &str, h: &Harness) -> Vec<String> {
         .collect();
     everything.push(h.permission_mode.as_deref().unwrap_or(""));
     everything.push(&h.executable);
+    // Claude Code's and Codex's ways of skipping their permission checks or sandbox, anywhere.
+    const BYPASS: [&str; 4] = [
+        "dangerously-",
+        "bypassPermissions",
+        "danger-full-access",
+        "--yolo",
+    ];
+    // Options that switch off an agent's own safety rules, or move or widen where it may write: Codex's
+    // execution-policy rules, project trust (which lets MCP commands run outside the sandbox), and working folder;
+    // Pi's trust in project-local extensions and settings. Nobody is there to review the project's files.
+    let agent_flags: &[&str] = match h.agent() {
+        "codex" => &[
+            "--ignore-rules",
+            "--trust",
+            "--cd",
+            "-C",
+            "--add-dir",
+            "--worktree",
+        ],
+        "pi" => &["--approve", "-a"],
+        _ => &[],
+    };
+    let args: Vec<&str> = h
+        .args
+        .iter()
+        .chain(&h.extra_args)
+        .map(String::as_str)
+        .collect();
     if everything
         .iter()
-        .any(|a| a.contains("dangerously-skip-permissions") || a.contains("bypassPermissions"))
+        .any(|a| BYPASS.iter().any(|b| a.contains(b)))
+        || args.iter().any(|a| {
+            agent_flags.iter().any(|f| {
+                // `--flag`, `--flag=x`, and a short flag with its value attached (`-C/dir`).
+                a == f || a.starts_with(&format!("{f}=")) || (f.len() == 2 && a.starts_with(f))
+            })
+        })
     {
         problems.push(format!(
             "harnesses.{name}: permission-bypass flags are not allowed"
@@ -528,6 +623,11 @@ pub fn policy_problems(name: &str, h: &Harness) -> Vec<String> {
             "harnesses.{name}.env names must be non-empty without '=', and no name or value may contain NUL"
         ));
     }
+    if h.kind != "claude" && (h.permission_mode.is_some() || !h.allowed_tools.is_empty()) {
+        problems.push(format!(
+            "harnesses.{name}: permissionMode and allowedTools apply only to type 'claude'"
+        ));
+    }
     match h.kind.as_str() {
         "claude" => {
             if let Some(mode) = &h.permission_mode
@@ -547,16 +647,124 @@ pub fn policy_problems(name: &str, h: &Harness) -> Vec<String> {
                 ));
             }
         }
+        "codex" | "pi" => {}
         "argv" => {
             if !h.args.iter().any(|a| a == "{prompt}") {
                 problems.push(format!("harnesses.{name}.args must contain \"{{prompt}}\""));
             }
         }
         other => problems.push(format!(
-            "harnesses.{name}.type '{other}' must be 'claude' or 'argv'"
+            "harnesses.{name}.type '{other}' must be 'claude', 'codex', 'pi' or 'argv'"
         )),
     }
     problems
+}
+
+/// Splits a command line typed in the settings into argv, without a shell: whitespace separates words, '…' quotes
+/// literally, and "…" quotes with the Windows rules: backslashes are literal unless they precede a `"`, where each
+/// pair gives one backslash and an odd one makes the quote literal. So Windows and UNC paths need no escaping.
+pub fn split_command(line: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => words.extend(word.take()),
+            '\'' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => w.push(c),
+                        None => return Err("unclosed ' in the command".into()),
+                    }
+                }
+            }
+            '"' => {
+                let w = word.get_or_insert_with(String::new);
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => {
+                            let mut n = 1;
+                            while chars.next_if_eq(&'\\').is_some() {
+                                n += 1;
+                            }
+                            if chars.peek() == Some(&'"') {
+                                w.extend(std::iter::repeat_n('\\', n / 2));
+                                if n % 2 == 1 {
+                                    w.push(chars.next().unwrap());
+                                }
+                            } else {
+                                w.extend(std::iter::repeat_n('\\', n));
+                            }
+                        }
+                        Some(c) => w.push(c),
+                        None => return Err("unclosed \" in the command".into()),
+                    }
+                }
+            }
+            c => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    words.extend(word);
+    Ok(words)
+}
+
+/// The inverse of `split_command`, quoting only the words that need it.
+pub fn join_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| {
+            if !a.is_empty() && !a.contains(|c: char| c.is_whitespace() || c == '\'' || c == '"') {
+                return a.clone();
+            }
+            if !a.contains('\'') {
+                return format!("'{a}'");
+            }
+            // Backslashes double only before a quote, or before the closing one.
+            let mut out = String::from('"');
+            let mut slashes = 0;
+            for c in a.chars() {
+                match c {
+                    '\\' => slashes += 1,
+                    '"' => {
+                        out.extend(std::iter::repeat_n('\\', slashes * 2 + 1));
+                        out.push('"');
+                        slashes = 0;
+                    }
+                    c => {
+                        out.extend(std::iter::repeat_n('\\', slashes));
+                        out.push(c);
+                        slashes = 0;
+                    }
+                }
+            }
+            out.extend(std::iter::repeat_n('\\', slashes * 2));
+            out.push('"');
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A custom harness from a command line; `{prompt}` goes last when the line doesn't place it.
+pub fn custom_harness(line: &str, workspace: &str) -> Result<Harness, String> {
+    let mut argv = split_command(line)?;
+    match argv.first().map(|p| p.trim()) {
+        None => return Err("the custom command must not be empty".into()),
+        Some("" | "{prompt}") => return Err("the custom command must start with a program".into()),
+        Some(_) => {}
+    }
+    if !argv.iter().skip(1).any(|a| a == "{prompt}") {
+        argv.push("{prompt}".into());
+    }
+    Ok(Harness {
+        kind: "argv".into(),
+        workspace: workspace.into(),
+        executable: argv.remove(0),
+        args: argv,
+        ..Harness::default()
+    })
 }
 
 #[cfg(test)]

@@ -80,9 +80,13 @@ struct CoreSettings: Decodable, Sendable {
     struct Phrases: Decodable, Sendable { var start: [String]; var end: [String]; var cancel: [String] }
     var wakeNames: [String]
     var phrases: Phrases
-    var workspace: String
-    /// The default harness the workspace belongs to.
+    /// The default harness id: `claude`, `codex`, `pi`, `custom`, or one defined by hand in the config.
     var harness: String
+    /// The `custom` harness's command line; empty when there is none.
+    var customCommand: String
+    /// Each configured harness's project folder (empty when it has none yet).
+    var harnessWorkspaces: [String: String]
+    var workspace: String
     var locale: String
     var dictationBundleIDs: [String]
     var problems: [String]

@@ -12,12 +12,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use zbus::zvariant;
 use zora_plugin::proto::{CoreMsg, Notify, Out, clock_reply};
-use zora_plugin::tray::{Icon, Request, TrayModel};
+use zora_plugin::tray::{Icon, Request, TrayModel, agent_choices};
+
+const CUSTOM: &str = "custom";
 
 #[derive(Debug, Clone)]
 pub enum Action {
     Pause(Request),
     Names,
+    Agent,
     Folder,
     Restart,
 }
@@ -174,6 +177,12 @@ impl ksni::Tray for ZoraTray {
                     StandardItem {
                         label: "Names Zora Answers To…".into(),
                         activate: Box::new(|t: &mut Self| Self::send(&t.tx, Action::Names)),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "Coding Agent…".into(),
+                        activate: Box::new(|t: &mut Self| Self::send(&t.tx, Action::Agent)),
                         ..Default::default()
                     }
                     .into(),
@@ -394,7 +403,35 @@ fn dialog_tool() -> Option<Dialog> {
     }
 }
 
-/// Runs a dialog; `None` when the user cancelled.
+/// Exit 1 is a cancel unless the dialog also complained: toolkits print warnings on a normal cancel (GTK's
+/// `Gtk-WARNING`, `Gtk-Message`, theme parsing errors), so only a known failure inside one, or a line that isn't a
+/// toolkit diagnostic at all, means it failed (bad options, no display).
+fn looks_like_usage_error(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(|l| l.trim().to_lowercase())
+        .filter(|l| !l.is_empty())
+        .any(|l| {
+            // A warning can still be fatal (GTK 3: "Gtk-WARNING **: cannot open display").
+            let fatal = [
+                "cannot open display",
+                "could not open display",
+                "unable to open display",
+                "could not connect to display",
+                "unknown option",
+                "usage:",
+            ]
+            .iter()
+            .any(|w| l.contains(w));
+            fatal
+                || !["warning", "-message", "debug"]
+                    .iter()
+                    .any(|w| l.contains(w))
+        })
+}
+
+/// Runs a dialog; `None` when the user cancelled (exit 1, as both zenity and kdialog report it). Any other
+/// failure is an error, so a dialog that couldn't open isn't mistaken for a cancel.
 async fn dialog(args: Vec<String>, tool: Dialog) -> Result<Option<String>, String> {
     let program = match tool {
         Dialog::Zenity => "zenity",
@@ -407,8 +444,15 @@ async fn dialog(args: Vec<String>, tool: Dialog) -> Result<Option<String>, Strin
         .output()
         .await
         .map_err(|e| format!("cannot run {program}: {e}"))?;
-    if !out.status.success() {
-        return Ok(None);
+    match out.status.code() {
+        Some(0) => {}
+        // kdialog also exits 1 on bad arguments, with a usage message; a cancel prints none.
+        Some(1) if !looks_like_usage_error(&out.stderr) => return Ok(None),
+        code => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let why = code.map_or("was killed".to_string(), |c| format!("exited with {c}"));
+            return Err(format!("{program} {why}: {}", err.trim()));
+        }
     }
     Ok(Some(
         String::from_utf8_lossy(&out.stdout)
@@ -417,7 +461,9 @@ async fn dialog(args: Vec<String>, tool: Dialog) -> Result<Option<String>, Strin
     ))
 }
 
-async fn show_error(tool: Dialog, text: &str) {
+/// An error dialog; when even that can't open, a notification instead (and always a log line).
+async fn show_error(tool: Dialog, notifier: &mut Notifier, text: &str) {
+    eprintln!("zora-desktop: {text}");
     let args = match tool {
         Dialog::Zenity => vec![
             "--error".into(),
@@ -432,7 +478,10 @@ async fn show_error(tool: Dialog, text: &str) {
             text.into(),
         ],
     };
-    let _ = dialog(args, tool).await;
+    if let Err(e) = dialog(args, tool).await {
+        eprintln!("zora-desktop: error dialog failed: {e}");
+        let _ = notifier.post("Zora", text, 0).await;
+    }
 }
 
 fn input_args(tool: Dialog, prompt: &str, current: &str) -> Vec<String> {
@@ -453,6 +502,64 @@ fn input_args(tool: Dialog, prompt: &str, current: &str) -> Vec<String> {
             current.into(),
         ],
     }
+}
+
+fn agent_args(tool: Dialog, current: &str) -> Vec<String> {
+    let text = "Which coding agent runs your voice commands?";
+    let choices = agent_choices(current);
+    match tool {
+        Dialog::Zenity => {
+            let mut a: Vec<String> = [
+                "--list",
+                "--radiolist",
+                "--title=Zora Settings",
+                "--height=300",
+                "--column=",
+                "--column=id",
+                "--column=Agent",
+                "--hide-column=2",
+                "--print-column=2",
+            ]
+            .map(String::from)
+            .to_vec();
+            a.insert(3, format!("--text={text}"));
+            // Rows are tagged by index, so an id containing `|` (zenity's separator) still maps back exactly.
+            // GLib keeps a `--` among the row cells, so a label starting with a dash (a configured id such as
+            // `--help`) gets a leading space instead, which keeps it from reading as an option.
+            for (i, (_, label, on)) in choices.into_iter().enumerate() {
+                let label = if label.starts_with('-') {
+                    format!(" {label}")
+                } else {
+                    label
+                };
+                a.extend([
+                    if on { "TRUE" } else { "FALSE" }.into(),
+                    i.to_string(),
+                    label,
+                ]);
+            }
+            a
+        }
+        Dialog::KDialog => {
+            let mut a: Vec<String> = vec![
+                "--title".into(),
+                "Zora Settings".into(),
+                "--radiolist".into(),
+                text.into(),
+                "--".into(),
+            ];
+            for (i, (_, label, on)) in choices.into_iter().enumerate() {
+                a.extend([i.to_string(), label, if on { "on" } else { "off" }.into()]);
+            }
+            a
+        }
+    }
+}
+
+/// The harness id for what `agent_args`' dialog printed (zenity repeats the row on a double-click: `1|1`).
+fn agent_picked(output: &str, current: &str) -> Option<String> {
+    let i: usize = output.split('|').next()?.trim().parse().ok()?;
+    agent_choices(current).into_iter().nth(i).map(|c| c.0)
 }
 
 fn folder_args(tool: Dialog, current: &str) -> Vec<String> {
@@ -491,6 +598,7 @@ async fn edit_setting(cli: &Cli, action: &Action, notifier: &mut Notifier) {
     let Some(tool) = dialog_tool() else {
         let hint = match action {
             Action::Names => "zorad names add <name>",
+            Action::Agent => "zorad settings set '{\"harness\": \"codex\"}'",
             _ => "zorad settings set '{\"workspace\": \"~/projects/x\"}'",
         };
         let _ = notifier
@@ -506,7 +614,14 @@ async fn edit_setting(cli: &Cli, action: &Action, notifier: &mut Notifier) {
     };
     let current: Value = match cli.run(&["settings".into()]).await {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-        Err(e) => return show_error(tool, &format!("Zora couldn't read its settings:\n{e}")).await,
+        Err(e) => {
+            return show_error(
+                tool,
+                notifier,
+                &format!("Zora couldn't read its settings:\n{e}"),
+            )
+            .await;
+        }
     };
     let change = match action {
         Action::Names => {
@@ -519,28 +634,70 @@ async fn edit_setting(cli: &Cli, action: &Action, notifier: &mut Notifier) {
             match dialog(input_args(tool, prompt, &names.join(", ")), tool).await {
                 Ok(Some(s)) => json!({"wakeNames": parse_names(&s)}),
                 Ok(None) => return,
-                Err(e) => return show_error(tool, &e).await,
+                Err(e) => return show_error(tool, notifier, &e).await,
+            }
+        }
+        Action::Agent => {
+            let current_id = current["harness"].as_str().unwrap_or_default();
+            let id = match dialog(agent_args(tool, current_id), tool).await {
+                Ok(Some(s)) => match agent_picked(&s, current_id) {
+                    Some(id) => id,
+                    None => return,
+                },
+                Ok(None) => return,
+                Err(e) => return show_error(tool, notifier, &e).await,
+            };
+            if id != CUSTOM {
+                json!({"harness": id})
+            } else {
+                let prompt = "Command for your agent. Your words go where {prompt} is, or at the end.\n\
+                              No shell: quote words that contain spaces. Example: opencode run {prompt}";
+                let cmd = current["customCommand"].as_str().unwrap_or_default();
+                match dialog(input_args(tool, prompt, cmd), tool).await {
+                    Ok(Some(s)) if !s.trim().is_empty() => {
+                        json!({"harness": id, "customCommand": s.trim()})
+                    }
+                    Ok(_) => return,
+                    Err(e) => return show_error(tool, notifier, &e).await,
+                }
             }
         }
         Action::Folder => {
+            // The folder belongs to the agent shown now; without its id the change could land on another one.
+            let Some(agent) = current["harness"].as_str().filter(|h| !h.is_empty()) else {
+                return show_error(
+                    tool,
+                    notifier,
+                    "Zora couldn't tell which agent the folder is for.",
+                )
+                .await;
+            };
+            let agent = agent.to_string();
             let ws = current["workspace"].as_str().unwrap_or_default();
             let ws = match ws.strip_prefix("~/") {
                 Some(rest) => format!("{}/{rest}", std::env::var("HOME").unwrap_or_default()),
                 None => ws.to_string(),
             };
             match dialog(folder_args(tool, &ws), tool).await {
-                Ok(Some(s)) if !s.trim().is_empty() => json!({"workspace": s.trim()}),
+                Ok(Some(s)) if !s.trim().is_empty() => {
+                    json!({"workspace": s.trim(), "expect": {"harness": agent}})
+                }
                 Ok(_) => return,
-                Err(e) => return show_error(tool, &e).await,
+                Err(e) => return show_error(tool, notifier, &e).await,
             }
         }
         _ => return,
     };
-    if let Err(e) = cli
+    match cli
         .run(&["settings".into(), "set".into(), change.to_string()])
         .await
     {
-        show_error(tool, &format!("Zora couldn't save that:\n{e}")).await;
+        Ok(out) => {
+            if let Some(warning) = zora_plugin::tray::unapplied(&out) {
+                show_error(tool, notifier, &warning).await;
+            }
+        }
+        Err(e) => show_error(tool, notifier, &format!("Zora couldn't save that:\n{e}")).await,
     }
 }
 
@@ -685,7 +842,7 @@ pub async fn run(config: Value, out: Arc<Out>, mut core_rx: UnboundedReceiver<Co
                 }
                 model.lock().unwrap().finish(&req, r, Instant::now());
             }
-            Ev::Action(a @ (Action::Names | Action::Folder)) => {
+            Ev::Action(a @ (Action::Names | Action::Agent | Action::Folder)) => {
                 // Dialogs run beside the loop so notifications keep flowing; at most one at a time.
                 let cli = cli.clone();
                 tokio::spawn(async move {
@@ -740,6 +897,45 @@ mod tests {
         assert_eq!(&a[a.len() - 2..], ["--", "-dir"]);
         let a = input_args(Dialog::Zenity, "Names", "-x");
         assert!(a.contains(&"--entry-text=-x".to_string()));
+    }
+
+    #[test]
+    fn agent_list_marks_the_current_one() {
+        let a = agent_args(Dialog::KDialog, "codex");
+        assert!(a.windows(3).any(|w| w == ["1", "Codex", "on"]));
+        assert!(a.windows(3).any(|w| w == ["0", "Claude Code", "off"]));
+        let a = agent_args(Dialog::Zenity, "pi|team");
+        assert!(a.windows(3).any(|w| w == ["TRUE", "4", "pi|team"]));
+        assert_eq!(a.iter().filter(|x| *x == "TRUE").count(), 1);
+        // No row cell can read as an option: zenity gets no `--` and a dash-led label is padded; kdialog gets `--`.
+        let a = agent_args(Dialog::Zenity, "--help");
+        assert!(!a.contains(&"--".to_string()));
+        assert!(a.windows(3).any(|w| w == ["TRUE", "4", " --help"]));
+        let a = agent_args(Dialog::KDialog, "--help");
+        let rows = a.iter().position(|x| x == "--").unwrap();
+        assert_eq!(a[rows + 1..].len(), 3 * 5);
+        assert!(a.windows(3).any(|w| w == ["4", "--help", "on"]));
+        // Rows come back by index, so an id containing `|` maps back exactly.
+        assert_eq!(agent_picked("4|4", "pi|team").as_deref(), Some("pi|team"));
+        assert_eq!(agent_picked("2", "pi|team").as_deref(), Some("pi"));
+        assert_eq!(agent_picked("9", "claude"), None);
+        assert_eq!(agent_picked("pi", "claude"), None);
+    }
+
+    #[test]
+    fn exit_1_is_a_cancel_only_without_complaints() {
+        assert!(!looks_like_usage_error(b""));
+        assert!(!looks_like_usage_error(
+            b"(zenity:42): Gtk-WARNING **: no parent\nGtk-Message: 10:00: GtkDialog mapped\n"
+        ));
+        assert!(looks_like_usage_error(b"kdialog: Unknown option 'x'.\n"));
+        assert!(looks_like_usage_error(b"cannot open display\n"));
+        assert!(looks_like_usage_error(
+            b"(zenity:42): Gtk-WARNING **: cannot open display: :0\n"
+        ));
+        assert!(!looks_like_usage_error(
+            b"(zenity:42): Gtk-WARNING **: Theme parsing error: gtk.css:12: unknown property\n"
+        ));
     }
 
     #[test]

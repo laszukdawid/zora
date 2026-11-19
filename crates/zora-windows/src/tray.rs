@@ -455,7 +455,27 @@ fn show_menu(hwnd: HWND, items: &[Item]) -> Option<Action> {
     }
 }
 
+thread_local! {
+    /// A settings dialog runs a nested message loop on this thread, so the tray menu still works under it;
+    /// a second one would share the input box's state. Only one at a time.
+    static SETTINGS_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A settings save still running: the next dialog waits for it, so it reads what was just saved.
+static SAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn act(action: Action) {
+    if !matches!(action, Action::Names | Action::Agent | Action::Folder) {
+        return act_now(action);
+    }
+    if SAVING.load(std::sync::atomic::Ordering::SeqCst) || SETTINGS_OPEN.with(|o| o.replace(true)) {
+        return;
+    }
+    act_now(action);
+    SETTINGS_OPEN.with(|o| o.set(false));
+}
+
+fn act_now(action: Action) {
     let Some((opts, tx, toggle)) =
         with_app(|a| (a.opts.clone(), a.done_tx.clone(), a.model.toggle_request()))
     else {
@@ -487,9 +507,44 @@ fn act(action: Action) {
                 save(opts, tx, json!({"wakeNames": menu::parse_names(&text)}));
             }
         }
+        Action::Agent => {
+            let current = match zorad(&opts, &["settings".into()]) {
+                Ok(s) => serde_json::from_str::<Value>(&s).unwrap_or_default(),
+                Err(e) => {
+                    let _ = tx.send(Ev::Error(format!("Zora couldn't read its settings: {e}")));
+                    return;
+                }
+            };
+            let prompt = "Coding agent: claude, codex or pi, or a whole command such as \
+                          opencode run {prompt}";
+            if let Some(change) = input_box("Zora Settings", prompt, &menu::agent_text(&current))
+                .and_then(|t| menu::agent_change(&t, &current))
+            {
+                save(opts, tx, change);
+            }
+        }
         Action::Folder => {
+            let current = match zorad(&opts, &["settings".into()]) {
+                Ok(s) => serde_json::from_str::<Value>(&s).unwrap_or_default(),
+                Err(e) => {
+                    let _ = tx.send(Ev::Error(format!("Zora couldn't read its settings: {e}")));
+                    return;
+                }
+            };
+            // The folder belongs to the agent shown now; without its id the change could land on another one.
+            let Some(agent) = current["harness"].as_str().filter(|h| !h.is_empty()) else {
+                let _ = tx.send(Ev::Error(
+                    "Zora couldn't tell which agent the folder is for.".into(),
+                ));
+                return;
+            };
+            let agent = agent.to_string();
             if let Some(dir) = pick_folder() {
-                save(opts, tx, json!({"workspace": dir}));
+                save(
+                    opts,
+                    tx,
+                    json!({"workspace": dir, "expect": {"harness": agent}}),
+                );
             }
         }
         Action::Restart => {
@@ -510,13 +565,22 @@ fn act(action: Action) {
 }
 
 fn save(opts: Arc<Options>, tx: Sender<Ev>, change: Value) {
+    SAVING.store(true, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(move || {
-        if let Err(e) = zorad(
+        match zorad(
             &opts,
             &["settings".into(), "set".into(), change.to_string()],
         ) {
-            let _ = tx.send(Ev::Error(format!("Zora couldn't save that: {e}")));
+            Ok(out) => {
+                if let Some(warning) = zora_plugin::tray::unapplied(&out) {
+                    let _ = tx.send(Ev::Error(warning));
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(Ev::Error(format!("Zora couldn't save that: {e}")));
+            }
         }
+        SAVING.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 }
 

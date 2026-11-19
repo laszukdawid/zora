@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Names, project folder and phrases. Reads and writes through `zorad settings`, which validates the change;
+/// Names, coding agent, project folder and phrases. Reads and writes through `zorad settings`, which validates the change;
 /// the running core picks it up within a second.
 @MainActor
 final class SettingsWindow: NSObject, NSWindowDelegate {
@@ -59,6 +59,16 @@ final class SettingsModel {
     var names: [String] = []
     var newName = ""
     var workspace = ""
+    var harness = "claude" {
+        didSet {
+            guard harness != oldValue else { return }
+            // Each agent keeps its own unsaved folder choice while the picker moves between them.
+            folderDrafts[oldValue] = workspace
+            workspace = folderDrafts[harness] ?? folder(for: harness)
+        }
+    }
+    private var folderDrafts: [String: String] = [:]
+    var customCommand = ""
     var start = ""
     var end = ""
     var cancel = ""
@@ -117,7 +127,14 @@ final class SettingsModel {
             change["wakeNames"] = names
             expect["wakeNames"] = original.wakeNames
         }
-        if workspace != original.workspace {
+        let command = customCommand.trimmingCharacters(in: .whitespaces)
+        if harness == "custom" && command != original.customCommand { change["customCommand"] = command }
+        if harness != original.harness {
+            change["harness"] = harness
+            expect["harness"] = original.harness
+        }
+        // Only a folder changed here is sent; otherwise the agent keeps its own (or takes the current one).
+        if workspace != folder(for: harness) {
             change["workspace"] = workspace
             expect["workspace"] = original.workspace
             expect["harness"] = original.harness
@@ -149,8 +166,14 @@ final class SettingsModel {
             }
             return
         }
-        if let s = CoreSettings.decode(r.out) { apply(s) }
+        guard let s = CoreSettings.decode(r.out) else { return close() }
+        apply(s)
         saved()
+        // A running Zora applies the file only when nothing in it needs attention.
+        guard s.problems.isEmpty else {
+            error = "Saved, but Zora keeps its current settings until the problems above are fixed."
+            return
+        }
         close()
     }
 
@@ -158,7 +181,10 @@ final class SettingsModel {
         original = s
         newName = ""
         names = s.wakeNames
+        harness = s.harness
         workspace = s.workspace
+        folderDrafts = [:] // setting `harness` above stored a draft for the old choice
+        customCommand = s.customCommand
         start = s.phrases.start.joined(separator: "\n")
         end = s.phrases.end.joined(separator: "\n")
         cancel = s.phrases.cancel.joined(separator: "\n")
@@ -167,6 +193,21 @@ final class SettingsModel {
 
     private static func json(_ object: [String: Any]) -> String? {
         (try? JSONSerialization.data(withJSONObject: object)).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    /// The folder `harness` would use if saved now: its own, or (new or unset) the current agent's.
+    private func folder(for id: String) -> String {
+        guard let original else { return workspace }
+        if id == original.harness { return original.workspace }
+        if let own = original.harnessWorkspaces[id], !own.trimmingCharacters(in: .whitespaces).isEmpty { return own }
+        return original.workspace
+    }
+
+    /// The built-in agents, plus the configured one when it was set up by hand under another id.
+    var harnessChoices: [(id: String, label: String)] {
+        var c = [("claude", "Claude Code"), ("codex", "Codex"), ("pi", "Pi"), ("custom", "Custom command")]
+        if let id = original?.harness, !c.contains(where: { $0.0 == id }) { c.append((id, id)) }
+        return c.map { (id: $0.0, label: $0.1) }
     }
 
     private func lines(_ text: String) -> [String] {
@@ -209,6 +250,24 @@ struct SettingsView: View {
                     Text("Names")
                 } footer: {
                     Text("Zora answers to any of these: “Hey \(example) … Do it \(example)”. One word each, at least 3 letters.")
+                        .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Picker("Agent", selection: $model.harness) {
+                        ForEach(model.harnessChoices, id: \.id) { Text($0.label).tag($0.id) }
+                    }
+                    if model.harness == "custom" {
+                        TextField("Command", text: $model.customCommand, prompt: Text("opencode run {prompt}"))
+                            .font(.body.monospaced())
+                            .accessibilityLabel("Custom command")
+                    }
+                } header: {
+                    Text("Coding agent")
+                } footer: {
+                    Text(model.harness == "custom"
+                         ? "Your command goes where {prompt} is, or at the end. It runs without a shell; quote words that contain spaces."
+                         : "Runs your voice commands. It must be installed and signed in.")
                         .foregroundStyle(.secondary)
                 }
 

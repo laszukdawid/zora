@@ -160,7 +160,8 @@ or turn the monitor off (below).
   claiming a state nobody reports. Its menu matches the macOS one (state, Pause Listening / Resume Listening, Pause
   for 1 Hour, Settings, the last five results, Restart Zora) and changes things only through `zorad pause`, `resume`
   and `settings set`. Unlike on macOS the tray can't close the microphone itself; the core passes a pause on within
-  a second. Settings edits the names and the project folder; phrases are edited with `zorad settings set`.
+  a second. Settings edits the names, the coding agent and the project folder; phrases are edited with
+  `zorad settings set`.
 - **Testing without a microphone.** `zora-listen --file x.wav` plays a WAV file as the microphone (in real time, so
   it goes through the same pause handling). `zora-listen transcribe x.wav` prints what the model hears.
   `--fake-stt <script>` (tests only) replaces the model: each stretch of sound becomes the next line of the script;
@@ -180,7 +181,7 @@ moment can't be seen. Until that is verified on hardware, the safe default is to
 |---|---|---|
 | `zora-listen` | transcript | The same plugin as on Linux: cpal (WASAPI, the default microphone) and sherpa-onnx's streaming Zipformer. The model goes to `%LOCALAPPDATA%\Zora\models`; `zora-listen setup` needs the `curl.exe` and `tar.exe` that ship with Windows 10 and later. Links need privileges on Windows, so setup names the model version in use in `<model>.version` instead of linking it. |
 | `zora-win-dictation` | dictation | Event-driven on WASAPI: it registers for endpoint changes, for new sessions on every capture endpoint (before enumerating them) and for each session's state changes, and reports dictation as the events arrive, so a capture that starts and stops between two checks is still seen. A session that is active and whose process image is named in `dictation.windowsApps` (by file name, with or without `.exe`, any case) means dictation; so does an active session whose process can't be identified, including one shared by several processes. Every 250 ms a snapshot reconciles: a session no event announced, a state the events didn't report, a device change, a failed registration or callback, or an event that arrives out of order makes the time since the last agreement unknown. Health is also unknown with no names configured, on any WASAPI error and after a stalled check. `zora-win-dictation watch` lists capture sessions so you can find the name to configure. |
-| `zora-tray` | notify | The notification-area icon with the same menu as macOS and Linux (state, Pause/Resume Listening, Pause for 1 Hour, Settings → Names / Project Folder, the last five results, Restart Zora) and notifications as balloons, which Windows 10 and 11 show as toasts. Changes go only through `zorad pause`, `resume` and `settings`. Restart Zora runs the scheduled task `\Zora\Zora` (option `task`). |
+| `zora-tray` | notify | The notification-area icon with the same menu as macOS and Linux (state, Pause/Resume Listening, Pause for 1 Hour, Settings → Names / Coding Agent / Project Folder, the last five results, Restart Zora) and notifications as balloons, which Windows 10 and 11 show as toasts. Changes go only through `zorad pause`, `resume` and `settings`. Restart Zora runs the scheduled task `\Zora\Zora` (option `task`). |
 
 ```powershell
 cargo test --workspace -- --test-threads=4   # needs the MSVC build tools (bundled SQLite is compiled from C)
@@ -306,7 +307,9 @@ Names, phrases, capture limits and the default harness apply live; everything el
   "defaultHarness": "claude",
   "harnesses": {
     "claude": { "type": "claude", "workspace": "~/projects/some-repo", "permissionMode": "acceptEdits" },
-    "codex":  { "type": "argv", "workspace": "~/projects/some-repo", "executable": "codex", "args": ["exec", "{prompt}"] }
+    "codex":  { "type": "codex", "workspace": "~/projects/some-repo" },
+    "pi":     { "type": "pi", "workspace": "~/projects/some-repo", "extraArgs": ["--model", "sonnet"] },
+    "custom": { "type": "argv", "workspace": "~/projects/some-repo", "executable": "opencode", "args": ["run", "{prompt}"] }
   },
   "plugins": { "macos": { "config": { "sounds": true } } },
   "notifications": {
@@ -316,11 +319,30 @@ Names, phrases, capture limits and the default harness apply live; everything el
 }
 ```
 
+- `type` is `claude`, `codex`, `pi` or `argv`. The first three build their own command line (`claude -p … --output-format
+  text`, `codex exec --sandbox workspace-write … -- <prompt>`, `pi -p …`) and put `extraArgs` before the prompt (after
+  it for Claude); `executable` overrides the program. `argv` runs `executable` (`claude` when it's left out) with
+  `args` exactly as given.
+- Codex refuses to run outside a Git repository, so its project folder must be inside one unless its `extraArgs`
+  include `--skip-git-repo-check`.
+- Settings (and `zorad settings set '{"harness": "codex"}'`) switch `defaultHarness` between `claude`, `codex`, `pi` and
+  `custom`, adding the entry the first time with the current project folder. An entry you already defined under one
+  of those ids is used as it is, so a hand-written `codex` entry keeps its own command line. `customCommand` sets the
+  `custom` harness from a command line such as `opencode run {prompt}`: there is no shell, and `{prompt}` goes last
+  when the line doesn't place it. `'…'` quotes literally; `"…"` follows the Windows rules, so backslashes stay as
+  typed except before a `"` (`"C:\dir\\"` for a trailing one). Its `env` is kept while the program stays the same.
+- A running Zora applies the config only when `zorad settings` lists no problems. A save that leaves any is written
+  but not in effect, and Settings says so.
+- Each agent must be found on `path`. Tools installed under a version manager (for example `~/.nvm/.../bin/pi`) need
+  that folder added to `path`, or an absolute `executable`.
 - `permissionMode` is one of `acceptEdits`, `auto`, `dontAsk`, `manual` or `plan`. Without it, Claude Code uses its
   own settings, and anything it would ask about is refused because nobody is there to answer.
 - `{prompt}` is always passed as a single argument and never goes through a shell.
 - Zora won't start if any harness setting contains a permission-bypass flag (`bypassPermissions`,
-  `--dangerously-skip-permissions`).
+  `--dangerously-skip-permissions`, Codex's `--dangerously-bypass-approvals-and-sandbox`, `danger-full-access`,
+  `--yolo`, `--ignore-rules`, `--trust`, and `--cd`/`-C`/`--add-dir`/`--worktree`, which move or widen where it may write; Pi's
+  `--approve`/`-a`). The Codex and Pi flags are also checked when a custom command
+  starts `codex` or `pi`; any other program gets only the generic checks.
 - Jobs on the same workspace run one at a time.
 - `plugins.macos.config.sounds: false` turns the menu-bar sounds off.
 

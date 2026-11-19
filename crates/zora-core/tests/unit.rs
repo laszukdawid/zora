@@ -1,6 +1,8 @@
-use zora_core::config::{Config, Harness};
+use zora_core::config::{
+    Config, Harness, custom_harness, join_command, policy_problems, split_command,
+};
 use zora_core::detector::{tokens, units};
-use zora_core::harness::{HarnessSpec, NpmShim, last_line_summary, npm_shim_target};
+use zora_core::harness::{Answer, HarnessSpec, NpmShim, last_line_summary, npm_shim_target};
 use zora_core::store::Store;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -30,7 +32,7 @@ fn config_defaults_fill_missing_keys_and_v1_files_load() {
     let c: Config = serde_json::from_value(serde_json::json!({"capture":{"maxChars":10},"harnesses":{"c":{"workspace":std::env::temp_dir()}},"defaultHarness":"c"})).unwrap();
     assert_eq!(c.capture.max_chars, 10);
     assert_eq!(c.capture.hold_back_seconds, 1.5);
-    assert_eq!(c.harnesses["c"].executable, "claude");
+    assert_eq!(c.harnesses["c"].program(), "claude");
     assert!(c.validate().is_empty(), "{:?}", c.validate());
     // A v1 Swift config (written with sortedKeys) still parses.
     let v1 = r#"{"capture":{"holdBackSeconds":1.5,"maxChars":4000,"maxGapSeconds":30,"timeoutSeconds":180},
@@ -65,11 +67,177 @@ fn config_rejects_permission_bypass_everywhere() {
         "x".into(),
         Harness {
             kind: "argv".into(),
+            executable: "x".into(),
             args: vec!["run".into()],
             ..Harness::default()
         },
     );
     assert_eq!(c.validate(), ["harnesses.x.args must contain \"{prompt}\""]);
+}
+
+#[test]
+fn builtin_agents_build_their_own_command_lines() {
+    let config = Config::default();
+    let codex = Harness {
+        extra_args: vec!["-m".into(), "o9".into()],
+        ..Harness::preset("codex").unwrap()
+    };
+    let spec = HarnessSpec::from_config("codex", &codex, &config);
+    assert_eq!(spec.executable, "codex");
+    assert_eq!(
+        spec.argv("review"),
+        [
+            "exec",
+            "--sandbox",
+            "workspace-write",
+            "-m",
+            "o9",
+            "--",
+            "review"
+        ]
+    );
+    let pi = HarnessSpec::from_config("pi", &Harness::preset("pi").unwrap(), &config);
+    assert_eq!(
+        (pi.executable.as_str(), pi.argv("x")),
+        ("pi", vec!["-p".to_string(), "x".into()])
+    );
+    assert_eq!(pi.answer, Answer::Stdout);
+    // The whole reply is the summary, even when it looks like Claude's JSON.
+    let r = pi.summarize(0, "{\"result\":\"x\"}\nDone.\n", "");
+    assert_eq!(r.summary, "{\"result\":\"x\"}\nDone.");
+    // An executable set by hand wins over the type's own.
+    let mine = Harness {
+        executable: "/opt/pi".into(),
+        ..Harness::preset("pi").unwrap()
+    };
+    assert_eq!(
+        HarnessSpec::from_config("pi", &mine, &config).executable,
+        "/opt/pi"
+    );
+    assert!(Harness::preset("argv").is_none());
+    // An old argv entry without an executable ran claude, and still does.
+    let legacy: Harness =
+        serde_json::from_value(serde_json::json!({"type": "argv", "args": ["-p", "{prompt}"]}))
+            .unwrap();
+    assert_eq!(legacy.program(), "claude");
+    assert!(policy_problems("old", &legacy).is_empty());
+}
+
+#[test]
+fn codex_bypass_flags_and_claude_only_options_are_rejected() {
+    for extra in [
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--sandbox=danger-full-access",
+        "--yolo",
+        "--ignore-rules",
+    ] {
+        let mut c = Config {
+            dry_run: true,
+            ..Config::default()
+        };
+        let mut h = Harness::preset("codex").unwrap();
+        h.extra_args = vec![extra.into()];
+        c.harnesses.insert("codex".into(), h);
+        assert_eq!(c.validate().len(), 1, "{extra}");
+    }
+    for (kind, flag) in [
+        ("pi", "-a"),
+        ("pi", "--approve"),
+        ("codex", "--ignore-rules"),
+        ("codex", "--trust"),
+        ("codex", "--cd=/"),
+        ("codex", "-C/"),
+        ("codex", "--add-dir"),
+        ("codex", "--worktree"),
+    ] {
+        let h = Harness {
+            extra_args: vec![flag.into()],
+            ..Harness::preset(kind).unwrap()
+        };
+        assert_eq!(policy_problems(kind, &h).len(), 1, "{kind} {flag}");
+        // The same agent started as a custom command is held to the same rules.
+        let h = custom_harness(&format!("/usr/local/bin/{kind} {flag}"), "").unwrap();
+        assert_eq!(policy_problems("custom", &h).len(), 1, "{kind} {flag}");
+    }
+    // Codex's -a is its approval policy, not Pi's trust flag.
+    let h = custom_harness("codex exec -a never", "").unwrap();
+    assert!(policy_problems("custom", &h).is_empty());
+    let mut c = Config {
+        dry_run: true,
+        ..Config::default()
+    };
+    let mut h = Harness::preset("pi").unwrap();
+    h.permission_mode = Some("acceptEdits".into());
+    c.harnesses.insert("pi".into(), h);
+    assert_eq!(c.validate().len(), 1);
+}
+
+#[test]
+fn codex_needs_a_git_repository_unless_told_otherwise() {
+    let ws = tmp("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut c = Config {
+        default_harness: "codex".into(),
+        ..Config::default()
+    };
+    let mut h = Harness::preset("codex").unwrap();
+    h.workspace = ws.to_string_lossy().into_owned();
+    c.harnesses.insert("codex".into(), h);
+    let p = c.validate();
+    assert!(p.len() == 1 && p[0].contains("Git repository"), "{p:?}");
+    c.harnesses.get_mut("codex").unwrap().extra_args = vec!["--skip-git-repo-check".into()];
+    assert!(c.validate().is_empty());
+    c.harnesses.get_mut("codex").unwrap().extra_args.clear();
+    std::fs::create_dir_all(ws.parent().unwrap().join(".git")).unwrap();
+    assert!(c.validate().is_empty());
+}
+
+#[test]
+fn custom_commands_split_like_a_shell_without_one() {
+    assert_eq!(
+        split_command(r#"opencode  run -m 'a b' "say \"hi\" \\ there" C:\x\y.exe {prompt}"#)
+            .unwrap(),
+        [
+            "opencode",
+            "run",
+            "-m",
+            "a b",
+            r#"say "hi" \\ there"#,
+            r"C:\x\y.exe",
+            "{prompt}"
+        ]
+    );
+    assert_eq!(split_command("a ''").unwrap(), ["a", ""]);
+    assert!(split_command("a 'b").is_err());
+    assert!(split_command("a \"b").is_err());
+    // Windows paths pasted in double quotes keep every backslash; pairs before a quote halve.
+    assert_eq!(
+        split_command(r#""\\server\share\a b.exe" "C:\dir\\" x"#).unwrap(),
+        [r"\\server\share\a b.exe", r"C:\dir\", "x"]
+    );
+    assert!(split_command(r#""C:\dir\""#).is_err());
+    for argv in [
+        vec!["opencode", "run", "{prompt}"],
+        vec![r"C:\Program Files\x.exe", "it's", r#"say "hi" \"#, ""],
+        vec![r"\\srv\it's dir\", r#"a\"b"#, r#"\\"\"#],
+    ] {
+        let argv: Vec<String> = argv.into_iter().map(String::from).collect();
+        assert_eq!(split_command(&join_command(&argv)).unwrap(), argv);
+    }
+    let h = custom_harness("opencode run", "~/p").unwrap();
+    assert_eq!(
+        (h.kind.as_str(), h.executable.as_str()),
+        ("argv", "opencode")
+    );
+    assert_eq!(h.args, ["run", "{prompt}"]);
+    assert_eq!(
+        custom_harness("x {prompt} -v", "").unwrap().args,
+        ["{prompt}", "-v"]
+    );
+    assert!(custom_harness("   ", "").is_err());
+    // A blank or placeholder program would fall back to claude; it's refused instead.
+    assert!(custom_harness("'' run", "").is_err());
+    assert!(custom_harness("{prompt} x", "").is_err());
 }
 
 #[test]

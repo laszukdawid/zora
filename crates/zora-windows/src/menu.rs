@@ -2,22 +2,24 @@
 //! Linux tray (state, Pause/Resume, Pause for 1 Hour, Settings, recent results, Restart Zora).
 
 use serde_json::Value;
-use zora_plugin::tray::{Request, View};
+use zora_plugin::tray::{AGENTS, Request, View};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Toggle,
     PauseHour,
     Names,
+    Agent,
     Folder,
     Restart,
 }
 
 impl Action {
-    pub const ALL: [Action; 5] = [
+    pub const ALL: [Action; 6] = [
         Action::Toggle,
         Action::PauseHour,
         Action::Names,
+        Action::Agent,
         Action::Folder,
         Action::Restart,
     ];
@@ -67,6 +69,7 @@ pub fn build(view: &View) -> Vec<Item> {
         "Settings".into(),
         vec![
             cmd(Action::Names, "Names Zora Answers To…", true),
+            cmd(Action::Agent, "Coding Agent…", true),
             cmd(Action::Folder, "Project Folder…", true),
         ],
     ));
@@ -104,6 +107,44 @@ pub fn names_text(settings: &Value) -> String {
         .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_default()
         .join(", ")
+}
+
+/// The agent box's text: the built-in id, or the custom command line when the custom harness is chosen.
+pub fn agent_text(settings: &Value) -> String {
+    match settings["harness"].as_str().unwrap_or_default() {
+        "custom" => settings["customCommand"]
+            .as_str()
+            .unwrap_or_default()
+            .into(),
+        id => id.into(),
+    }
+}
+
+/// What the agent box asks for: a built-in agent's name, a harness configured by hand (its exact id), or a whole
+/// command line for a custom one. Unchanged text changes nothing.
+pub fn agent_change(text: &str, settings: &Value) -> Option<Value> {
+    let t = text.trim();
+    if t.is_empty() || t == agent_text(settings) {
+        return None;
+    }
+    // An exact configured id first, so a hand-written "Codex" entry wins over the built-in alias.
+    if t != "custom"
+        && settings["harnessWorkspaces"]
+            .as_object()
+            .is_some_and(|m| m.contains_key(t))
+    {
+        return Some(serde_json::json!({"harness": t}));
+    }
+    let lower = t.to_lowercase();
+    Some(
+        match AGENTS
+            .iter()
+            .find(|(id, label)| *id != "custom" && (lower == *id || lower == label.to_lowercase()))
+        {
+            Some((id, _)) => serde_json::json!({"harness": id}),
+            None => serde_json::json!({"harness": "custom", "customCommand": t}),
+        },
+    )
 }
 
 /// The tray plugin's options from `hello.config`.
@@ -179,7 +220,7 @@ mod tests {
                 "-",
                 "Pause Listening",
                 "Pause for 1 Hour",
-                "Settings[Names Zora Answers To…|Project Folder…]",
+                "Settings[Names Zora Answers To…|Coding Agent…|Project Folder…]",
                 "-",
                 "Restart Zora"
             ]
@@ -191,6 +232,39 @@ mod tests {
         assert!(l.contains(&"Resume Listening".to_string()), "{l:?}");
         assert!(!l.contains(&"Pause for 1 Hour".to_string()), "{l:?}");
         assert!(l.contains(&"label:Done: added tests".to_string()), "{l:?}");
+    }
+
+    #[test]
+    fn agent_box_picks_a_builtin_or_a_custom_command() {
+        let s =
+            json!({"harness": "work-agent", "harnessWorkspaces": {"work-agent": "", "claude": ""}});
+        assert_eq!(
+            agent_change(" Codex ", &s),
+            Some(json!({"harness": "codex"}))
+        );
+        assert_eq!(
+            agent_change("claude code", &s),
+            Some(json!({"harness": "claude"}))
+        );
+        assert_eq!(
+            agent_change("opencode run {prompt}", &s),
+            Some(json!({"harness": "custom", "customCommand": "opencode run {prompt}"}))
+        );
+        assert_eq!(agent_change("  ", &s), None);
+        // OK on the text as shown keeps a harness set up by hand instead of running its id as a program.
+        assert_eq!(agent_change("work-agent", &s), None);
+        let s = json!({"harness": "claude", "harnessWorkspaces": {"work-agent": "", "claude": ""}});
+        assert_eq!(
+            agent_change("work-agent", &s),
+            Some(json!({"harness": "work-agent"}))
+        );
+        let s = json!({"harness": "claude", "harnessWorkspaces": {"Codex": "", "claude": ""}});
+        assert_eq!(agent_change("Codex", &s), Some(json!({"harness": "Codex"})));
+        assert_eq!(agent_change("codex", &s), Some(json!({"harness": "codex"})));
+        assert_eq!(agent_text(&json!({"harness": "pi"})), "pi");
+        let s = json!({"harness": "custom", "customCommand": "x {prompt}"});
+        assert_eq!(agent_text(&s), "x {prompt}");
+        assert_eq!(agent_change("x {prompt}", &s), None);
     }
 
     #[test]

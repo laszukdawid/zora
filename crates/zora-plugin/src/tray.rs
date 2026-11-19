@@ -4,6 +4,43 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// The coding agents the trays offer, as `zorad settings` harness ids and labels.
+pub const AGENTS: [(&str, &str); 4] = [
+    ("claude", "Claude Code"),
+    ("codex", "Codex"),
+    ("pi", "Pi"),
+    ("custom", "Custom command"),
+];
+
+/// After `zorad settings set`: a running Zora applies the file only when it has no problems at all, so a save that
+/// leaves any (even older ones) is not in effect yet. `None` when it is, or the output isn't settings JSON.
+pub fn unapplied(settings_out: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(settings_out).ok()?;
+    let problems: Vec<&str> = v["problems"]
+        .as_array()?
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect();
+    (!problems.is_empty()).then(|| {
+        format!(
+            "Saved, but Zora keeps its current settings until this is fixed: {}",
+            problems.join("; ")
+        )
+    })
+}
+
+/// The agent choices with `current` marked, plus `current` itself when it is a harness set up by hand.
+pub fn agent_choices(current: &str) -> Vec<(String, String, bool)> {
+    let mut c: Vec<(String, String, bool)> = AGENTS
+        .iter()
+        .map(|(id, label)| (id.to_string(), label.to_string(), *id == current))
+        .collect();
+    if !current.is_empty() && !c.iter().any(|x| x.2) {
+        c.push((current.into(), current.into(), true));
+    }
+    c
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Idle,
@@ -295,6 +332,23 @@ impl TrayModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_save_with_problems_says_it_is_not_in_effect() {
+        assert_eq!(unapplied(r#"{"problems": []}"#), None);
+        assert_eq!(unapplied("not json"), None);
+        let w = unapplied(r#"{"problems": ["a", "b"]}"#).unwrap();
+        assert!(w.starts_with("Saved, but") && w.ends_with("a; b"), "{w}");
+    }
+
+    #[test]
+    fn agent_choices_add_a_hand_configured_current_one() {
+        let c = agent_choices("codex");
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.iter().filter(|x| x.2).count(), 1);
+        let c = agent_choices("mine");
+        assert_eq!(c.last().unwrap(), &("mine".into(), "mine".into(), true));
+    }
 
     #[test]
     fn waits_for_the_core_before_claiming_anything() {

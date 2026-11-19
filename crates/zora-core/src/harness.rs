@@ -10,8 +10,19 @@ pub struct HarnessSpec {
     pub executable: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    pub claude_json: bool,
+    pub answer: Answer,
     pub dry_run: bool,
+}
+
+/// How the harness's output becomes the job summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    /// Claude Code: a result object or event list if it printed one, else the whole stdout.
+    Claude,
+    /// The whole stdout is the agent's final answer (`codex exec`, `pi -p`).
+    Stdout,
+    /// Unknown output: the last non-empty line.
+    LastLine,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,31 +34,50 @@ pub struct HarnessResult {
 
 impl HarnessSpec {
     pub fn from_config(id: &str, h: &Harness, config: &Config) -> HarnessSpec {
-        let (args, claude_json) = if h.kind == "claude" {
-            // Plain text: Claude prints only its final answer. (The JSON format is a long event list whose
-            // shape changes between versions and can exceed the captured output.)
-            let mut a: Vec<String> = ["-p", "{prompt}", "--output-format", "text"]
-                .map(String::from)
-                .to_vec();
-            if let Some(mode) = &h.permission_mode {
-                a.extend(["--permission-mode".to_string(), mode.clone()]);
-            }
-            if !h.allowed_tools.is_empty() {
-                a.push("--allowedTools".into());
-                a.extend(h.allowed_tools.iter().cloned());
-            }
+        let with_prompt = |head: &[&str], tail: &[&str]| -> Vec<String> {
+            let mut a: Vec<String> = head.iter().map(|s| s.to_string()).collect();
             a.extend(h.extra_args.iter().cloned());
-            (a, true)
-        } else {
-            (h.args.clone(), false)
+            a.extend(tail.iter().map(|s| s.to_string()));
+            a
+        };
+        let (args, answer) = match h.kind.as_str() {
+            "claude" => {
+                // Plain text: Claude prints only its final answer. (The JSON format is a long event list whose
+                // shape changes between versions and can exceed the captured output.)
+                let mut a: Vec<String> = ["-p", "{prompt}", "--output-format", "text"]
+                    .map(String::from)
+                    .to_vec();
+                if let Some(mode) = &h.permission_mode {
+                    a.extend(["--permission-mode".to_string(), mode.clone()]);
+                }
+                if !h.allowed_tools.is_empty() {
+                    a.push("--allowedTools".into());
+                    a.extend(h.allowed_tools.iter().cloned());
+                }
+                a.extend(h.extra_args.iter().cloned());
+                (a, Answer::Claude)
+            }
+            // `exec` prints progress on stderr and only the final message on stdout. The default sandbox is
+            // read-only; workspace-write lets it edit the project, like Claude's acceptEdits. `--` keeps a
+            // one-word prompt such as "review" from running a subcommand.
+            "codex" => (
+                with_prompt(
+                    &["exec", "--sandbox", "workspace-write"],
+                    &["--", "{prompt}"],
+                ),
+                Answer::Stdout,
+            ),
+            // Pi rejects `--`; after `-p` the next word is always the prompt, never a subcommand.
+            "pi" => (with_prompt(&["-p"], &["{prompt}"]), Answer::Stdout),
+            _ => (h.args.clone(), Answer::LastLine),
         };
         HarnessSpec {
             id: id.to_string(),
             workspace: expand_tilde(&h.workspace),
-            executable: h.executable.clone(),
+            executable: h.program().to_string(),
             args,
             env: h.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            claude_json,
+            answer,
             dry_run: config.dry_run,
         }
     }
@@ -66,7 +96,7 @@ impl HarnessSpec {
     }
 
     pub fn summarize(&self, exit_code: i32, stdout: &str, stderr: &str) -> HarnessResult {
-        if self.claude_json {
+        if self.answer == Answer::Claude {
             // Claude Code prints either one result object or (newer versions) an array of events whose last
             // `"type": "result"` element carries the answer.
             #[derive(serde::Deserialize)]
@@ -103,7 +133,7 @@ impl HarnessSpec {
                 };
             }
         }
-        if self.claude_json {
+        if self.answer != Answer::LastLine {
             // Plain-text answer: the whole reply is the summary; the exit code says whether it worked.
             let text = stdout.trim();
             if !text.is_empty() {
