@@ -70,7 +70,12 @@ impl Env {
     }
 
     fn start(&self, config: &Path) -> Child {
+        self.start_with(config, &[])
+    }
+
+    fn start_with(&self, config: &Path, vars: &[(&str, &str)]) -> Child {
         let mut c = self.cmd();
+        c.envs(vars.iter().copied());
         c.args(["run", "--config"])
             .arg(config)
             .stdout(Stdio::null())
@@ -1181,15 +1186,62 @@ fn clear_and_recovery_remove_cancel_markers() {
         s.set_status("stuck", "ambiguous");
     }
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     for id in ["old", "stuck", "orphan"] {
         std::fs::write(dir.join(id), b"").unwrap();
     }
     env.zorad(&["jobs", "clear", "stuck"]);
     assert!(!dir.join("stuck").exists(), "jobs clear left its marker");
     let child = env.start(&env.config(json!([]), sh("echo ok", &["print", "ok"])));
+    // Orphans are pruned on Unix only (Windows keeps no marker files).
     let recovered = wait_for(Duration::from_secs(15), || {
-        (!dir.join("old").exists() && !dir.join("orphan").exists()).then_some(())
+        (!dir.join("old").exists() && (cfg!(windows) || !dir.join("orphan").exists())).then_some(())
     });
     let (_, err) = term_and_collect(child);
     assert!(recovered.is_some(), "markers left after recovery:\n{err}");
+}
+
+#[test]
+fn jobs_cancel_ends_a_job_whose_guard_stopped_reacting() {
+    let env = Env::new();
+    let pidfile = env.home.join("descendant.pid");
+    let cfg = env.config(
+        json!([{"delayMs": 3500, "say": "Hey Zora, long job. Do it, Zora.", "durMs": 500}]),
+        stubborn_job(&pidfile),
+    );
+    let child = env.start_with(&cfg, &[("ZORA_TEST_STALL_GUARD", "1")]);
+    let pid: Option<i32> = wait_for(Duration::from_secs(20), || {
+        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+    });
+    let id = env.jobs().first().map(|j| j.id.clone());
+    let cancelled = id.as_ref().map(|id| {
+        env.cmd()
+            .args(["jobs", "cancel", id])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    });
+    let t0 = Instant::now();
+    // The core sees the request itself, gives the guard its bounded time, then kills it and cleans up.
+    let done = wait_for(Duration::from_secs(60), || {
+        env.commands()
+            .into_iter()
+            .find(|c| c.2 == "failed" || c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    assert_eq!(cancelled, Some(true), "{err}");
+    let pid = pid.unwrap_or_else(|| panic!("job never started:\n{err}"));
+    assert!(
+        done.is_some(),
+        "job never ended: {:?}\n{err}",
+        env.commands()
+    );
+    assert!(t0.elapsed() < Duration::from_secs(60), "{err}");
+    assert!(!alive(pid), "descendant {pid} survived:\n{err}");
+    assert!(env.jobs().is_empty(), "{:?}\n{err}", env.jobs());
 }

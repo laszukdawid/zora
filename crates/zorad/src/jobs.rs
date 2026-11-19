@@ -304,6 +304,9 @@ impl JobManager {
         // Once the guard has been told to stop (Cancel or EOF), it gets a bounded time to report `cleaned`.
         let stop_limit = self.kill_grace + Duration::from_secs(10);
         let mut give_up: Option<tokio::time::Instant> = None;
+        // `zorad jobs cancel` is observed here too, so a guard that never reacts still gets the bounded deadline.
+        let marker = cancel_marker(&job.id).unwrap_or_default();
+        let mut request_check = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
                 line = lines.next() => {
@@ -358,6 +361,13 @@ impl JobManager {
                 }
                 // A guard that never reports is handled below: killed, and its job cleaned only with verified identity.
                 _ = tokio::time::sleep_until(give_up.unwrap_or(deadline)), if give_up.is_some() => break,
+                _ = request_check.tick(), if !cancel_sent && registration.is_some() => {
+                    if os::cancel_requested(&job.id, &marker) {
+                        cancel_sent = true;
+                        give_up = Some(tokio::time::Instant::now() + stop_limit);
+                        send_guard(&mut stdin, CoreMsg::Cancel).await;
+                    }
+                }
             }
         }
         // Close both pipes first: a guard blocked writing an oversized frame must not hang us. Then wait for it
@@ -431,29 +441,20 @@ fn cancel_dir() -> std::path::PathBuf {
 
 /// The file `zorad jobs cancel` creates to ask a Unix guard to cancel job `id` (Windows uses a named event).
 pub fn cancel_marker(id: &str) -> Option<std::path::PathBuf> {
-    let plain = !id.is_empty()
+    marker_name(id).then(|| cancel_dir().join(id))
+}
+
+/// Whether `id` can name a cancel marker: letters, digits, `-` and `_` only.
+pub fn marker_name(id: &str) -> bool {
+    !id.is_empty()
         && id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    plain.then(|| cancel_dir().join(id))
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 pub fn remove_cancel_marker(id: &str) {
     if let Some(p) = cancel_marker(id) {
         let _ = std::fs::remove_file(p);
-    }
-}
-
-/// Removes markers of jobs that are not live in the store.
-fn prune_cancel_markers(live: &HashSet<String>) {
-    let Ok(entries) = std::fs::read_dir(cancel_dir()) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if !live.contains(&name) && e.file_type().is_ok_and(|t| !t.is_dir()) {
-            let _ = std::fs::remove_file(e.path());
-        }
     }
 }
 
@@ -471,7 +472,7 @@ pub async fn recover(store: &StoreHandle) -> Result<usize, String> {
         .call(|s| s.non_final_jobs())
         .await
         .ok_or("store unavailable")??;
-    prune_cancel_markers(&jobs.iter().map(|j| j.id.clone()).collect());
+    os::prune_cancel_markers(&cancel_dir(), &jobs.iter().map(|j| j.id.clone()).collect());
     let mut recovered = 0;
     for job in jobs {
         let id = job.id.clone();

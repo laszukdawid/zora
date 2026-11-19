@@ -244,6 +244,8 @@ pub fn guard_main() -> i32 {
         return 1;
     }
 
+    stall_for_tests();
+
     // Wait for the leader while watching for cancel / liveness loss.
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -299,6 +301,15 @@ pub fn guard_main() -> i32 {
     );
     send(&out, &GuardMsg::Cleaned { ok });
     if ok { 0 } else { 1 }
+}
+
+/// Tests only: a guard that stops reacting once its job runs.
+fn stall_for_tests() {
+    if std::env::var_os("ZORA_TEST_STALL_GUARD").is_some() {
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
 }
 
 /// Tests only: widens the window between the guard's last cancel check and the release.

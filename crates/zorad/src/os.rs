@@ -302,16 +302,47 @@ pub fn reap_job(_id: &str, pgid: i32, gate_start: i64, grace: Duration) -> bool 
     false
 }
 
-/// Requests cancellation of a job: its guard sees the marker and does all the signalling. Only when the guard is
-/// verifiably gone (its pid no longer has the recorded start time) is the job's group TERMed from here, and only
-/// when that group is provably the job's (leader pid == pgid with the recorded start time).
-pub fn cancel_job(job: &zora_core::store::JobRecord, marker: &Path) -> Result<(), String> {
-    let guard_alive = match (job.guard_pid, job.guard_start) {
-        (Some(pid), Some(start)) => pid > 0 && start_time(pid as i32) == Some(start),
-        _ => false,
+enum Guard {
+    Alive,
+    Gone,
+    Unknown,
+}
+
+/// Whether the recorded guard still runs. Gone only on proof: no such process (ESRCH), or that pid now has a
+/// different start time.
+fn guard_state(pid: Option<i64>, start: Option<i64>) -> Guard {
+    let (Some(pid), Some(start)) = (pid, start) else {
+        return Guard::Unknown;
     };
-    if guard_alive {
-        return request_cancel(marker);
+    if pid <= 0 || pid > i32::MAX as i64 {
+        return Guard::Unknown;
+    }
+    // SAFETY: signal 0 only checks for existence.
+    if unsafe { libc::kill(pid as i32, 0) } != 0
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return Guard::Gone;
+    }
+    match start_time(pid as i32) {
+        Some(s) if s == start => Guard::Alive,
+        Some(_) => Guard::Gone,
+        None => Guard::Unknown,
+    }
+}
+
+/// Requests cancellation of a job: its guard sees the marker and does all the signalling. Only when the guard is
+/// proven gone is the job's group TERMed from here, and only when that group is provably the job's (leader pid ==
+/// pgid with the recorded start time).
+pub fn cancel_job(job: &zora_core::store::JobRecord, marker: &Path) -> Result<(), String> {
+    match guard_state(job.guard_pid, job.guard_start) {
+        Guard::Alive => return request_cancel(marker),
+        Guard::Unknown => {
+            return Err(
+                "has a guard that can't be identified; nothing was signalled (check `zorad jobs`)"
+                    .into(),
+            );
+        }
+        Guard::Gone => {}
     }
     match (job.job_pgid, job.gate_start) {
         (Some(pgid), Some(start)) if pgid > 0 && start_time(pgid as i32) == Some(start) => {
@@ -364,6 +395,37 @@ pub fn request_cancel(marker: &Path) -> Result<(), String> {
 /// A cancel marker counts only as a regular file (never a link).
 fn marker_present(marker: &Path) -> bool {
     std::fs::symlink_metadata(marker).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Whether cancellation of job `_id` was requested (the core's own check, independent of the guard).
+pub fn cancel_requested(_id: &str, marker: &Path) -> bool {
+    marker_present(marker)
+}
+
+/// Removes markers of jobs that are not `live`: only regular files named like job ids, and only in a real folder
+/// of ours with mode 0700 (never through a link).
+pub fn prune_cancel_markers(dir: &Path, live: &std::collections::HashSet<String>) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions.
+    let ours = meta.uid() == unsafe { libc::geteuid() };
+    if !meta.is_dir() || !ours || meta.permissions().mode() & 0o777 != 0o700 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if crate::jobs::marker_name(&name)
+            && !live.contains(&name)
+            && e.file_type().is_ok_and(|t| t.is_file())
+        {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// SIGTERM and SIGINT stop the service in order.
@@ -476,5 +538,53 @@ mod tests {
         assert!(!marker_present(&marker));
         // Nothing verifiable left: refused.
         assert!(cancel_job(&job(gone, pgid, start), &marker).is_err());
+    }
+
+    #[test]
+    fn a_guard_that_cant_be_identified_is_not_taken_for_gone() {
+        let (mut c, pgid, start) = group();
+        let mut j = job(None, pgid, start);
+        let marker = tmp().join("cancel/j");
+        assert!(cancel_job(&j, &marker).is_err());
+        j.guard_pid = None;
+        assert!(cancel_job(&j, &marker).is_err());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(c.try_wait().unwrap().is_none(), "the group was signalled");
+        assert!(!marker_present(&marker));
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    #[test]
+    fn pruning_touches_only_our_orphan_markers() {
+        let root = tmp();
+        let dir = root.join("cancel");
+        zora_core::config::create_private_dir(&dir).unwrap();
+        for f in ["orphan1", "live1", "notes.txt"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("link1")).unwrap();
+        let live: std::collections::HashSet<String> = ["live1".to_string()].into();
+        prune_cancel_markers(&dir, &live);
+        assert!(!dir.join("orphan1").exists());
+        for kept in ["live1", "notes.txt", "sub"] {
+            assert!(dir.join(kept).exists(), "{kept} was removed");
+        }
+        assert!(std::fs::symlink_metadata(dir.join("link1")).is_ok() && outside.exists());
+
+        // A link in place of the folder, or a folder others can enter, is left alone.
+        let other = root.join("other");
+        zora_core::config::create_private_dir(&other).unwrap();
+        std::fs::write(other.join("orphan2"), b"").unwrap();
+        let link = root.join("cancel-link");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        prune_cancel_markers(&link, &live);
+        assert!(other.join("orphan2").exists());
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prune_cancel_markers(&other, &live);
+        assert!(other.join("orphan2").exists());
     }
 }
