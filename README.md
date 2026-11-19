@@ -165,7 +165,7 @@ macOS works today. Linux (Ubuntu 24.04 or newer, and Arch) has its own speech, d
 recognized on your machine by a small English model, and the tray icon has the same menu as on macOS. It needs
 PipeWire, which both use by default. On GNOME the tray icon needs the AppIndicator extension (Ubuntu has it already).
 Linux support is new and hasn't been tried on many machines yet; see [docs/development.md](docs/development.md#linux)
-to install it. Windows has the core plus its own speech, dictation and tray plugins, not yet tried on a real machine; see [docs/development.md](docs/development.md#windows).
+to install it. Windows: experimental. The core and its own speech, dictation and tray plugins are there but not yet tried on a real machine, and voice commands stay off until you opt in; see [docs/development.md](docs/development.md#windows).
 
 ## For developers
 

@@ -70,6 +70,9 @@ fn main() {
         }
     };
     let apps = apps_from_config(&session.config);
+    let experimental = session.config["windowsExperimental"]
+        .as_bool()
+        .unwrap_or(false);
     eprintln!("zora-win-dictation: watching {} app name(s)", apps.len());
     let (tx, rx) = std::sync::mpsc::channel::<Req>();
     let mut src = Reconnecting::new(tx.clone());
@@ -94,7 +97,7 @@ fn main() {
             let _ = tx.send(Req::Quit);
         });
     }
-    run(Watcher::new(apps), &mut src, rx, |msgs| {
+    run(Watcher::new(apps, experimental), &mut src, rx, |msgs| {
         for m in msgs {
             out.send(m.to_json());
         }

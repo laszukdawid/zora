@@ -64,6 +64,9 @@ pub struct Dictation {
     pub linux_apps: Vec<String>,
     /// Windows: process image names (e.g. `MyDictation.exe`) whose capture sessions mean dictation.
     pub windows_apps: Vec<String>,
+    /// Windows: use the dictation monitor, which is not yet verified on hardware. Off, it reports health
+    /// unknown, so no command runs (unless `monitor` is "none").
+    pub windows_experimental: bool,
     pub pad_seconds: f64,
     /// "plugin" (default) or "none" (no dictation tool: always healthy, never dictating).
     pub monitor: String,
@@ -75,6 +78,7 @@ impl Default for Dictation {
             bundle_ids: vec!["com.typewhisper.mac".into()],
             linux_apps: vec![],
             windows_apps: vec![],
+            windows_experimental: false,
             pad_seconds: 1.0,
             monitor: "plugin".into(),
         }
