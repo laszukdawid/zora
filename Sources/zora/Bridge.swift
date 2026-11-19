@@ -242,6 +242,7 @@ final class Bridge: @unchecked Sendable {
                 return restart
             }
             pendingConfig = config
+            writer.sync { lock.withLock { announced = nil } } // after any mark queued for the old epochs
             sendRaw(["t": "ready", "protocol": 1, "generation": gen, "capabilities": ["transcript", "dictation", "notify", "listening"],
                      "clock": "darwin-uptime-raw-ns", "now_ns": HostClock.nowNanos()])
             lock.withLock { ready = true }
@@ -293,7 +294,7 @@ final class Bridge: @unchecked Sendable {
                 await pipeline?.stop()
                 micRunning = false
                 runningTag = nil
-                lock.withLock { self.announced = nil }
+                writer.async { self.lock.withLock { self.announced = nil } }
                 monitor?.stop()
                 send(["t": "stopped"])
                 // A later core connection starts fresh capture and a fresh monitoring snapshot.
@@ -329,7 +330,8 @@ final class Bridge: @unchecked Sendable {
     /// Bumped by every mic request. A request that isn't the newest when it reaches the head of the chain is
     /// dropped: the newer one behind it applies the latest state.
     private var micToken: UInt64 = 0
-    /// The tag the core was last told is open; transcript output must carry it.
+    /// The tag the core was last told is open; transcript output must carry it. Changed only on `writer`, in
+    /// order with the `mic` messages.
     private var announced: CaptureTag?
     private var lastMic: (tag: CaptureTag, open: Bool)?
     // Touched only inside the chain.
@@ -349,10 +351,23 @@ final class Bridge: @unchecked Sendable {
         }
     }
 
-    /// Queues a mic change that applies whatever state is current when it runs.
+    /// Queues a mic change that applies whatever state is current when it runs. The pipeline's grant changes
+    /// now, so a pause or disconnect stops the engine from opening even before the chain gets to it.
     private func requestMic() {
-        let token: UInt64 = lock.withLock { micToken += 1; return micToken }
+        let token = updateGrant(bump: true)
         onMic { [weak self] in await self?.applyMic(token: token) }
+    }
+
+    @discardableResult
+    private func updateGrant(bump: Bool) -> UInt64 {
+        let (token, grant, pipeline): (UInt64, CaptureTag?, SpeechPipeline?) = lock.withLock {
+            if bump { micToken += 1 }
+            let wanted = coreListening == true && !localPause
+            return (micToken, wanted ? CaptureTag(connection: connection, epoch: coreEpoch ?? 0) : nil, self.pipeline)
+        }
+        // Outside `lock`: the pipeline may hold its engine lock while calling back into the bridge.
+        pipeline?.setGrant(grant, seq: token)
+        return token
     }
 
     /// The state to apply; nil when `token` has been superseded.
@@ -442,6 +457,8 @@ final class Bridge: @unchecked Sendable {
                 micFailure = nil
                 retryDelay = 1
                 retryTask?.cancel()
+            } catch SpeechPipelineError.revoked {
+                return // a newer request is queued and reports
             } catch {
                 send(["t": "gap", "at_ns": HostClock.nowNanos(), "reason": "microphone start failed"])
                 micFailed("\(error)", target: target)
@@ -484,26 +501,24 @@ final class Bridge: @unchecked Sendable {
         let open = micRunning
         let tag = target.tag
         let tell: Bool = lock.withLock {
-            guard tag.connection == connection else { return false }
-            announced = open ? tag : nil
-            guard target.epochs, lastMic.map({ $0.tag != tag || $0.open != open }) ?? true else { return false }
+            guard tag.connection == connection, target.epochs,
+                  lastMic.map({ $0.tag != tag || $0.open != open }) ?? true else { return false }
             lastMic = (tag, open)
             return true
         }
-        // Queued before any transcript output this tag allows, so the core hears `open: true` first.
-        if tell { send(["t": "mic", "epoch": tag.epoch, "open": open], connection: tag.connection) }
+        // On `writer`, after `mic{open: true}` is written, so the core hears it before any output it allows.
+        let mark = { [weak self] in
+            guard let self else { return }
+            lock.withLock { if tag.connection == self.connection { self.announced = open ? tag : nil } }
+        }
+        if tell {
+            send(["t": "mic", "epoch": tag.epoch, "open": open], only: .connection(tag.connection), afterWrite: mark)
+        } else {
+            writer.async(execute: mark)
+        }
         let failure = target.wanted ? micFailure : nil
         Task { @MainActor [weak self] in
             self?.indicator?.setMic(open: open, failure: failure, connection: tag.connection)
-        }
-    }
-
-    /// `tag` if transcript output captured under it may go out now: same connection and epoch, and the core was
-    /// told the mic is open. nil drops it.
-    private func outputTag(_ tag: CaptureTag) -> CaptureTag? {
-        lock.withLock {
-            guard tag == announced, tag.connection == connection, tag.epoch == (coreEpoch ?? 0) else { return nil }
-            return tag
         }
     }
 
@@ -540,27 +555,24 @@ final class Bridge: @unchecked Sendable {
             switch event {
             case .segment(let s):
                 // File input has no tag and is never paused.
-                guard let self, s.tag.map({ self.outputTag($0) != nil }) ?? true else { return }
-                send(["t": "segment", "session": s.session, "start_ns": HostClock.nanos(s.start), "end_ns": HostClock.nanos(s.end), "text": s.text])
+                self?.send(["t": "segment", "session": s.session, "start_ns": HostClock.nanos(s.start), "end_ns": HostClock.nanos(s.end), "text": s.text],
+                           only: s.tag.map { .output($0) } ?? .any)
             case .gap(let reason, let at):
                 self?.send(["t": "gap", "at_ns": HostClock.nanos(at), "reason": reason])
             }
         }
         if config["earlyWake"] as? Bool ?? true {
             pipeline.onPartial = { [weak self] session, text, tag in
-                guard let self else { return }
                 var msg: [String: Any] = ["t": "partial", "session": session, "text": String(text.suffix(512))]
-                if let tag {
-                    guard let ok = outputTag(tag) else { return }
-                    if ok.epoch > 0 { msg["epoch"] = ok.epoch }
-                }
+                if let tag, tag.epoch > 0 { msg["epoch"] = tag.epoch }
                 log.debug("partial chars=\(text.count)")
-                send(msg)
+                self?.send(msg, only: tag.map { .output($0) } ?? .any)
             }
             log.info("early wake enabled")
         }
         pipeline.onMicLost = { [weak self] tag, reason in self?.micLost(tag: tag, reason: reason) }
-        self.pipeline = pipeline
+        lock.withLock { self.pipeline = pipeline }
+        updateGrant(bump: false)
         if let file = options.audioFile {
             // File mode is for testing and ignores pause.
             Task { [weak self] in
@@ -599,8 +611,15 @@ final class Bridge: @unchecked Sendable {
     // MARK: Output
 
     /// The writer queue is the single point that assigns `seq` and writes, so sequence order is wire order.
-    /// With `connection`, the message is dropped if that connection has gone by the time it is written.
-    private func send(_ body: [String: Any], connection conn: UInt64? = nil) {
+    enum Only {
+        case any
+        /// Dropped if that connection has gone by the time it is written.
+        case connection(UInt64)
+        /// Transcript output: written only while its tag is the announced one on the current connection and epoch.
+        case output(CaptureTag)
+    }
+
+    private func send(_ body: [String: Any], only: Only = .any, afterWrite: (() -> Void)? = nil) {
         let overloaded: Bool = lock.withLock {
             pendingWrites += 1
             return pendingWrites > 1024
@@ -616,13 +635,19 @@ final class Bridge: @unchecked Sendable {
         writer.async { [self] in
             defer { lock.withLock { pendingWrites -= 1 } }
             guard let (fd, gen): (Int32, UInt64) = lock.withLock({
-                ready && writeFD >= 0 && (conn == nil || conn == connection) ? (writeFD, generation) : nil
+                let allowed = switch only {
+                case .any: true
+                case .connection(let c): c == connection
+                case .output(let t): t == announced && t.connection == connection && t.epoch == (coreEpoch ?? 0)
+                }
+                return ready && writeFD >= 0 && allowed ? (writeFD, generation) : nil
             }) else { return }
             seq += 1
             var msg = body
             msg["seq"] = seq
             msg["generation"] = gen
             writeLine(msg, to: fd)
+            afterWrite?()
         }
     }
 

@@ -11,6 +11,8 @@ public enum SpeechPipelineError: Error, CustomStringConvertible {
     case assetsMissing(String)
     case noAudioFormat
     case microphoneUnavailable(String)
+    /// The start was withdrawn (a pause or disconnect) before the engine opened.
+    case revoked
 
     public var description: String {
         switch self {
@@ -18,6 +20,7 @@ public enum SpeechPipelineError: Error, CustomStringConvertible {
         case .assetsMissing(let l): "speech model for \(l) is not installed; run `zora setup`"
         case .noAudioFormat: "no audio format compatible with the speech analyzer"
         case .microphoneUnavailable(let m): "microphone unavailable: \(m)"
+        case .revoked: "microphone start withdrawn"
         }
     }
 }
@@ -57,6 +60,9 @@ public final class SpeechPipeline: @unchecked Sendable {
     private let engineLock = NSLock()
     /// Under `engineLock`: the microphone should be open. A late device-change restart checks it.
     private var micOn = false
+    /// Under `engineLock`: the tag the engine may open under; see `setGrant`.
+    private var grant: CaptureTag?
+    private var grantSeq: UInt64 = 0
     /// Set while pausing: buffered audio is skipped and the open session is thrown away, not finalized.
     private let discarding = OSAllocatedUnfairLock(initialState: false)
     /// The tag new microphone audio is captured under; nil while paused (the tap drops audio and no partial
@@ -125,13 +131,25 @@ public final class SpeechPipeline: @unchecked Sendable {
 
     // MARK: Microphone
 
-    /// Opens the microphone; its audio and text carry `tag`. On failure everything is released again.
+    /// Which tag the engine may open under (nil: none). A pause or disconnect revokes it here, synchronously, so
+    /// neither a start already on its way nor a device-change restart can open the engine afterwards; audio and
+    /// partial text under another tag stop at once. A `seq` older than the last one is ignored.
+    public func setGrant(_ tag: CaptureTag?, seq: UInt64) {
+        engineLock.withLock {
+            guard seq >= grantSeq else { return }
+            grantSeq = seq
+            grant = tag
+            live.withLock { if $0 != tag { $0 = nil } }
+        }
+    }
+
+    /// Opens the microphone; its audio and text carry `tag`. Throws `.revoked` if `tag` isn't granted when the
+    /// engine would start. On failure everything is released again.
     public func startMicrophone(tag: CaptureTag) async throws {
-        live.withLock { $0 = tag }
         startConsumer()
         do {
             try engineLock.withLock {
-                try installTapAndStart()
+                try installTapAndStart(tag: tag)
                 micOn = true
             }
         } catch {
@@ -188,13 +206,20 @@ public final class SpeechPipeline: @unchecked Sendable {
         engineLock.withLock {
             // A change notice that was already on its way when the mic was paused or stopped must not reopen it.
             guard micOn else { return }
+            let tag = live.withLock { $0 }
             log.info("restarting microphone: \(reason, privacy: .public)")
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
             markDiscontinuity()
-            do { try installTapAndStart() } catch {
+            do {
+                guard let tag else { throw SpeechPipelineError.revoked }
+                try installTapAndStart(tag: tag)
+            } catch SpeechPipelineError.revoked {
+                // Paused or disconnected meanwhile: stay closed; the queued pause releases the rest.
                 micOn = false
-                let tag = live.withLock { v in defer { v = nil }; return v }
+            } catch {
+                micOn = false
+                live.withLock { $0 = nil }
                 log.error("microphone restart failed: \(String(describing: error), privacy: .public)")
                 onEvent(.gap(reason: "microphone restart failed: \(error)", at: HostClock.now()))
                 onMicLost?(tag, "\(error)")
@@ -202,7 +227,8 @@ public final class SpeechPipeline: @unchecked Sendable {
         }
     }
 
-    private func installTapAndStart() throws {
+    /// Under `engineLock`.
+    private func installTapAndStart(tag: CaptureTag) throws {
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
@@ -218,11 +244,16 @@ public final class SpeechPipeline: @unchecked Sendable {
             }
         }
         engine.prepare()
-        do { try engine.start() } catch {
+        do {
+            // The last check before the device opens; `setGrant` can't change it while we hold `engineLock`.
+            guard grant == tag else { throw SpeechPipelineError.revoked }
+            try engine.start()
+        } catch {
             // Leave no tap behind: installing a second one on the same bus raises an exception.
             input.removeTap(onBus: 0)
             throw error
         }
+        live.withLock { $0 = tag }
     }
 
     // MARK: File (integration testing through the same path)
