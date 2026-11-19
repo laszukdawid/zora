@@ -129,7 +129,9 @@ invalidates everything before it, so a plugin still listening under an older epo
   a plugin whose processes couldn't be reaped, leaves the pause unconfirmed (`confirmed: false` and `degraded`). A
   group that couldn't be reaped keeps counting, in later pauses too, until it is verified gone; a new connection of
   the same plugin can't confirm for it. The timeout is reported once; if every source is later confirmed or
-  verified gone during the same pause, the core repeats `listening` with `confirmed: true`.
+  verified gone during the same pause, the core repeats `listening` with `confirmed: true`. A transcript plugin
+  that connects during a decided pause gets its own 5 s, and the core repeats `listening` without `confirmed`
+  (Pausing… again) until that is settled.
 - Whatever a plugin still sends while paused, the core drops: segments and partial text are neither stored nor
   matched (this takes precedence over storing old-generation segments), and an open capture ends. Final segments
   keep their capture-time check after a resume. Commands completed before the pause still run.

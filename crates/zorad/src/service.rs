@@ -389,7 +389,7 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                 tx,
             } => {
                 if capabilities.iter().any(|c| c == "transcript") {
-                    tracker.up(&id);
+                    tracker.up(&id, Instant::now() + PAUSE_CONFIRM);
                 }
                 plugins.insert(
                     id,
@@ -471,8 +471,11 @@ pub async fn run(config: Config, opts: Options) -> i32 {
             for reason in report {
                 notifier.notify(&ZoraEvent::Degraded { reason }, &mut plugins);
             }
-            eprintln!("[zorad] pause confirmed={confirmed}");
-            listen_state.confirmed = Some(confirmed);
+            eprintln!(
+                "[zorad] pause confirmed={}",
+                confirmed.map_or("pending".into(), |c| c.to_string())
+            );
+            listen_state.confirmed = confirmed;
             let _ = listen_tx.send(listen_state);
         }
         for fx in effects {

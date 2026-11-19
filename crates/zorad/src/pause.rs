@@ -198,9 +198,10 @@ impl PauseTracker {
         self.confirmed = None;
     }
 
-    /// A transcript plugin connected; while paused it must confirm too.
-    pub fn up(&mut self, id: &str) {
-        if self.pending.is_some() {
+    /// A transcript plugin connected; while paused it must confirm too, by `deadline` at the earliest.
+    pub fn up(&mut self, id: &str, deadline: Instant) {
+        if let Some(p) = &mut self.pending {
+            p.deadline = p.deadline.max(deadline);
             self.waiting.insert(id.to_string());
         }
     }
@@ -238,8 +239,9 @@ impl PauseTracker {
         self.unreaped.remove(&(id.to_string(), generation));
     }
 
-    /// The confirmation to publish when it changed, and the reasons to report (each source once per pause).
-    pub fn evaluate(&mut self, now: Instant) -> Option<(bool, Vec<String>)> {
+    /// The confirmation to publish when it changed (None: waiting again), and the reasons to report (each source
+    /// once per pause).
+    pub fn evaluate(&mut self, now: Instant) -> Option<(Option<bool>, Vec<String>)> {
         let p = self.pending.as_mut()?;
         let open: Vec<(String, String)> = self
             .waiting
@@ -265,6 +267,10 @@ impl PauseTracker {
         } else if due {
             false
         } else {
+            // A source joined a pause already decided: back to waiting.
+            if self.confirmed.take().is_some() {
+                return Some((None, vec![]));
+            }
             return None;
         };
         let mut report = vec![];
@@ -279,7 +285,7 @@ impl PauseTracker {
             return None;
         }
         self.confirmed = Some(next);
-        Some((next, report))
+        Some((Some(next), report))
     }
 }
 
@@ -304,7 +310,7 @@ mod tests {
         t.closed("listen");
         assert_eq!(t.evaluate(now), None, "the old group still counts");
         let (confirmed, report) = t.evaluate(now + Duration::from_secs(5)).unwrap();
-        assert!(!confirmed);
+        assert_eq!(confirmed, Some(false));
         assert_eq!(report.len(), 1);
         assert!(report[0].contains("left processes running"), "{report:?}");
         assert_eq!(
@@ -315,7 +321,7 @@ mod tests {
         t.reaped("listen", 1);
         assert_eq!(
             t.evaluate(now + Duration::from_secs(7)),
-            Some((true, vec![]))
+            Some((Some(true), vec![]))
         );
     }
 
@@ -325,16 +331,31 @@ mod tests {
         let mut t = tracker_at(now + Duration::from_secs(5));
         t.closed("macos");
         t.closed("listen");
-        assert_eq!(t.evaluate(now), Some((true, vec![])));
+        assert_eq!(t.evaluate(now), Some((Some(true), vec![])));
         t.opened("listen", now);
         let (confirmed, report) = t.evaluate(now).unwrap();
-        assert!(!confirmed);
+        assert_eq!(confirmed, Some(false));
         assert_eq!(report, ["plugin listen opened its microphone while paused"]);
         t.closed("listen");
-        assert_eq!(t.evaluate(now), Some((true, vec![])));
+        assert_eq!(t.evaluate(now), Some((Some(true), vec![])));
         // A second reopen is reported again.
         t.opened("listen", now);
         assert_eq!(t.evaluate(now).unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn a_source_joining_a_confirmed_pause_withdraws_the_confirmation() {
+        let now = Instant::now();
+        let mut t = tracker_at(now + Duration::from_secs(5));
+        t.closed("listen");
+        assert_eq!(t.evaluate(now), Some((Some(true), vec![])));
+        // A transcript plugin connects (here after the first deadline): it gets its own 5 s.
+        t.up("other", now + Duration::from_secs(10));
+        let at = now + Duration::from_secs(6);
+        assert_eq!(t.evaluate(at), Some((None, vec![])), "pausing again");
+        assert_eq!(t.evaluate(at), None);
+        t.closed("other");
+        assert_eq!(t.evaluate(at), Some((Some(true), vec![])));
     }
 
     #[test]
@@ -342,12 +363,12 @@ mod tests {
         let now = Instant::now();
         let mut t = tracker_at(now + Duration::from_secs(5));
         let (confirmed, report) = t.evaluate(now + Duration::from_secs(5)).unwrap();
-        assert!(!confirmed);
+        assert_eq!(confirmed, Some(false));
         assert!(report[0].contains("did not confirm"), "{report:?}");
         t.closed("listen");
         assert_eq!(
             t.evaluate(now + Duration::from_secs(6)),
-            Some((true, vec![]))
+            Some((Some(true), vec![]))
         );
     }
 
@@ -355,21 +376,21 @@ mod tests {
     fn confirmations_settle_early_and_a_verified_reap_counts_as_closed() {
         let now = Instant::now();
         let mut t = tracker_at(now + Duration::from_secs(5));
-        t.up("other");
+        t.up("other", now);
         t.closed("listen");
         assert_eq!(t.evaluate(now), None);
         t.down("other", 7, true, true);
-        assert_eq!(t.evaluate(now), Some((true, vec![])));
+        assert_eq!(t.evaluate(now), Some((Some(true), vec![])));
         // A failed reap after the pause was confirmed un-confirms it.
         t.down("listen", 3, false, true);
         let (confirmed, report) = t.evaluate(now + Duration::from_secs(5)).unwrap();
-        assert!(!confirmed && report.len() == 1, "{report:?}");
+        assert!(confirmed == Some(false) && report.len() == 1, "{report:?}");
         // Nothing that can't record (a notify-only plugin) counts.
         t.reaped("listen", 3);
         t.down("tray", 1, false, false);
         assert_eq!(
             t.evaluate(now + Duration::from_secs(6)),
-            Some((true, vec![]))
+            Some((Some(true), vec![]))
         );
     }
 
