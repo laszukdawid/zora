@@ -338,10 +338,12 @@ pub struct Graph {
     serials: std::collections::HashMap<u32, u64>,
     /// The server those serials belong to.
     server: Option<String>,
-    /// Running dictation streams that disappeared (PipeWire also removes a node it merely hides from this client),
-    /// with their serial and since when: still capturing and a blind spot until they return or `VANISH_LIMIT`
-    /// passes.
-    vanished: Vec<(Option<u64>, Ns)>,
+    /// Holds: running dictation streams whose state is no longer seen, by serial and since when. A recorder
+    /// that disappears (PipeWire also removes a node it merely hides from this client) or whose connection
+    /// dropped keeps counting as capturing, and the graph stays incomplete, until one of: fresh state for that
+    /// serial (its first info after rediscovery), a confirmed server change, or `VANISH_LIMIT`. Rediscovery
+    /// alone never clears a hold.
+    holds: Vec<(Option<u64>, Ns)>,
     /// Blind spots opened by an identity change on a running node: they close when it stops or goes away.
     until_stopped: std::collections::HashSet<u32>,
 }
@@ -357,17 +359,33 @@ impl Graph {
             matched_serials: Default::default(),
             serials: Default::default(),
             server: None,
-            vanished: Vec::new(),
+            holds: Vec::new(),
             until_stopped: Default::default(),
         }
     }
 
-    /// The server this connection reached (from the core info). Serials from another server mean nothing.
-    pub fn server(&mut self, identity: &str) {
-        if self.server.as_deref() != Some(identity) {
-            self.matched_serials.clear();
-            self.server = Some(identity.to_string());
+    /// The server this connection reached (from the core info). Serials from another server mean nothing: a
+    /// change closes every hold (unknown up to now) and forgets which serials matched.
+    pub fn server(&mut self, identity: &str, now: Ns) -> Vec<Msg> {
+        if self.server.as_deref() == Some(identity) {
+            return vec![];
         }
+        let changed = self.server.is_some();
+        self.server = Some(identity.to_string());
+        self.matched_serials.clear();
+        if !changed {
+            return vec![];
+        }
+        let mut out: Vec<Msg> = self
+            .holds
+            .drain(..)
+            .map(|(_, since)| Msg::Unknown {
+                from_ns: since,
+                to_ns: now,
+            })
+            .collect();
+        out.extend(self.edges(now));
+        out
     }
 
     pub fn class(&self, id: u32) -> Option<Class> {
@@ -375,37 +393,21 @@ impl Graph {
     }
 
     /// A node appeared. `media_class` and `serial` (`object.serial`) are from its registry entry.
-    pub fn discovered(
-        &mut self,
-        id: u32,
-        media_class: Option<&str>,
-        serial: Option<u64>,
-        now: Ns,
-    ) -> Vec<Msg> {
-        let mut out = vec![];
+    pub fn discovered(&mut self, id: u32, media_class: Option<&str>, serial: Option<u64>, now: Ns) {
         if let Some(serial) = serial {
             self.serials.insert(id, serial);
-            // A vanished recorder is back: the time it was hidden is unknown.
-            if let Some(i) = self.vanished.iter().position(|(s, _)| *s == Some(serial)) {
-                let (_, since) = self.vanished.remove(i);
-                out.push(Msg::Unknown {
-                    from_ns: since,
-                    to_ns: now,
-                });
-            }
         }
         let node = self.streams.entry(id).or_default();
         node.global_class = media_class.map(String::from);
         if node.effective(&self.apps) != Class::Irrelevant {
             self.blind.insert(id, now);
         }
-        out
     }
 
-    /// Ends vanished recorders that stayed away for `VANISH_LIMIT`: unknown for that time, then `ended`.
+    /// Ends holds older than `VANISH_LIMIT`: unknown for that time, then `ended` if nothing else captures.
     pub fn expire(&mut self, now: Ns) -> Vec<Msg> {
         let mut out = vec![];
-        self.vanished.retain(|(_, since)| {
+        self.holds.retain(|(_, since)| {
             if now - since < VANISH_LIMIT {
                 return true;
             }
@@ -457,6 +459,18 @@ impl Graph {
         if let Some(serial) = node.prop("object.serial").and_then(|v| v.parse().ok()) {
             self.serials.entry(id).or_insert(serial);
         }
+        let mut out = vec![];
+        // Fresh state for a held serial: the unseen time is unknown, and from now its own state counts.
+        if !seen_before
+            && let Some(serial) = self.serials.get(&id).copied()
+            && let Some(i) = self.holds.iter().position(|(s, _)| *s == Some(serial))
+        {
+            let (_, since) = self.holds.remove(i);
+            out.push(Msg::Unknown {
+                from_ns: since,
+                to_ns: now,
+            });
+        }
         if let Class::Capture { matches: true, .. } = class {
             self.sticky.insert(id);
             if let Some(serial) = self.serials.get(&id) {
@@ -469,7 +483,6 @@ impl Graph {
             self.blind.entry(id).or_insert(now);
             self.until_stopped.insert(id);
         }
-        let mut out = vec![];
         let blind = self.blind.contains_key(&id);
         let resolved = if self.until_stopped.contains(&id) {
             !running && class != Class::Unclassified
@@ -486,7 +499,7 @@ impl Graph {
     }
 
     /// The node is gone from this client's view. That may be a permission change rather than its end, so a
-    /// recorder that was running is kept as vanished (still capturing) instead of ending at once, and its serial
+    /// recorder that was running is held (still capturing) instead of ending at once, and its serial
     /// keeps matching for the server's lifetime.
     pub fn removed(&mut self, id: u32, now: Ns) -> Vec<Msg> {
         let driver = self.streams.get(&id).is_some_and(StreamNode::is_driver);
@@ -496,7 +509,7 @@ impl Graph {
         self.sticky.remove(&id);
         let serial = self.serials.remove(&id);
         if was_dictating {
-            self.vanished.push((serial, now));
+            self.holds.push((serial, now));
         }
         out.extend(self.edges(now));
         out
@@ -514,7 +527,7 @@ impl Graph {
     }
 
     pub fn complete(&self) -> bool {
-        self.blind.is_empty() && self.vanished.is_empty()
+        self.blind.is_empty() && self.holds.is_empty()
     }
 
     /// The node is running and is (or once was) a configured dictation app's capture stream.
@@ -536,7 +549,7 @@ impl Graph {
     }
 
     pub fn capturing(&self) -> bool {
-        !self.vanished.is_empty() || self.streams.keys().any(|id| self.dictating(*id))
+        !self.holds.is_empty() || self.streams.keys().any(|id| self.dictating(*id))
     }
 
     pub fn node(&self, id: u32) -> Option<&StreamNode> {
@@ -545,7 +558,15 @@ impl Graph {
 
     /// The connection is gone; everything learned on it is forgotten, except which serials matched (they are
     /// dropped when the next connection reaches a different server).
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self, now: Ns) {
+        // Recorders running when the connection dropped are held: the next snapshot must show them again.
+        let running: Vec<Option<u64>> = self
+            .streams
+            .keys()
+            .filter(|id| self.dictating(**id))
+            .map(|id| self.serials.get(id).copied())
+            .collect();
+        self.holds.extend(running.into_iter().map(|s| (s, now)));
         self.serials.clear();
         self.streams.clear();
         self.blind.clear();
@@ -640,7 +661,7 @@ mod tests {
 
     impl Graph {
         fn discovered_t(&mut self, id: u32, class: Option<&str>, now: Ns) {
-            let _ = self.discovered(id, class, None, now);
+            self.discovered(id, class, None, now);
         }
     }
 
@@ -896,93 +917,116 @@ mod tests {
         assert!(!g.capturing());
     }
 
+    const REC_PROPS: [(&str, &str); 2] = [
+        ("media.class", CAPTURE_CLASS),
+        ("application.process.binary", REC),
+    ];
+    const GENERIC: [(&str, &str); 2] = [
+        ("media.class", CAPTURE_CLASS),
+        ("application.name", "Recorder"),
+    ];
+
+    /// A graph on server `s` with node `id` (serial `serial`) recording for the configured app.
+    fn recording(t: Ns, id: u32, serial: u64) -> Graph {
+        let mut g = graph(t);
+        g.server("s", t);
+        g.discovered(id, Some(CAPTURE_CLASS), Some(serial), t);
+        g.info(id, Some(REC_PROPS), true, t);
+        assert!(g.capturing());
+        g
+    }
+
+    fn ended_last(out: &[Msg]) -> bool {
+        matches!(out.last(), Some(Msg::Dictation { began: false, .. }))
+    }
+
     #[test]
     fn a_match_survives_a_reconnect_to_the_same_server() {
         let t = 10 * SECOND;
-        let rec = [
-            ("media.class", CAPTURE_CLASS),
-            ("application.process.binary", REC),
-        ];
-        let generic = [
-            ("media.class", CAPTURE_CLASS),
-            ("application.name", "Recorder"),
-        ];
-        let mut g = graph(t);
-        g.server("pipewire-0:1234");
-        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t);
-        g.info(5, Some(rec), true, t);
-        assert!(g.capturing());
+        let mut g = recording(t, 5, 77);
         // The connection drops and comes back to the same server; the node now shows only a generic name.
-        g.clear();
-        g.server("pipewire-0:1234");
-        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 5 * SECOND);
-        g.info(5, Some(generic), true, t + 5 * SECOND);
-        assert!(g.capturing(), "still the recorder");
-        // A restarted server reuses nothing: the same serial there is another node.
-        g.clear();
-        g.server("pipewire-0:9999");
-        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 9 * SECOND);
-        g.info(5, Some(generic), true, t + 9 * SECOND);
-        assert!(!g.capturing());
+        g.clear(t + 4 * SECOND);
+        assert!(g.server("s", t + 5 * SECOND).is_empty());
+        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 5 * SECOND);
+        let out = g.info(5, Some(GENERIC), true, t + 5 * SECOND);
+        assert_eq!(out[0], unknown(t + 4 * SECOND, t + 5 * SECOND));
+        assert!(g.capturing() && g.complete(), "still the recorder");
         // The serial can also come from the info properties.
         let mut g = graph(t);
-        g.server("s");
-        let _ = g.discovered(1, Some(CAPTURE_CLASS), None, t);
+        g.server("s", t);
+        g.discovered(1, Some(CAPTURE_CLASS), None, t);
         let with_serial = [
             ("media.class", CAPTURE_CLASS),
             ("application.process.binary", REC),
             ("object.serial", "42"),
         ];
         g.info(1, Some(with_serial), true, t);
-        g.clear();
-        g.server("s");
-        let _ = g.discovered(1, Some(CAPTURE_CLASS), Some(42), t + SECOND);
-        g.info(1, Some(generic), true, t + SECOND);
+        g.clear(t + SECOND);
+        g.server("s", t + SECOND);
+        g.discovered(1, Some(CAPTURE_CLASS), Some(42), t + SECOND);
+        g.info(1, Some(GENERIC), true, t + SECOND);
+        assert!(g.capturing() && g.complete());
+    }
+
+    #[test]
+    fn a_recorder_missing_after_a_reconnect_is_held_until_the_limit() {
+        let t = 10 * SECOND;
+        let mut g = recording(t, 5, 77);
+        g.clear(t + SECOND);
+        g.server("s", t + 2 * SECOND);
+        // The first snapshot of the new connection doesn't show it: still capturing, health unknown.
+        assert!(g.capturing() && !g.complete());
+        assert!(g.expire(t + 10 * SECOND).is_empty());
+        let out = g.expire(t + 11 * SECOND);
+        assert_eq!(out[0], unknown(t + SECOND, t + 11 * SECOND));
+        assert!(ended_last(&out));
+        assert!(!g.capturing() && g.complete());
+    }
+
+    #[test]
+    fn a_hold_ends_only_with_fresh_state_not_with_rediscovery() {
+        let t = 10 * SECOND;
+        let mut g = recording(t, 5, 77);
+        // Hidden: no `ended`, still capturing, health unknown.
+        assert!(g.removed(5, t + SECOND).is_empty());
+        assert!(g.capturing() && !g.complete());
+        // Rediscovered, then hidden again before any state: the hold stays.
+        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 2 * SECOND);
+        g.removed(5, t + 3 * SECOND);
+        assert!(g.capturing() && !g.complete());
+        assert!(g.expire(t + 10 * SECOND).is_empty(), "held until the limit");
+        // Shown again with fresh state under a generic name: the unseen time is unknown, and it still counts.
+        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 10 * SECOND);
+        let out = g.info(5, Some(GENERIC), true, t + 10 * SECOND);
+        assert_eq!(out[0], unknown(t + SECOND, t + 10 * SECOND));
+        assert!(g.capturing() && g.complete());
+        // Hidden again and never back: after the limit, unknown for that time, then ended.
+        g.removed(5, t + 11 * SECOND);
+        let out = g.expire(t + 21 * SECOND);
+        assert_eq!(out[0], unknown(t + 11 * SECOND, t + 21 * SECOND));
+        assert!(ended_last(&out));
+        // Its serial still matches for the server's lifetime.
+        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 22 * SECOND);
+        g.info(5, Some(GENERIC), true, t + 22 * SECOND);
         assert!(g.capturing());
     }
 
     #[test]
-    fn a_running_recorder_hidden_and_shown_again_keeps_capturing() {
+    fn a_server_change_closes_holds_and_forgets_serials() {
         let t = 10 * SECOND;
-        let rec = [
-            ("media.class", CAPTURE_CLASS),
-            ("application.process.binary", REC),
-        ];
-        let generic = [
-            ("media.class", CAPTURE_CLASS),
-            ("application.name", "Recorder"),
-        ];
-        let mut g = graph(t);
-        g.server("s");
-        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t);
-        g.info(5, Some(rec), true, t);
-        // PipeWire hides it (global_remove): no `ended`, still capturing, health unknown.
-        let out = g.removed(5, t + SECOND);
-        assert!(out.is_empty(), "{out:?}");
-        assert!(g.capturing() && !g.complete());
-        assert!(g.expire(t + 5 * SECOND).is_empty());
-        // Shown again with only a generic name: the hidden time is unknown, and it still counts.
-        let out = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 6 * SECOND);
-        assert_eq!(out, [unknown(t + SECOND, t + 6 * SECOND)]);
-        g.info(5, Some(generic), true, t + 6 * SECOND);
-        assert!(g.capturing() && g.complete());
-        // Hidden again and never back: after the limit, unknown for that time, then ended.
-        g.removed(5, t + 7 * SECOND);
-        assert!(g.expire(t + 16 * SECOND).is_empty());
-        let out = g.expire(t + 17 * SECOND);
-        assert_eq!(out[0], unknown(t + 7 * SECOND, t + 17 * SECOND));
-        assert_eq!(
-            out.last(),
-            Some(&Msg::Dictation {
-                began: false,
-                at_ns: t + 17 * SECOND
-            })
-        );
+        let mut g = recording(t, 5, 77);
+        g.removed(5, t + SECOND);
+        g.clear(t + 2 * SECOND);
+        // A restarted server: the hold closes as unknown up to the change, then ends.
+        let out = g.server("s2", t + 3 * SECOND);
+        assert_eq!(out[0], unknown(t + SECOND, t + 3 * SECOND));
+        assert!(ended_last(&out));
         assert!(!g.capturing() && g.complete());
-        // Its serial still matches for the server's lifetime.
-        let _ = g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 20 * SECOND);
-        g.info(5, Some(generic), true, t + 20 * SECOND);
-        assert!(g.capturing());
+        // It reuses serial 77 for some other app's stream: not a match, and nothing is held for it.
+        g.discovered(9, Some(CAPTURE_CLASS), Some(77), t + 4 * SECOND);
+        let out = g.info(9, Some(GENERIC), true, t + 4 * SECOND);
+        assert_eq!(out, [unknown(t + 4 * SECOND, t + 4 * SECOND)]);
+        assert!(!g.capturing() && g.complete());
     }
 
     #[test]

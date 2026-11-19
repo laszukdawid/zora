@@ -70,6 +70,8 @@ impl Shared {
         }
         eprintln!("zora-dictation: {reason}");
         self.broken = Some(reason.to_string());
+        // Recorders running now are held from this moment until the next connection shows them again.
+        self.graph.clear(now);
         let mut msgs = self.graph.monitor.lost(reason, now);
         for (purpose, _) in self.pending.drain().map(|(_, p)| p) {
             if let Purpose::Sync(id) = purpose {
@@ -156,7 +158,9 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                 // The cookie is random per server start, so it tells a restarted server from the same one.
                 if let Some(shared) = s3.upgrade() {
                     let identity = format!("{}:{}", info.name(), info.cookie());
-                    shared.borrow_mut().graph.server(&identity);
+                    let sh = &mut *shared.borrow_mut();
+                    let msgs = sh.graph.server(&identity, now_ns());
+                    sh.send(msgs);
                 }
             })
             .done(move |id, seq| {
@@ -205,13 +209,10 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                     .as_ref()
                     .and_then(|p| p.get("object.serial"))
                     .and_then(|v| v.parse().ok());
-                {
-                    let sh = &mut *shared.borrow_mut();
-                    let msgs = sh.graph.discovered(id, class, serial, now_ns());
-                    if sh.broken.is_none() {
-                        sh.send(msgs);
-                    }
-                }
+                shared
+                    .borrow_mut()
+                    .graph
+                    .discovered(id, class, serial, now_ns());
                 let Ok(node) = reg.bind::<Node, _>(obj) else {
                     eprintln!("zora-dictation: cannot bind node {id}");
                     return;
@@ -315,7 +316,7 @@ pub fn run(
                 *c = None;
                 let mut sh = shared.borrow_mut();
                 sh.core = None;
-                sh.graph.clear();
+                sh.graph.clear(now);
                 sh.pending.clear();
                 sh.tick_outstanding = false;
             }
