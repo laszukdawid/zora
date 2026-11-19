@@ -39,17 +39,27 @@ pub struct StreamNode {
 }
 
 impl StreamNode {
-    /// PipeWire info updates carry only the properties that changed, so they are merged, never replaced.
-    pub fn update_props<'a>(
+    /// Replaces the properties. PipeWire sends the full set when they change (its change mask says so) and an
+    /// empty set otherwise; the caller passes only the former.
+    pub fn set_props<'a>(
         &mut self,
         props: impl IntoIterator<Item = (&'a str, &'a str)>,
         apps: &[String],
     ) {
-        for (k, v) in props {
-            self.props.insert(k.to_string(), v.to_string());
-        }
+        self.props = props
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         self.capture = self.props.get("media.class").map(String::as_str) == Some(CAPTURE_CLASS);
         self.matches = matches_app(|k| self.props.get(k).map(String::as_str), apps);
+    }
+
+    pub fn prop(&self, key: &str) -> Option<&str> {
+        self.props.get(key).map(String::as_str)
+    }
+
+    pub fn is_capture(&self) -> bool {
+        self.capture
     }
 
     /// A configured dictation app is capturing through this node right now.
@@ -172,6 +182,21 @@ impl Monitor {
         }
     }
 
+    /// A capture stream changed between snapshots. Edges go out as they happen, so a dictation that starts and
+    /// stops between two snapshots is still reported.
+    pub fn changed(&mut self, capturing: bool, now: Ns) -> Vec<Msg> {
+        if capturing == self.capturing {
+            return vec![];
+        }
+        let mut out = self.stall_check(now);
+        self.capturing = capturing;
+        out.push(Msg::Dictation {
+            began: capturing,
+            at_ns: now,
+        });
+        out
+    }
+
     /// A complete, fresh snapshot of every capture stream. `capturing`: a matching stream is running.
     pub fn observe(&mut self, capturing: bool, now: Ns) -> Vec<Msg> {
         let mut out = self.stall_check(now);
@@ -292,10 +317,10 @@ mod tests {
     }
 
     #[test]
-    fn partial_property_updates_keep_the_match() {
+    fn property_changes_replace_the_set() {
         let apps = vec!["pw-record".to_string()];
         let mut n = StreamNode::default();
-        n.update_props(
+        n.set_props(
             [
                 ("media.class", CAPTURE_CLASS),
                 ("application.name", "pw-record"),
@@ -304,15 +329,16 @@ mod tests {
         );
         n.running = true;
         assert!(n.dictating());
-        n.update_props([("node.latency", "1024/48000")], &apps);
-        assert!(
-            n.dictating(),
-            "a later update without the app name changes nothing"
+        n.set_props(
+            [
+                ("media.class", CAPTURE_CLASS),
+                ("node.latency", "1024/48000"),
+            ],
+            &apps,
         );
-        n.running = false;
-        assert!(!n.dictating());
+        assert!(!n.dictating(), "a removed app name no longer matches");
         let mut other = StreamNode::default();
-        other.update_props(
+        other.set_props(
             [
                 ("media.class", "Audio/Source"),
                 ("application.name", "pw-record"),
@@ -321,6 +347,41 @@ mod tests {
         );
         other.running = true;
         assert!(!other.dictating(), "only capture streams count");
+    }
+
+    #[test]
+    fn dictation_between_two_snapshots_is_still_reported() {
+        let mut mon = Monitor::new(true);
+        let t = 10 * SECOND;
+        mon.observe(false, t);
+        let began = mon.changed(true, t + 300 * MILLI);
+        let ended = mon.changed(false, t + 600 * MILLI);
+        assert_eq!(
+            began,
+            [Msg::Dictation {
+                began: true,
+                at_ns: t + 300 * MILLI
+            }]
+        );
+        assert_eq!(
+            ended,
+            [Msg::Dictation {
+                began: false,
+                at_ns: t + 600 * MILLI
+            }]
+        );
+        assert!(mon.changed(false, t + 700 * MILLI).is_empty());
+        // The next snapshot (or a command's sync) sees nothing running, and repeats no edge.
+        assert!(mon.observe(false, t + SECOND).is_empty());
+        assert_eq!(
+            mon.synced(1, t + SECOND),
+            Msg::Synced {
+                id: 1,
+                at_ns: t + SECOND,
+                healthy: true,
+                capturing: false
+            }
+        );
     }
 
     #[test]

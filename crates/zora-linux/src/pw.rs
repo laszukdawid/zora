@@ -1,18 +1,20 @@
 //! Dictation monitor on PipeWire: binds every node, tracks the capture streams (`Stream/Input/Audio`) whose
-//! application properties name a configured dictation app, and reports whether one is running. A core `sync`
-//! round trip is the "complete observation": it confirms every event the server sent before it has arrived.
-//! Everything runs on one PipeWire main loop, including the 1 s timer and the core's `sync` requests.
+//! application properties name a configured dictation app, and reports when one starts or stops running.
+//!
+//! Capture edges are sent as node updates arrive. A snapshot is complete when a core `sync` round trip returns
+//! and every bound node has delivered its first info; until then a round trip is repeated. The first snapshot,
+//! the 1 s heartbeat and every `sync` from the core use that rule. Everything runs on one PipeWire main loop.
 
 use pipewire as pw;
-use pw::node::{Node, NodeListener, NodeState};
+use pw::node::{Node, NodeChangeMask, NodeListener, NodeState};
 use pw::types::ObjectType;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use zora_plugin::clock::now_ns;
-use zora_plugin::dictation::{Monitor, Msg, StreamNode};
+use zora_plugin::clock::{Ns, SECOND, now_ns};
+use zora_plugin::dictation::{APP_KEYS, Monitor, Msg, StreamNode};
 use zora_plugin::proto::Out;
 
 /// From the stdin thread into the loop.
@@ -27,14 +29,25 @@ enum Purpose {
     Sync(u64),
 }
 
+/// A round trip unanswered this long means the server is stuck: reconnect.
+const ROUND_TRIP_LIMIT: Ns = 3 * SECOND;
+/// How long an incomplete snapshot is retried before it counts as no observation.
+const RETRY_WINDOW: Ns = SECOND / 2;
+
 struct Shared {
     monitor: Monitor,
     apps: Vec<String>,
     streams: HashMap<u32, StreamNode>,
-    pending: HashMap<i32, Purpose>,
+    /// Nodes bound (or that failed to bind) whose first info has not arrived; a snapshot is incomplete meanwhile.
+    awaiting: HashSet<u32>,
+    pending: HashMap<i32, (Purpose, Ns)>,
     tick_outstanding: bool,
-    broken: bool,
+    core: Option<pw::core::CoreRc>,
+    /// Set the moment the connection fails; nothing it still delivers counts.
+    broken: Option<String>,
     out: Arc<Out>,
+    /// `zora-dictation watch`: print capture streams instead of judging them.
+    watch: bool,
 }
 
 impl Shared {
@@ -47,10 +60,78 @@ impl Shared {
     fn capturing(&self) -> bool {
         self.streams.values().any(StreamNode::dictating)
     }
+
+    fn request(&mut self, purpose: Purpose, issued: Ns) -> Result<(), String> {
+        let core = self.core.as_ref().ok_or("not connected")?;
+        let seq = core.sync(0).map_err(|e| e.to_string())?;
+        if matches!(purpose, Purpose::Tick) {
+            self.tick_outstanding = true;
+        }
+        self.pending.insert(seq.seq(), (purpose, issued));
+        Ok(())
+    }
+
+    /// The connection can't be trusted any more: health unknown now, and every waiting `sync` answered so.
+    fn fail(&mut self, reason: &str, now: Ns) {
+        if self.broken.is_some() {
+            return;
+        }
+        eprintln!("zora-dictation: {reason}");
+        self.broken = Some(reason.to_string());
+        let mut msgs = self.monitor.lost(reason, now);
+        for (purpose, _) in self.pending.drain().map(|(_, p)| p) {
+            if let Purpose::Sync(id) = purpose {
+                msgs.push(self.monitor.synced(id, now));
+            }
+        }
+        self.tick_outstanding = false;
+        self.send(msgs);
+    }
+
+    fn capture_changed(&mut self, now: Ns) {
+        let capturing = self.capturing();
+        let msgs = self.monitor.changed(capturing, now);
+        self.send(msgs);
+    }
+
+    fn done(&mut self, seq: i32, now: Ns) {
+        if self.broken.is_some() {
+            return;
+        }
+        let Some((purpose, issued)) = self.pending.remove(&seq) else {
+            return;
+        };
+        if !self.awaiting.is_empty() {
+            // Some node's first info is still on its way: ask again for a short while, then count it as no
+            // observation (the stall rule turns that into unknown) and answer a waiting `sync` unhealthy.
+            if now - issued < RETRY_WINDOW {
+                if let Err(e) = self.request(purpose, issued) {
+                    self.fail(&format!("PipeWire round trip failed: {e}"), now);
+                }
+                return;
+            }
+            match purpose {
+                Purpose::Tick => self.tick_outstanding = false,
+                Purpose::Sync(id) => {
+                    let mut msgs = self.monitor.lost("PipeWire nodes without state", now);
+                    msgs.push(self.monitor.synced(id, now));
+                    self.send(msgs);
+                }
+            }
+            return;
+        }
+        let capturing = self.capturing();
+        let mut msgs = self.monitor.observe(capturing, now);
+        match purpose {
+            Purpose::Tick => self.tick_outstanding = false,
+            Purpose::Sync(id) => msgs.push(self.monitor.synced(id, now)),
+        }
+        self.send(msgs);
+    }
 }
 
 struct Conn {
-    core: pw::core::CoreRc,
+    _core: pw::core::CoreRc,
     _registry: pw::registry::RegistryRc,
     _core_listener: pw::core::Listener,
     _registry_listener: pw::registry::Listener,
@@ -58,6 +139,15 @@ struct Conn {
 }
 
 const NOT_RUNNING: &str = "cannot connect to PipeWire (PulseAudio or ALSA alone is not supported)";
+
+fn describe(id: u32, n: &StreamNode) -> String {
+    let props: Vec<String> = APP_KEYS
+        .iter()
+        .filter_map(|k| n.prop(k).map(|v| format!("{k}={v:?}")))
+        .collect();
+    let state = if n.running { "running" } else { "not running" };
+    format!("stream {id} {state}: {}", props.join(" "))
+}
 
 fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Result<Conn, String> {
     let core = context.connect_rc(None).map_err(|e| e.to_string())?;
@@ -68,29 +158,23 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
         let (s1, s2) = (Rc::downgrade(shared), Rc::downgrade(shared));
         core.add_listener_local()
             .done(move |id, seq| {
-                if id != pw::core::PW_ID_CORE {
-                    return;
+                if id == pw::core::PW_ID_CORE
+                    && let Some(shared) = s1.upgrade()
+                {
+                    shared.borrow_mut().done(seq.seq(), now_ns());
                 }
-                let Some(shared) = s1.upgrade() else { return };
-                let mut sh = shared.borrow_mut();
-                let Some(purpose) = sh.pending.remove(&seq.seq()) else {
-                    return;
-                };
-                let now = now_ns();
-                let capturing = sh.capturing();
-                let mut msgs = sh.monitor.observe(capturing, now);
-                match purpose {
-                    Purpose::Tick => sh.tick_outstanding = false,
-                    Purpose::Sync(id) => msgs.push(sh.monitor.synced(id, now)),
-                }
-                sh.send(msgs);
             })
             .error(move |id, _seq, res, message| {
-                eprintln!("zora-dictation: PipeWire error on {id}: {res} {message}");
-                if id == pw::core::PW_ID_CORE
-                    && let Some(shared) = s2.upgrade()
-                {
-                    shared.borrow_mut().broken = true;
+                if id == pw::core::PW_ID_CORE {
+                    if let Some(shared) = s2.upgrade() {
+                        shared.borrow_mut().fail(
+                            &format!("PipeWire connection lost ({res} {message})"),
+                            now_ns(),
+                        );
+                    }
+                } else {
+                    // A node that vanished while being bound; it stays incomplete until its removal arrives.
+                    eprintln!("zora-dictation: PipeWire error on proxy {id}: {res} {message}");
                 }
             })
             .register()
@@ -106,25 +190,43 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                 if obj.type_ != ObjectType::Node {
                     return;
                 }
-                let (Some(reg), Some(nodes)) = (reg.upgrade(), n1.upgrade()) else {
-                    return;
-                };
-                let Ok(node) = reg.bind::<Node, _>(obj) else {
+                let (Some(reg), Some(nodes), Some(shared)) =
+                    (reg.upgrade(), n1.upgrade(), s1.upgrade())
+                else {
                     return;
                 };
                 let id = obj.id;
+                shared.borrow_mut().awaiting.insert(id);
+                let Ok(node) = reg.bind::<Node, _>(obj) else {
+                    eprintln!("zora-dictation: cannot bind node {id}");
+                    return;
+                };
                 let s = s1.clone();
                 let listener = node
                     .add_listener_local()
                     .info(move |info| {
                         let Some(shared) = s.upgrade() else { return };
-                        let mut sh = shared.borrow_mut();
+                        let sh = &mut *shared.borrow_mut();
+                        if sh.broken.is_some() {
+                            return;
+                        }
+                        let first = sh.awaiting.remove(&id);
                         let apps = sh.apps.clone();
                         let entry = sh.streams.entry(id).or_default();
-                        if let Some(props) = info.props() {
-                            entry.update_props(props.iter(), &apps);
+                        let before = (entry.running, entry.prop(APP_KEYS[0]).map(String::from));
+                        if (first || info.change_mask().contains(NodeChangeMask::PROPS))
+                            && let Some(props) = info.props()
+                        {
+                            entry.set_props(props.iter(), &apps);
                         }
                         entry.running = matches!(info.state(), NodeState::Running);
+                        if sh.watch && entry.is_capture() {
+                            let after = (entry.running, entry.prop(APP_KEYS[0]).map(String::from));
+                            if first || before != after {
+                                println!("{}", describe(id, entry));
+                            }
+                        }
+                        sh.capture_changed(now_ns());
                     })
                     .register();
                 nodes.borrow_mut().insert(id, (node, listener));
@@ -134,36 +236,41 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                     nodes.borrow_mut().remove(&id);
                 }
                 if let Some(shared) = s2.upgrade() {
-                    shared.borrow_mut().streams.remove(&id);
+                    let sh = &mut *shared.borrow_mut();
+                    sh.awaiting.remove(&id);
+                    if let Some(n) = sh.streams.remove(&id)
+                        && sh.watch
+                        && n.is_capture()
+                    {
+                        println!("stream {id} removed");
+                    }
+                    if sh.broken.is_none() {
+                        sh.capture_changed(now_ns());
+                    }
                 }
             })
             .register()
     };
 
+    shared.borrow_mut().core = Some(core.clone());
     let conn = Conn {
-        core,
+        _core: core,
         _registry: registry,
         _core_listener: core_listener,
         _registry_listener: registry_listener,
         _nodes: nodes,
     };
-    // The first `done` arrives after every global and the info of every node bound meanwhile.
-    request(&conn, shared, Purpose::Tick)?;
+    shared.borrow_mut().request(Purpose::Tick, now_ns())?;
     Ok(conn)
 }
 
-fn request(conn: &Conn, shared: &Rc<RefCell<Shared>>, purpose: Purpose) -> Result<(), String> {
-    let seq = conn.core.sync(0).map_err(|e| e.to_string())?;
-    let mut sh = shared.borrow_mut();
-    if matches!(purpose, Purpose::Tick) {
-        sh.tick_outstanding = true;
-    }
-    sh.pending.insert(seq.seq(), purpose);
-    Ok(())
-}
-
-/// Runs until `Req::Quit`.
-pub fn run(apps: Vec<String>, out: Arc<Out>, rx: pw::channel::Receiver<Req>) -> Result<(), String> {
+/// Runs until `Req::Quit`. With `watch`, prints every capture stream's identity and state as it changes.
+pub fn run(
+    apps: Vec<String>,
+    out: Arc<Out>,
+    rx: pw::channel::Receiver<Req>,
+    watch: bool,
+) -> Result<(), String> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
     let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
@@ -171,10 +278,13 @@ pub fn run(apps: Vec<String>, out: Arc<Out>, rx: pw::channel::Receiver<Req>) -> 
         monitor: Monitor::new(!apps.is_empty()),
         apps,
         streams: HashMap::new(),
+        awaiting: HashSet::new(),
         pending: HashMap::new(),
         tick_outstanding: false,
-        broken: false,
+        core: None,
+        broken: None,
         out,
+        watch,
     }));
     let conn: Rc<RefCell<Option<Conn>>> = Rc::default();
 
@@ -183,17 +293,17 @@ pub fn run(apps: Vec<String>, out: Arc<Out>, rx: pw::channel::Receiver<Req>) -> 
         move || {
             let now = now_ns();
             let mut c = conn.borrow_mut();
-            if c.is_some() && shared.borrow().broken {
+            if c.is_some() && shared.borrow().broken.is_some() {
                 *c = None;
                 let mut sh = shared.borrow_mut();
+                sh.core = None;
                 sh.streams.clear();
+                sh.awaiting.clear();
                 sh.pending.clear();
                 sh.tick_outstanding = false;
-                sh.broken = false;
-                let msgs = sh.monitor.lost("PipeWire connection lost", now);
-                sh.send(msgs);
             }
             if c.is_none() {
+                shared.borrow_mut().broken = None;
                 match connect(&context, &shared) {
                     Ok(new) => {
                         eprintln!("zora-dictation: connected to PipeWire");
@@ -201,6 +311,7 @@ pub fn run(apps: Vec<String>, out: Arc<Out>, rx: pw::channel::Receiver<Req>) -> 
                     }
                     Err(e) => {
                         let sh = &mut *shared.borrow_mut();
+                        sh.core = None;
                         let msgs = sh.monitor.lost(NOT_RUNNING, now);
                         if !msgs.is_empty() {
                             eprintln!("zora-dictation: {e}");
@@ -214,20 +325,26 @@ pub fn run(apps: Vec<String>, out: Arc<Out>, rx: pw::channel::Receiver<Req>) -> 
     reconnect();
 
     let timer = {
-        let (shared, conn) = (shared.clone(), conn.clone());
+        let shared = shared.clone();
         let reconnect = reconnect.clone();
         mainloop.loop_().add_timer(move |_| {
             reconnect();
-            let outstanding = shared.borrow().tick_outstanding;
-            let failed = match conn.borrow().as_ref() {
-                Some(c) if !outstanding => request(c, &shared, Purpose::Tick).is_err(),
-                _ => false,
-            };
-            if failed {
-                shared.borrow_mut().broken = true;
+            let now = now_ns();
+            let sh = &mut *shared.borrow_mut();
+            if sh
+                .pending
+                .values()
+                .any(|(_, at)| now - at > ROUND_TRIP_LIMIT)
+            {
+                sh.fail("PipeWire stopped answering", now);
+            } else if sh.core.is_some()
+                && sh.broken.is_none()
+                && !sh.tick_outstanding
+                && let Err(e) = sh.request(Purpose::Tick, now)
+            {
+                sh.fail(&format!("PipeWire round trip failed: {e}"), now);
             }
-            let mut sh = shared.borrow_mut();
-            let msgs = sh.monitor.tick(now_ns());
+            let msgs = sh.monitor.tick(now);
             sh.send(msgs);
         })
     };
@@ -237,22 +354,17 @@ pub fn run(apps: Vec<String>, out: Arc<Out>, rx: pw::channel::Receiver<Req>) -> 
         .map_err(|e| e.to_string())?;
 
     let _rx = {
-        let (shared, conn, weak_loop) = (shared.clone(), conn.clone(), mainloop.downgrade());
+        let (shared, weak_loop) = (shared.clone(), mainloop.downgrade());
         rx.attach(mainloop.loop_(), move |req| match req {
             Req::Sync(id) => {
                 let now = now_ns();
-                {
-                    let sh = &mut *shared.borrow_mut();
-                    let msgs = sh.monitor.stall_check(now);
-                    sh.send(msgs);
-                }
-                let ok = conn
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|c| request(c, &shared, Purpose::Sync(id)).is_ok());
+                let sh = &mut *shared.borrow_mut();
+                let msgs = sh.monitor.stall_check(now);
+                sh.send(msgs);
+                let ok = sh.broken.is_none() && sh.request(Purpose::Sync(id), now).is_ok();
                 if !ok {
-                    let sh = &mut *shared.borrow_mut();
-                    let mut msgs = sh.monitor.lost(NOT_RUNNING, now);
+                    let reason = sh.broken.clone().unwrap_or_else(|| NOT_RUNNING.into());
+                    let mut msgs = sh.monitor.lost(&reason, now);
                     msgs.push(sh.monitor.synced(id, now));
                     sh.send(msgs);
                 }
