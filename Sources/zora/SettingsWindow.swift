@@ -120,6 +120,7 @@ final class SettingsModel {
         if workspace != original.workspace {
             change["workspace"] = workspace
             expect["workspace"] = original.workspace
+            expect["harness"] = original.harness
         }
         var phrases: [String: [String]] = [:]
         var oldPhrases: [String: [String]] = [:]

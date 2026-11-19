@@ -81,6 +81,8 @@ struct CoreSettings: Decodable, Sendable {
     var wakeNames: [String]
     var phrases: Phrases
     var workspace: String
+    /// The default harness the workspace belongs to.
+    var harness: String
     var locale: String
     var dictationBundleIDs: [String]
     var problems: [String]
