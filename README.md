@@ -44,6 +44,7 @@ into the transcript and nowhere else.
 | Check mark | Done. The notification shows the agent's answer |
 | Warning triangle | The task failed or was dropped |
 | Crossed-out microphone | Paused. The microphone is off |
+| Gear with a cross | Zora needs setup and isn't listening. The menu says what's wrong, and **Settings…** fixes most of it |
 
 Click the icon for the menu:
 
@@ -149,7 +150,8 @@ review or blocked when the agent finishes. The board's Zora tab also shows recen
 
 | Problem | What to do |
 |---|---|
-| No icon in the menu bar | Run `~/Applications/Zora.app/Contents/MacOS/zorad status`. A config problem is listed there. The log is in `~/Library/Logs/Zora/zora.log`. |
+| The icon is a gear with a cross | Open the menu to see what's wrong. A missing project folder is fixed in **Settings…**. Other config problems are listed by `~/Applications/Zora.app/Contents/MacOS/zorad status`. Zora starts listening again by itself once the config is fixed. |
+| No icon in the menu bar | Zora isn't running. Check `~/Library/Logs/Zora/zora.log`, then run `~/Applications/Zora.app/Contents/MacOS/zora install` again. |
 | The icon never changes when you say "Hey Zora" | Check the icon isn't the crossed-out microphone (paused). Then run `zora status` to check microphone permission and the speech model. |
 | "Hey Zora" is heard, but the task never runs | A dictation app may have been listening at the same time, or the task took longer than three minutes. The notification says why it was dropped. |
 | Your name is often misheard | Add a second, more distinct name in Settings. Zora already accepts common mishearings ("Zara", "Sora" for "Zora"). |

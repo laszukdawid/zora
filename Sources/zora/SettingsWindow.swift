@@ -9,10 +9,11 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var activeObserver: NSObjectProtocol?
 
-    init(cli: ZoradCLI) {
+    init(cli: ZoradCLI, saved: @escaping () -> Void) {
         model = SettingsModel(cli: cli)
         super.init()
         model.close = { [weak self] in self?.window?.close() }
+        model.saved = saved
     }
 
     func show() {
@@ -66,9 +67,10 @@ final class SettingsModel {
     var loaded = false
     var busy = false
     var close: () -> Void = {}
+    var saved: () -> Void = {}
     private let cli: ZoradCLI
     /// What was loaded, so Save sends only what changed here and never undoes an edit made elsewhere meanwhile.
-    private var original: Settings?
+    private var original: CoreSettings?
 
     init(cli: ZoradCLI) { self.cli = cli }
 
@@ -77,13 +79,13 @@ final class SettingsModel {
         busy = true
         defer { busy = false }
         error = nil
-        let r = await cli.run(["settings"])
-        guard r.ok, let s = Self.decode(r.out) else {
+        do {
+            apply(try await cli.settings())
+        } catch {
             loaded = false
-            error = "Couldn't read the settings: \(r.ok ? "unexpected output from zorad" : r.message)"
+            self.error = "Couldn't read the settings: \(error)"
             return
         }
-        apply(s)
         loaded = true
     }
 
@@ -128,23 +130,12 @@ final class SettingsModel {
             error = r.message
             return
         }
-        if let s = Self.decode(r.out) { apply(s) }
+        if let s = CoreSettings.decode(r.out) { apply(s) }
+        saved()
         close()
     }
 
-    private struct Settings: Decodable {
-        struct Phrases: Decodable { var start: [String]; var end: [String]; var cancel: [String] }
-        var wakeNames: [String]
-        var phrases: Phrases
-        var workspace: String
-        var problems: [String]
-    }
-
-    private static func decode(_ out: String) -> Settings? {
-        try? JSONDecoder().decode(Settings.self, from: Data(out.utf8))
-    }
-
-    private func apply(_ s: Settings) {
+    private func apply(_ s: CoreSettings) {
         original = s
         newName = ""
         names = s.wakeNames

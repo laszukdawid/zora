@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import ZoraCore
 import ZoraMac
 import os
 
@@ -37,14 +36,19 @@ final class Bridge: @unchecked Sendable {
 
     // MARK: Lifecycle
 
-    @MainActor
-    func startIndicator() {
+    private var cli: ZoradCLI {
         let args = options.coreArgs
         let config = args.firstIndex(of: "--config").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+        return ZoradCLI(path: options.zorad, configPath: config)
+    }
+
+    @MainActor
+    func startIndicator() {
         indicator = StatusIndicator(
-            cli: ZoradCLI(path: options.zorad, configPath: config),
+            cli: cli,
             pauseMic: { [weak self] in self?.setLocalPause(true) },
-            restoreMic: { [weak self] in self?.setLocalPause(false) }
+            restoreMic: { [weak self] in self?.setLocalPause(false) },
+            settingsSaved: { [weak self] in self?.recheck.signal() }
         )
     }
 
@@ -99,18 +103,57 @@ final class Bridge: @unchecked Sendable {
                 Thread.sleep(forTimeInterval: 10)
                 exit(0)
             }
-            // A clean exit with status 0 outside a stop means the core refused to run (e.g. bad config).
-            let exitedCleanly = (status & 0x7f) == 0 && ((status >> 8) & 0xff) == 0
             coreLost()
-            log.error("zorad exited (status \(status)); restarting")
-            if exitedCleanly && Date().timeIntervalSince(startedAt) < 5 {
-                FileHandle.standardError.write(Data("zora: zorad exited at startup; check `zorad status`\n".utf8))
-                exit(0)
+            let refusedConfig = (status & 0x7f) == 0 && ((status >> 8) & 0xff) == Self.exitConfig
+            if refusedConfig {
+                waitForValidConfig()
+                backoff = 1
+                continue
             }
+            log.error("zorad exited (status \(status)); restarting")
             if Date().timeIntervalSince(startedAt) > 60 { backoff = 1 }
             Thread.sleep(forTimeInterval: backoff)
             backoff = min(backoff * 2, 60)
         }
+    }
+
+    /// `zorad run` exits with EX_CONFIG when the config is invalid.
+    private static let exitConfig: Int32 = 78
+    /// Signalled when Settings saved a change, so a fixed config starts the core at once.
+    private let recheck = DispatchSemaphore(value: 0)
+
+    /// The core refused the config. The app stays in the menu bar showing the problem (Settings can fix most
+    /// problems) and starts the core again once `zorad settings` reports none.
+    private func waitForValidConfig() {
+        log.error("zorad refused the config; waiting for it to be fixed")
+        let cli = self.cli
+        while true {
+            let problems = Self.blocking { () -> [String] in
+                do { return try await cli.settings().problems } catch { return ["\(error)"] }
+            }
+            let stop = lock.withLock { stopping }
+            if stop { exit(0) }
+            if problems.isEmpty { break }
+            Task { @MainActor [weak self] in self?.indicator?.setNeedsSetup(problems) }
+            // Polling also catches fixes made outside Settings, such as a project folder that comes back.
+            _ = recheck.wait(timeout: .now() + 5)
+            while recheck.wait(timeout: .now()) == .success {}
+        }
+        log.info("config is valid again; starting the core")
+        Task { @MainActor [weak self] in self?.indicator?.setNeedsSetup(nil) }
+    }
+
+    /// Runs async work from the supervisor thread.
+    private static func blocking<T: Sendable>(_ work: @escaping @Sendable () async -> T) -> T {
+        let done = DispatchSemaphore(value: 0)
+        let box = OSAllocatedUnfairLock<T?>(initialState: nil)
+        Task {
+            let v = await work()
+            box.withLock { $0 = v }
+            done.signal()
+        }
+        done.wait()
+        return box.withLock { $0! }
     }
 
     private func spawnCore() -> pid_t? {
