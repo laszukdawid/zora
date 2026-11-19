@@ -366,15 +366,18 @@ fn others_in_group(pgid: i32, leader: i32) -> Option<usize> {
             let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
                 continue;
             };
-            let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
-                continue; // exited meanwhile
+            let stat = match std::fs::read(e.path().join("stat")) {
+                Ok(b) => b,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.raw_os_error() == Some(libc::ESRCH) =>
+                {
+                    continue; // exited meanwhile
+                }
+                Err(_) => return None, // can't tell: not proven empty
             };
-            // "pid (comm) state ppid pgrp ...": comm may contain spaces and parentheses.
-            let pgrp = stat
-                .rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().nth(2))
-                .and_then(|s| s.parse::<i32>().ok());
-            if pgrp == Some(pgid) && pid != leader {
+            let pgrp = stat_pgrp(&stat)?;
+            if pgrp == pgid && pid != leader {
                 n += 1;
             }
         }
@@ -385,6 +388,19 @@ fn others_in_group(pgid: i32, leader: i32) -> Option<usize> {
         let _ = (pgid, leader);
         None
     }
+}
+
+/// The process group in a `/proc/<pid>/stat` line ("pid (comm) state ppid pgrp ..."). `comm` may hold spaces,
+/// parentheses and bytes that aren't UTF-8, so the fields are read after the last ')'.
+#[cfg(any(target_os = "linux", test))]
+fn stat_pgrp(stat: &[u8]) -> Option<i32> {
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    std::str::from_utf8(&stat[close + 1..])
+        .ok()?
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
 }
 
 /// Stops the rest of a group whose leader (`pgid`) has exited but is still unreaped, so its id can't have been
@@ -764,6 +780,13 @@ pub fn attached_plugin() -> Result<
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn stat_lines_with_odd_names_still_give_the_group() {
+        assert_eq!(stat_pgrp(b"42 (sh) S 1 4242 4242 0"), Some(4242));
+        assert_eq!(stat_pgrp(b"42 (a) b (\xff\xfe) R 1 77 77 0"), Some(77));
+        assert_eq!(stat_pgrp(b"42 (truncated"), None);
+    }
 
     #[test]
     fn a_leader_that_was_not_seen_exiting_leaves_check_only_cleanup() {
