@@ -368,6 +368,7 @@ final class Bridge: @unchecked Sendable {
             coreListening = nil
             connection += 1
         }
+        Task { @MainActor [weak self] in self?.indicator?.coreStopped() }
         onMic { [weak self] in await self?.applyMic() }
     }
 

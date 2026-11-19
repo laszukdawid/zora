@@ -36,11 +36,16 @@ one. An ad-hoc signature would lose the microphone permission on every rebuild.
 
 ## Releases
 
-Pushing a tag `v<version>` that matches the Cargo workspace version runs `.github/workflows/release.yml`. It
-builds Zora.app, signs it with a Developer ID certificate, notarizes and staples both the app and
-`Zora-<version>.dmg`, and creates a **draft** GitHub release with the dmg and its SHA-256. Check it, then publish.
+Pushing a tag `v<version>` that matches the Cargo workspace version runs `.github/workflows/release.yml`:
 
-The workflow needs these repository secrets, in a `release` environment:
+1. **build** compiles an unsigned Zora.app. It has no secrets.
+2. **sign** runs in the `release` environment, which holds the secrets. It signs the app with the Developer ID
+   certificate, notarizes and staples the app and `Zora-<version>.dmg`, and checks the app inside the dmg with
+   Gatekeeper.
+3. **publish** checks that the tag still points at the built commit, then creates a **draft** GitHub release with
+   the dmg and its SHA-256. Check it, then publish it.
+
+Secrets of the `release` environment:
 
 | Secret | What |
 |---|---|
@@ -48,6 +53,10 @@ The workflow needs these repository secrets, in a `release` environment:
 | `MACOS_CERT_PASSWORD` | The .p12 export password |
 | `NOTARY_KEY` | Contents of an App Store Connect API key (`AuthKey_<id>.p8`) with the Developer role |
 | `NOTARY_KEY_ID`, `NOTARY_ISSUER` | That key's ID and the issuer ID shown on App Store Connect → Users and Access → Integrations |
+
+Anyone who can push a `v*` tag can run the signing job, so keep the secrets behind two repository settings:
+the `release` environment requires your approval (Settings → Environments → release → Required reviewers), and a
+tag ruleset lets only maintainers create, move or delete `v*` tags.
 
 To build a release locally instead, store the notarization credentials once with
 `xcrun notarytool store-credentials zora-notary --key <path.p8> --key-id <id> --issuer <issuer>`, then run

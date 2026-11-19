@@ -357,41 +357,79 @@ fn spawn(cmd: &[String]) -> std::io::Result<tokio::process::Child> {
         .spawn()
 }
 
-/// Forwards plugin stderr (metadata-only by contract) at no more than 4 KiB/s, whole lines only: a plugin may
-/// write one line in several pieces.
+/// Forwards plugin stderr (metadata-only by contract) at no more than 4 KiB/s, in whole lines.
 async fn forward_stderr(id: String, mut err: impl AsyncRead + Unpin) {
     let mut buf = [0u8; 4096];
-    let mut pending: Vec<u8> = Vec::new();
-    let mut budget = 4096usize;
-    let mut window = tokio::time::Instant::now();
+    let mut lines = StderrLines::default();
     loop {
         let n = match err.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        pending.extend_from_slice(&buf[..n]);
-        let complete = match pending.iter().rposition(|&b| b == b'\n') {
-            Some(i) => i + 1,
-            // An overlong line is cut rather than held forever.
-            None if pending.len() >= 4096 => pending.len(),
-            None => continue,
-        };
-        let chunk: Vec<u8> = pending.drain(..complete).collect();
-        if window.elapsed() >= Duration::from_secs(1) {
-            window = tokio::time::Instant::now();
-            budget = 4096;
+        for line in lines.push(&buf[..n], tokio::time::Instant::now().into_std()) {
+            eprintln!("[{id}] {line}");
         }
-        let take = chunk.len().min(budget);
-        budget -= take;
-        print_lines(&id, &chunk[..take]);
     }
-    let take = pending.len().min(budget);
-    print_lines(&id, &pending[..take]);
+    if let Some(line) = lines.finish() {
+        eprintln!("[{id}] {line}");
+    }
 }
 
-fn print_lines(id: &str, bytes: &[u8]) {
-    for line in String::from_utf8_lossy(bytes).lines() {
-        eprintln!("[{id}] {line}");
+/// Splits a byte stream into lines, however the writes were cut. A line over `MAX_STDERR_LINE` is cut there and the
+/// rest of it dropped; lines beyond the per-second budget are dropped whole.
+#[derive(Default)]
+struct StderrLines {
+    pending: Vec<u8>,
+    /// Inside an overlong line, dropping bytes until its newline.
+    skipping: bool,
+    budget: usize,
+    window: Option<std::time::Instant>,
+}
+
+const MAX_STDERR_LINE: usize = 1024;
+const BUDGET_PER_SECOND: usize = 4096;
+
+impl StderrLines {
+    fn push(&mut self, bytes: &[u8], now: std::time::Instant) -> Vec<String> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            if b == b'\n' {
+                if !std::mem::take(&mut self.skipping) {
+                    self.emit(now, &mut out);
+                }
+            } else if !self.skipping {
+                self.pending.push(b);
+                if self.pending.len() >= MAX_STDERR_LINE {
+                    self.emit(now, &mut out);
+                    self.skipping = true;
+                }
+            }
+        }
+        out
+    }
+
+    /// A last line without a newline.
+    fn finish(&mut self) -> Option<String> {
+        let mut out = Vec::new();
+        if !self.pending.is_empty() {
+            self.emit(std::time::Instant::now(), &mut out);
+        }
+        out.pop()
+    }
+
+    fn emit(&mut self, now: std::time::Instant, out: &mut Vec<String>) {
+        let line = std::mem::take(&mut self.pending);
+        if self
+            .window
+            .is_none_or(|w| now.duration_since(w) >= Duration::from_secs(1))
+        {
+            self.window = Some(now);
+            self.budget = BUDGET_PER_SECOND;
+        }
+        if line.len() <= self.budget {
+            self.budget -= line.len();
+            out.push(String::from_utf8_lossy(&line).into_owned());
+        }
     }
 }
 
@@ -828,5 +866,54 @@ async fn connected(
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn a_line_written_in_pieces_comes_out_whole() {
+        let mut l = StderrLines::default();
+        let t = Instant::now();
+        assert!(l.push(b"notify kind=", t).is_empty());
+        assert_eq!(
+            l.push(b"jobSucceeded\nnext", t),
+            vec!["notify kind=jobSucceeded"]
+        );
+        assert_eq!(l.finish().as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn utf8_split_across_writes_survives() {
+        let mut l = StderrLines::default();
+        let t = Instant::now();
+        let s = "zażółć\n".as_bytes();
+        assert!(l.push(&s[..3], t).is_empty());
+        assert_eq!(l.push(&s[3..], t), vec!["zażółć"]);
+    }
+
+    #[test]
+    fn an_overlong_line_is_cut_once_and_its_rest_dropped() {
+        let mut l = StderrLines::default();
+        let t = Instant::now();
+        let long = vec![b'a'; MAX_STDERR_LINE * 3];
+        let out = l.push(&long, t);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), MAX_STDERR_LINE);
+        assert_eq!(l.push(b"aaa\nok\n", t), vec!["ok"]);
+    }
+
+    #[test]
+    fn lines_over_the_budget_are_dropped_whole_until_the_next_second() {
+        let mut l = StderrLines::default();
+        let t = Instant::now();
+        let line = [vec![b'x'; 999], vec![b'\n']].concat();
+        let out = l.push(&line.repeat(5), t);
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|s| s.len() == 999));
+        assert_eq!(l.push(&line, t + Duration::from_secs(1)).len(), 1);
     }
 }

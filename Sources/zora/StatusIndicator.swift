@@ -117,6 +117,15 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         render()
     }
 
+    /// The core is gone (exited, restarting): until a new one reports, the menu says it is starting rather than
+    /// claiming to listen.
+    func coreStopped() {
+        guard listening != nil else { return }
+        listening = nil
+        pausedUntil = nil
+        render()
+    }
+
     /// The core refused the config (`problems`), or accepts it again (nil). While refused, the menu lists the
     /// problems and offers Settings; pausing makes no sense without a core.
     func setNeedsSetup(_ problems: [String]?) {
@@ -266,6 +275,9 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         if setupProblems != nil {
             symbol = "gear.badge.xmark"
             label = "Zora needs setup: it isn't listening"
+        } else if listening == nil && state == .idle {
+            symbol = "ellipsis"
+            label = "Zora: starting…"
         } else if paused && state == .idle {
             symbol = "mic.slash"
             label = pausedUntil.map { "Zora: paused until \($0.formatted(date: .omitted, time: .shortened))" }
