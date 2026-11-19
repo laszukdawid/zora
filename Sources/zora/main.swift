@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import ZoraCore
 import ZoraMac
 
 struct CLIError: Error, CustomStringConvertible {
@@ -24,21 +23,6 @@ usage: zora <command> [options]
 """
 
 func stderr(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
-
-func loadConfig(_ path: String?, createIfMissing: Bool) throws -> ZoraConfig {
-    let url = path.map { URL(fileURLWithPath: expandTilde($0)) } ?? ZoraConfig.defaultURL
-    if !FileManager.default.fileExists(atPath: url.path) {
-        guard createIfMissing else { return ZoraConfig() }
-        try ZoraConfig().write(to: url)
-        stderr("wrote default config to \(url.path); set harnesses.claude.workspace before running without --dry-run")
-    }
-    do { return try ZoraConfig.load(from: url) } catch { throw CLIError("cannot read \(url.path): \(error)") }
-}
-
-func parseDuration(_ s: String) -> Double? {
-    guard let unit = s.last, let n = Double(s.dropLast()) else { return Double(s) }
-    switch unit { case "s": return n; case "m": return n * 60; case "h": return n * 3600; default: return Double(s) }
-}
 
 /// Runs `body` on the main run loop (needed for notifications and NSWorkspace) and exits with its result.
 func runMain(_ body: @escaping () async throws -> Int32) -> Never {
@@ -66,6 +50,9 @@ func zoradPath() -> String {
     if let p = ProcessInfo.processInfo.environment["ZORA_ZORAD_PATH"] { return p }
     return Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/zorad").path
 }
+
+/// The config is read and validated by the core, the same way for the CLI, the menu bar and `zorad run`.
+var core: ZoradCLI { ZoradCLI(path: zoradPath(), configPath: configPath) }
 
 switch command {
 case "run":
@@ -104,18 +91,18 @@ case "run":
 
 case "setup":
     runMain {
-        var config = try loadConfig(configPath, createIfMissing: true)
+        var settings = try await core.settings()
         print("microphone:", await Microphone.request() ? "granted" : "denied")
         let mac = MacNotifier()
         print("notifications:", mac.isAvailable ? (await mac.requestAuthorization() ? "authorized" : "denied") : "unavailable (run from Zora.app)")
-        print("speech model for \(config.locale): installing if needed…")
-        let locale = try await SpeechPipeline.installAssets(for: Locale(identifier: config.locale)) { p in
+        print("speech model for \(settings.locale): installing if needed…")
+        let locale = try await SpeechPipeline.installAssets(for: Locale(identifier: settings.locale)) { p in
             FileHandle.standardError.write(Data(String(format: "\r  %3.0f%%", p * 100).utf8))
         }
         print("\nspeech model: installed (\(locale.identifier))")
         var dir: String?
         if let i = rest.firstIndex(of: "--project"), i + 1 < rest.count { dir = rest[i + 1] }
-        if dir != nil || config.validate().contains(where: { $0.contains("workspace") }) {
+        if dir != nil || settings.problems.contains(where: { $0.contains("workspace") }) {
             if dir == nil, isatty(STDIN_FILENO) != 0 {
                 print("Project folder for your coding agent (it runs there and can change files): ", terminator: "")
                 dir = readLine()?.trimmingCharacters(in: .whitespaces)
@@ -124,15 +111,14 @@ case "setup":
                 let path = URL(fileURLWithPath: expandTilde(dir)).standardizedFileURL.path
                 let change = String(decoding: try JSONSerialization.data(withJSONObject: ["workspace": path]), as: UTF8.self)
                 // Saved through the core, which validates it the same way the menu bar's Settings does.
-                let r = await ZoradCLI(path: zoradPath(), configPath: configPath).run(["settings", "set", change])
+                let r = await core.run(["settings", "set", change])
                 guard r.ok else { print("project folder:", r.message); return 1 }
                 print("project folder:", path)
-                config = try loadConfig(configPath, createIfMissing: false)
+                settings = try await core.settings()
             }
         }
-        let problems = config.validate()
-        problems.forEach { print("config:", $0) }
-        return problems.isEmpty ? 0 : 1
+        settings.problems.forEach { print("config:", $0) }
+        return settings.problems.isEmpty ? 0 : 1
     }
 
 case "install":
@@ -151,15 +137,22 @@ case "uninstall":
 
 case "status":
     runMain {
-        let config = try loadConfig(configPath, createIfMissing: false)
+        // Everything except the speech model and dictation apps works without the core.
+        let settings: CoreSettings?
+        do { settings = try await core.settings() } catch {
+            settings = nil
+            print("config: cannot read it through zorad: \(error)")
+        }
         print("bundle:", Bundle.main.bundleIdentifier ?? "none (not running from Zora.app)")
         print("core:", FileManager.default.isExecutableFile(atPath: zoradPath()) ? zoradPath() : "missing")
         print("microphone:", Microphone.status)
         print("notifications:", await MacNotifier().authorizationDescription())
-        let (locale, asset) = await SpeechPipeline.assetStatus(for: Locale(identifier: config.locale))
-        print("speech model:", locale?.identifier ?? "unsupported locale \(config.locale)", "\(asset)")
         print("login item:", LoginItem.status)
-        if let snap = CoreAudioDictationMonitor.snapshot(bundleIDs: config.dictation.bundleIDs) {
+        guard let settings else { return 1 }
+        let (locale, asset) = await SpeechPipeline.assetStatus(for: Locale(identifier: settings.locale))
+        print("speech model:", locale?.identifier ?? "unsupported locale \(settings.locale)", "\(asset)")
+        print("config:", settings.problems.isEmpty ? "ok" : settings.problems.joined(separator: "; "))
+        if let snap = CoreAudioDictationMonitor.snapshot(bundleIDs: settings.dictationBundleIDs) {
             print("dictation apps:", snap.isEmpty ? "none running" : snap.map { "\($0.bundleID) pid \($0.pid) capturing=\($0.capturing)" }.joined(separator: ", "))
         } else {
             print("dictation apps: cannot read CoreAudio process list")

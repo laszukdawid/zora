@@ -12,7 +12,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, LinesCodec};
-use zora_core::harness::{HarnessResult, HarnessSpec, resolve_executable};
+use zora_core::config::PATH_SEPARATOR;
+use zora_core::harness::{HarnessResult, HarnessSpec, resolve_command};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JobEvent {
@@ -253,17 +254,14 @@ impl JobManager {
                 true,
             );
         }
-        let Some(exe) = resolve_executable(&job.spec.executable, &self.search_path) else {
-            return (
-                fail(format!("{} not found on PATH", job.spec.executable)),
-                true,
-            );
+        let mut argv = match resolve_command(&job.spec.executable, &self.search_path) {
+            Ok(argv) => argv,
+            Err(e) => return (fail(e), true),
         };
         let mut env: Vec<(String, String)> =
             std::env::vars().filter(|(k, _)| k != "PATH").collect();
-        env.push(("PATH".into(), self.search_path.join(":")));
+        env.push(("PATH".into(), self.search_path.join(PATH_SEPARATOR)));
         env.extend(job.spec.env.iter().cloned());
-        let mut argv = vec![exe];
         argv.extend(job.spec.argv(&job.prompt));
         let spec = JobSpec {
             argv,
@@ -271,17 +269,21 @@ impl JobManager {
             env,
             capture_limit: 64 * 1024,
             kill_grace_ms: self.kill_grace.as_millis() as u64,
+            name: job.id.clone(),
+            cancel_marker: cancel_marker(&job.id)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         };
 
         let exe_self = std::env::current_exe().unwrap_or_else(|_| "zorad".into());
-        let mut child = match Command::new(exe_self)
+        let mut guard = Command::new(exe_self);
+        guard
             .arg("__guard")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .process_group(0)
-            .spawn()
-        {
+            .stderr(Stdio::inherit());
+        os::detach(&mut guard);
+        let mut child = match guard.spawn() {
             Ok(c) => c,
             Err(e) => return (fail(format!("cannot start job guard: {e}")), true),
         };
@@ -296,8 +298,17 @@ impl JobManager {
         let mut registration: Option<(i32, i64)> = None;
         let mut exited: Option<GuardMsg> = None;
         let mut cleaned: Option<bool> = None;
+        let mut failed: Option<String> = None;
         let mut timed_out = false;
         let mut cancel_sent = false;
+        // A cancel was asked for (by voice, the core, or `zorad jobs cancel`), apart from timeouts and shutdown.
+        let mut cancel_asked = false;
+        // Once the guard has been told to stop (Cancel or EOF), it gets a bounded time to report `cleaned`.
+        let stop_limit = self.kill_grace + Duration::from_secs(10);
+        let mut give_up: Option<tokio::time::Instant> = None;
+        // `zorad jobs cancel` is observed here too, so a guard that never reacts still gets the bounded deadline.
+        let marker = cancel_marker(&job.id).unwrap_or_default();
+        let mut request_check = tokio::time::interval(Duration::from_millis(500));
         loop {
             tokio::select! {
                 line = lines.next() => {
@@ -310,13 +321,19 @@ impl JobManager {
                                 .store
                                 .call(move |s| s.set_job_owner(&id, &boot, guard_pid as i64, guard_start, pgid as i64, gate_start))
                                 .await;
-                            // Shutdown, cancellation or the deadline may have arrived during the durable write.
-                            let cancelled = self.lock().closed || cancel.try_recv().is_ok() || tokio::time::Instant::now() >= deadline;
+                            pause_after_owner_for_tests().await;
+                            // Shutdown, cancellation or the deadline may have arrived during the durable write. A
+                            // cancel taken here is recorded before the guard is told, so the outcome says so.
+                            if cancel.try_recv().is_ok() {
+                                cancel_asked = true;
+                            }
+                            let cancelled = cancel_asked || self.lock().closed || tokio::time::Instant::now() >= deadline;
                             if cancelled {
                                 // The gate never gets "go": EOF makes the guard kill it, and nothing executes.
                                 registration = Some((pgid, gate_start));
                                 cancel_sent = true;
                                 stdin = None;
+                                give_up = Some(tokio::time::Instant::now() + stop_limit);
                             } else if matches!(stored, Some(Ok(()))) {
                                 registration = Some((pgid, gate_start));
                                 let id = job.id.clone();
@@ -325,22 +342,41 @@ impl JobManager {
                             } else {
                                 // Without durable ownership nothing may execute: EOF makes the guard kill the gate.
                                 stdin = None;
+                                give_up = Some(tokio::time::Instant::now() + stop_limit);
                             }
                         }
                         Ok(m @ GuardMsg::Exited { .. }) => exited = Some(m),
                         Ok(GuardMsg::Cleaned { ok }) => { cleaned = Some(ok); break; }
-                        Ok(GuardMsg::Failed { error }) => { let _ = child.wait().await; return (fail(error), true); }
+                        Ok(GuardMsg::Failed { error }) => failed = Some(error),
+                        Ok(GuardMsg::Cancelling) => {
+                            cancel_asked = true;
+                            cancel_sent = true;
+                            give_up.get_or_insert(tokio::time::Instant::now() + stop_limit);
+                        }
                         Err(_) => {}
                     }
                 }
                 _ = tokio::time::sleep_until(deadline), if !cancel_sent => {
                     timed_out = true;
                     cancel_sent = true;
+                    give_up = Some(tokio::time::Instant::now() + stop_limit);
                     send_guard(&mut stdin, CoreMsg::Cancel).await;
                 }
                 Some(()) = cancel.recv(), if !cancel_sent => {
+                    cancel_asked = true;
                     cancel_sent = true;
+                    give_up = Some(tokio::time::Instant::now() + stop_limit);
                     send_guard(&mut stdin, CoreMsg::Cancel).await;
+                }
+                // A guard that never reports is handled below: killed, and its job cleaned only with verified identity.
+                _ = tokio::time::sleep_until(give_up.unwrap_or(deadline)), if give_up.is_some() => break,
+                _ = request_check.tick(), if !cancel_sent && registration.is_some() => {
+                    if os::cancel_requested(&job.id, &marker) {
+                        cancel_asked = true;
+                        cancel_sent = true;
+                        give_up = Some(tokio::time::Instant::now() + stop_limit);
+                        send_guard(&mut stdin, CoreMsg::Cancel).await;
+                    }
                 }
             }
         }
@@ -354,10 +390,9 @@ impl JobManager {
             .is_err()
         {
             if let Some(gp) = guard_pid {
-                os::signal_group(gp, libc::SIGKILL);
+                os::kill_detached(gp);
             }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.kill()).await;
         }
 
         let cleanup_ok = match (cleaned, registration) {
@@ -365,8 +400,9 @@ impl JobManager {
             (None, None) => true, // never registered, so nothing ran
             (None, Some((pgid, gate_start))) => {
                 // The guard died without reporting; clean up only with verified identity.
+                let id = job.id.clone();
                 tokio::task::spawn_blocking(move || {
-                    verified_cleanup(pgid, gate_start, Duration::from_secs(5))
+                    os::reap_job(&id, pgid, gate_start, Duration::from_secs(5))
                 })
                 .await
                 .unwrap_or(false)
@@ -385,7 +421,11 @@ impl JobManager {
             let _ = self.events.send(JobEvent::AdmissionClosed { reason });
         }
 
+        if cleanup_ok {
+            remove_cancel_marker(&job.id);
+        }
         let result = match exited {
+            _ if failed.is_some() => fail(failed.unwrap_or_default()),
             _ if timed_out => fail(format!("timed out after {}s", self.timeout.as_secs())),
             Some(GuardMsg::Exited {
                 cancelled: true, ..
@@ -399,9 +439,44 @@ impl JobManager {
             Some(GuardMsg::Exited {
                 signal: Some(sig), ..
             }) => fail(format!("killed by signal {sig}")),
+            // The guard never reported, but the cancel it was given is done and verified.
+            _ if cancel_asked && cleanup_ok => fail("cancelled".into()),
             _ => fail("job guard ended unexpectedly".into()),
         };
         (result, cleanup_ok)
+    }
+}
+
+/// Tests only: widens the window between the durable ownership write and Go.
+async fn pause_after_owner_for_tests() {
+    if let Some(ms) = std::env::var("ZORA_TEST_PAUSE_AFTER_OWNER_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+
+fn cancel_dir() -> std::path::PathBuf {
+    crate::service::database_path().with_file_name("cancel")
+}
+
+/// The file `zorad jobs cancel` creates to ask a Unix guard to cancel job `id` (Windows uses a named event).
+pub fn cancel_marker(id: &str) -> Option<std::path::PathBuf> {
+    marker_name(id).then(|| cancel_dir().join(id))
+}
+
+/// Whether `id` can name a cancel marker: letters, digits, `-` and `_` only.
+pub fn marker_name(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+pub fn remove_cancel_marker(id: &str) {
+    if let Some(p) = cancel_marker(id) {
+        let _ = std::fs::remove_file(p);
     }
 }
 
@@ -413,36 +488,37 @@ async fn send_guard(stdin: &mut Option<ChildStdin>, msg: CoreMsg) {
     }
 }
 
-/// Cleans a job group only when its leader is provably ours (same pid and start time). Blocking.
-pub fn verified_cleanup(pgid: i32, gate_start: i64, grace: Duration) -> bool {
-    if os::group_empty(pgid) {
-        return true;
-    }
-    if os::start_time(pgid) == Some(gate_start) {
-        return os::reap_group_blocking(pgid, grace);
-    }
-    false
-}
-
 /// Startup recovery for jobs a previous core left behind. Err means admission must stay closed.
 pub async fn recover(store: &StoreHandle) -> Result<usize, String> {
     let jobs = store
         .call(|s| s.non_final_jobs())
         .await
         .ok_or("store unavailable")??;
-    let boot = os::boot_id();
+    os::prune_cancel_markers(&cancel_dir(), &jobs.iter().map(|j| j.id.clone()).collect());
     let mut recovered = 0;
     for job in jobs {
         let id = job.id.clone();
         let mark = |status: &'static str| {
+            if status == "interrupted" {
+                remove_cancel_marker(&id);
+            }
             let id = id.clone();
             store.send_critical(move |s| s.set_status(&id, status));
         };
-        // A different boot means none of the recorded processes can still exist: no signals, no manual check.
-        if job.boot_id.as_deref().is_some_and(|b| b != boot) {
-            mark("interrupted");
-            recovered += 1;
-            continue;
+        match os::owner(job.boot_id.as_deref()) {
+            // A different boot means none of the recorded processes can still exist: no signals, no manual check.
+            os::Owner::OtherBoot => {
+                mark("interrupted");
+                recovered += 1;
+                continue;
+            }
+            // Not visible from here, so not provably gone: admission stays closed.
+            os::Owner::Elsewhere(why) => {
+                return Err(format!(
+                    "job {id} {why}; check it, then run `zora jobs clear {id}`"
+                ));
+            }
+            os::Owner::Here => {}
         }
         if job.status == "ambiguous" {
             return Err(format!(
@@ -459,12 +535,15 @@ pub async fn recover(store: &StoreHandle) -> Result<usize, String> {
         }
         let ok = match (job.job_pgid, job.gate_start) {
             (None, _) => true,
-            (Some(pgid), Some(gate_start)) => tokio::task::spawn_blocking(move || {
-                verified_cleanup(pgid as i32, gate_start, Duration::from_secs(5))
-            })
-            .await
-            .unwrap_or(false),
-            (Some(pgid), None) => os::group_empty(pgid as i32),
+            (Some(pgid), Some(gate_start)) => {
+                let id = id.clone();
+                tokio::task::spawn_blocking(move || {
+                    os::reap_job(&id, pgid as i32, gate_start, Duration::from_secs(5))
+                })
+                .await
+                .unwrap_or(false)
+            }
+            (Some(pgid), None) => os::job_gone(&id, pgid as i32),
         };
         if ok {
             mark("interrupted");

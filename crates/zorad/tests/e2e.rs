@@ -23,7 +23,9 @@ impl Env {
     }
 
     fn db(&self) -> PathBuf {
-        if cfg!(target_os = "macos") {
+        if cfg!(windows) {
+            self.home.join("AppData/Local/Zora/zora.sqlite")
+        } else if cfg!(target_os = "macos") {
             self.home
                 .join("Library/Application Support/Zora/zora.sqlite")
         } else {
@@ -31,22 +33,34 @@ impl Env {
         }
     }
 
-    fn config(&self, steps: Value, harness_script: &str) -> PathBuf {
-        self.config_with(steps, harness_script, json!({}))
+    /// `zorad` with this test's home (and on Windows its profile folders).
+    fn cmd(&self) -> Command {
+        let mut c = Command::new(ZORAD);
+        c.env("HOME", &self.home).env_remove("XDG_STATE_HOME");
+        #[cfg(windows)]
+        c.env("USERPROFILE", &self.home)
+            .env("APPDATA", self.home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", self.home.join("AppData/Local"));
+        c
     }
 
-    fn config_with(&self, steps: Value, harness_script: &str, extra_plugin: Value) -> PathBuf {
+    fn config(&self, steps: Value, harness: Script) -> PathBuf {
+        self.config_with(steps, harness, json!({}))
+    }
+
+    fn config_with(&self, steps: Value, harness: Script, extra_plugin: Value) -> PathBuf {
         let mut plugin_cfg =
             json!({"capabilities": ["transcript", "dictation", "notify"], "steps": steps});
         if let (Some(p), Some(e)) = (plugin_cfg.as_object_mut(), extra_plugin.as_object()) {
             p.extend(e.clone());
         }
+        let (executable, args) = harness.command();
         let cfg = json!({
             "capture": {"holdBackSeconds": 0.3},
             "dictation": {"monitor": "plugin"},
             "defaultHarness": "sh",
-            "harnesses": {"sh": {"type": "argv", "workspace": self.home.join("ws"), "executable": "/bin/sh",
-                                 "args": ["-c", harness_script, "zora", "{prompt}"]}},
+            "harnesses": {"sh": {"type": "argv", "workspace": self.home.join("ws"), "executable": executable,
+                                 "args": args}},
             "notifications": {"log": ["*"], "script": ["*"]},
             "plugins": {"script": {"command": [PLUGIN], "config": plugin_cfg}}
         });
@@ -56,15 +70,18 @@ impl Env {
     }
 
     fn start(&self, config: &Path) -> Child {
-        Command::new(ZORAD)
-            .args(["run", "--config"])
+        self.start_with(config, &[])
+    }
+
+    fn start_with(&self, config: &Path, vars: &[(&str, &str)]) -> Child {
+        let mut c = self.cmd();
+        c.envs(vars.iter().copied());
+        c.args(["run", "--config"])
             .arg(config)
-            .env("HOME", &self.home)
-            .env_remove("XDG_STATE_HOME")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
+            .stderr(Stdio::piped());
+        sys::own_group(&mut c);
+        c.spawn().unwrap()
     }
 
     fn commands(&self) -> Vec<(String, String, String, Option<String>)> {
@@ -97,13 +114,145 @@ fn wait_for<T>(limit: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
     None
 }
 
-fn alive(pid: i32) -> bool {
-    // SAFETY: existence check only.
-    unsafe { libc::kill(pid, 0) == 0 }
+/// A harness job: a shell script on Unix; on Windows the arguments of `zora-test-harness` (src/bin/test_harness.rs).
+struct Script {
+    sh: String,
+    win: Vec<String>,
 }
 
+fn sh(script: &str, win: &[&str]) -> Script {
+    Script {
+        sh: script.into(),
+        win: win.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+impl Script {
+    /// The harness `executable` and `args`; the prompt is the script's `$1`, and the helper's last argument.
+    fn command(self) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            let mut args = self.win;
+            args.push("{prompt}".into());
+            (env!("CARGO_BIN_EXE_zora-test-harness").into(), args)
+        } else {
+            let args = ["-c", &self.sh, "zora", "{prompt}"].map(String::from);
+            ("/bin/sh".into(), args.to_vec())
+        }
+    }
+}
+
+#[cfg(unix)]
+mod sys {
+    pub fn alive(pid: i32) -> bool {
+        // SAFETY: existence check only.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    pub fn kill(pid: i32) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    pub fn own_group(_cmd: &mut std::process::Command) {}
+
+    /// SIGTERM.
+    pub fn stop(pid: u32) {
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+
+    pub fn describe(s: std::process::ExitStatus) -> String {
+        use std::os::unix::process::ExitStatusExt;
+        format!("code={:?} signal={:?}", s.code(), s.signal())
+    }
+
+    /// What `zorad jobs cancel` does to a guard: creates its cancel marker.
+    pub fn request_cancel(_name: &str, marker: &std::path::Path) {
+        std::fs::write(marker, b"").unwrap();
+    }
+}
+
+#[cfg(windows)]
+mod sys {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Console::{
+        AllocConsole, CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, GetExitCodeProcess, OpenProcess,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    };
+
+    pub fn alive(pid: i32) -> bool {
+        // SAFETY: plain query on a handle closed below.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+            if h.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            CloseHandle(h);
+            ok && code == STILL_ACTIVE as u32
+        }
+    }
+
+    pub fn kill(pid: i32) {
+        // SAFETY: terminate a process by pid; the handle is closed below.
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+            if !h.is_null() {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
+    }
+
+    unsafe extern "system" fn ignore_break(event: u32) -> i32 {
+        (event == CTRL_BREAK_EVENT) as i32
+    }
+
+    /// zorad gets its own console process group, so Ctrl+Break reaches it and not the test runner.
+    pub fn own_group(cmd: &mut std::process::Command) {
+        static CONSOLE: std::sync::Once = std::sync::Once::new();
+        // SAFETY: AllocConsole fails harmlessly when a console exists; the handler only returns a value.
+        CONSOLE.call_once(|| unsafe {
+            AllocConsole();
+            SetConsoleCtrlHandler(Some(ignore_break), 1);
+        });
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
+    /// Ctrl+Break, the Windows counterpart of SIGTERM for a console program.
+    pub fn stop(pid: u32) {
+        // SAFETY: no pointers involved.
+        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) };
+    }
+
+    pub fn describe(s: std::process::ExitStatus) -> String {
+        format!("code={:?}", s.code())
+    }
+
+    /// What `zorad jobs cancel` does to a guard: sets its named cancel event.
+    pub fn request_cancel(name: &str, _marker: &std::path::Path) {
+        use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+        let wide: Vec<u16> = format!("Local\\zora-cancel-{name}")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: NUL-terminated name; the handle is checked and closed.
+        unsafe {
+            let h = OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr());
+            assert!(!h.is_null(), "no cancel event for {name}");
+            SetEvent(h);
+            CloseHandle(h);
+        }
+    }
+}
+
+use sys::alive;
+
 fn term_and_collect(mut child: Child) -> (Option<i32>, String) {
-    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    sys::stop(child.id());
     let status = wait_for(Duration::from_secs(15), || child.try_wait().ok().flatten());
     if status.is_none() {
         let _ = child.kill();
@@ -113,14 +262,9 @@ fn term_and_collect(mut child: Child) -> (Option<i32>, String) {
         let _ = e.read_to_string(&mut err);
     }
     // Keep the raw outcome in the log so an intermittent failure can be told apart (timeout vs signal vs code).
-    use std::os::unix::process::ExitStatusExt;
     match status {
         None => err.push_str("\n[test] zorad did not exit within 15 s after SIGTERM; killed\n"),
-        Some(s) => err.push_str(&format!(
-            "\n[test] zorad exit: code={:?} signal={:?}\n",
-            s.code(),
-            s.signal()
-        )),
+        Some(s) => err.push_str(&format!("\n[test] zorad exit: {}\n", sys::describe(s))),
     }
     (status.and_then(|s| s.code()), err)
 }
@@ -131,7 +275,7 @@ fn spoken_command_runs_and_service_stops_cleanly() {
     // Coverage starts at the first healthy heartbeat; speak after it plus pad + 1 s.
     let cfg = env.config(
         json!([{"delayMs": 3500, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 800}]),
-        "echo \"ran: $1\"",
+        sh("echo \"ran: $1\"", &["ran"]),
     );
     let child = env.start(&cfg);
     let done = wait_for(Duration::from_secs(20), || {
@@ -159,10 +303,9 @@ fn spoken_command_runs_and_service_stops_cleanly() {
 
 impl Env {
     fn zorad(&self, args: &[&str]) {
-        let ok = Command::new(ZORAD)
+        let ok = self
+            .cmd()
             .args(args)
-            .env("HOME", &self.home)
-            .env_remove("XDG_STATE_HOME")
             .stdout(Stdio::null())
             .status()
             .unwrap()
@@ -180,7 +323,7 @@ fn nothing_is_heard_while_paused_and_resume_listens_again() {
             {"delayMs": 3500, "say": "Hey Zora, secret. Do it, Zora.", "durMs": 300},
             {"delayMs": 5500, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 300}
         ]),
-        "echo \"ran: $1\"",
+        sh("echo \"ran: $1\"", &["ran"]),
     );
     let child = env.start(&cfg);
     // Resume between the two sentences.
@@ -219,7 +362,7 @@ fn dictated_command_never_runs() {
     let env = Env::new();
     let cfg = env.config(
         json!([{"delayMs": 3500, "began": true}, {"delayMs": 300, "say": "Hey Zora delete it. Do it Zora.", "durMs": 200}, {"delayMs": 300, "ended": true}]),
-        "echo ran",
+        sh("echo ran", &["print", "ran"]),
     );
     let child = env.start(&cfg);
     std::thread::sleep(Duration::from_secs(7));
@@ -238,11 +381,14 @@ fn dictated_command_never_runs() {
     );
 }
 
-fn stubborn_job(pidfile: &Path) -> String {
+fn stubborn_job(pidfile: &Path) -> Script {
     // The leader spawns a TERM-ignoring descendant that records its own pid, then waits.
-    format!(
-        "(trap '' TERM; exec >/dev/null 2>&1; sh -c 'echo $PPID' > {}; exec sleep 120) & trap '' TERM; sleep 120",
-        pidfile.display()
+    let path = pidfile.display().to_string();
+    sh(
+        &format!(
+            "(trap '' TERM; exec >/dev/null 2>&1; sh -c 'echo $PPID' > {path}; exec sleep 120) & trap '' TERM; sleep 120"
+        ),
+        &["stubborn", &path],
     )
 }
 
@@ -252,7 +398,7 @@ fn sigkill_of_core_mid_job_kills_the_job_and_restart_recovers() {
     let pidfile = env.home.join("descendant.pid");
     let cfg = env.config(
         json!([{"delayMs": 3500, "say": "Hey Zora long job. Do it Zora.", "durMs": 800}]),
-        &stubborn_job(&pidfile),
+        stubborn_job(&pidfile),
     );
     let mut child = env.start(&cfg);
     let pid: i32 = wait_for(Duration::from_secs(20), || {
@@ -268,7 +414,7 @@ fn sigkill_of_core_mid_job_kills_the_job_and_restart_recovers() {
         "descendant {pid} survived the core"
     );
 
-    let restarted = env.start(&env.config(json!([]), "echo ok"));
+    let restarted = env.start(&env.config(json!([]), sh("echo ok", &["print", "ok"])));
     let recovered = wait_for(Duration::from_secs(15), || {
         env.jobs().is_empty().then_some(())
     });
@@ -291,7 +437,7 @@ fn guard_killed_mid_job_is_cleaned_by_the_core() {
     let pidfile = env.home.join("descendant.pid");
     let cfg = env.config(
         json!([{"delayMs": 3500, "say": "Hey Zora long job. Do it Zora.", "durMs": 800}]),
-        &stubborn_job(&pidfile),
+        stubborn_job(&pidfile),
     );
     let child = env.start(&cfg);
     let pid: i32 = wait_for(Duration::from_secs(20), || {
@@ -300,7 +446,7 @@ fn guard_killed_mid_job_is_cleaned_by_the_core() {
     .expect("job never started");
     let guard = wait_for(Duration::from_secs(5), || env.jobs().first()?.guard_pid)
         .expect("guard not recorded") as i32;
-    unsafe { libc::kill(guard, libc::SIGKILL) };
+    sys::kill(guard);
     assert!(
         wait_for(Duration::from_secs(12), || (!alive(pid)).then_some(())).is_some(),
         "descendant survived its guard"
@@ -315,7 +461,10 @@ fn guard_killed_mid_job_is_cleaned_by_the_core() {
 #[test]
 fn protocol_violation_restarts_the_plugin() {
     let env = Env::new();
-    let cfg = env.config(json!([{"delayMs": 300, "raw": "{not json"}]), "echo ok");
+    let cfg = env.config(
+        json!([{"delayMs": 300, "raw": "{not json"}]),
+        sh("echo ok", &["print", "ok"]),
+    );
     let child = env.start(&cfg);
     std::thread::sleep(Duration::from_secs(4));
     let (code, err) = term_and_collect(child);
@@ -337,7 +486,7 @@ fn dictation_already_running_at_connect_is_suppressed() {
     let env = Env::new();
     let cfg = env.config_with(
         json!([{"delayMs": 3500, "say": "Hey Zora delete it. Do it Zora.", "durMs": 500}, {"delayMs": 100, "quietEnd": true}]),
-        "echo ran",
+        sh("echo ran", &["print", "ran"]),
         json!({"capturingAtStart": true}),
     );
     let child = env.start(&cfg);
@@ -352,7 +501,7 @@ fn dictation_already_running_at_connect_is_suppressed() {
 #[test]
 fn sequence_gap_drops_the_connection() {
     let env = Env::new();
-    let cfg = env.config(json!([{"delayMs": 3000, "skipSeq": true}, {"delayMs": 500, "say": "Hey Zora x. Do it Zora.", "durMs": 300}]), "echo ran");
+    let cfg = env.config(json!([{"delayMs": 3000, "skipSeq": true}, {"delayMs": 500, "say": "Hey Zora x. Do it Zora.", "durMs": 300}]), sh("echo ran", &["print", "ran"]));
     let child = env.start(&cfg);
     std::thread::sleep(Duration::from_secs(6));
     let (_, err) = term_and_collect(child);
@@ -360,6 +509,8 @@ fn sequence_gap_drops_the_connection() {
     assert!(env.commands().is_empty(), "{err}");
 }
 
+/// Unix only: nothing in a Windows job can leave it (no breakaway), so no process can escape holding the pipe.
+#[cfg(unix)]
 #[test]
 fn escaped_pipe_holder_does_not_block_the_job() {
     let env = Env::new();
@@ -371,7 +522,7 @@ fn escaped_pipe_holder_does_not_block_the_job() {
     );
     let cfg = env.config(
         json!([{"delayMs": 3500, "say": "Hey Zora go. Do it Zora.", "durMs": 500}]),
-        &script,
+        sh(&script, &[]),
     );
     let child = env.start(&cfg);
     let done = wait_for(Duration::from_secs(20), || {
@@ -381,7 +532,7 @@ fn escaped_pipe_holder_does_not_block_the_job() {
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok())
     {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        sys::kill(pid);
     }
     let (_, err) = term_and_collect(child);
     let done = done.unwrap_or_else(|| panic!("job blocked by an escaped pipe holder:\n{err}"));
@@ -400,7 +551,7 @@ fn ambiguous_job_from_an_earlier_boot_is_cleared() {
     }
     let child = env.start(&env.config(
         json!([{"delayMs": 3500, "say": "Hey Zora go. Do it Zora.", "durMs": 500}]),
-        "echo ok",
+        sh("echo ok", &["print", "ok"]),
     ));
     let ran = wait_for(Duration::from_secs(15), || {
         env.commands()
@@ -426,7 +577,7 @@ fn dictation_survives_a_monitor_health_flap() {
             {"delayMs": 3500, "say": "Hey Zora delete it. Do it Zora.", "durMs": 500},
             {"delayMs": 100, "quietEnd": true}
         ]),
-        "echo ran",
+        sh("echo ran", &["print", "ran"]),
         json!({"capturingAtStart": true}),
     );
     let child = env.start(&cfg);
@@ -444,7 +595,7 @@ fn shutdown_reaps_plugin_process_group() {
     let pidfile = env.home.join("plugin-child.pid");
     let cfg = env.config_with(
         json!([{"delayMs": 200, "spawnStubborn": pidfile.display().to_string()}]),
-        "echo ok",
+        sh("echo ok", &["print", "ok"]),
         json!({"lingerAfterStop": true}),
     );
     let child = env.start(&cfg);
@@ -455,7 +606,7 @@ fn shutdown_reaps_plugin_process_group() {
     let (code, err) = term_and_collect(child);
     let gone = wait_for(Duration::from_secs(2), || (!alive(pid)).then_some(()));
     if gone.is_none() {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        sys::kill(pid);
     }
     assert!(
         gone.is_some(),
@@ -470,7 +621,7 @@ fn shutdown_during_negotiation_reaps_plugin_group() {
     let pidfile = env.home.join("negotiating-child.pid");
     let cfg = env.config_with(
         json!([]),
-        "echo ok",
+        sh("echo ok", &["print", "ok"]),
         json!({"spawnBeforeReady": pidfile.display().to_string(), "withholdReady": true}),
     );
     let child = env.start(&cfg);
@@ -481,7 +632,7 @@ fn shutdown_during_negotiation_reaps_plugin_group() {
     let (_, err) = term_and_collect(child);
     let gone = wait_for(Duration::from_secs(2), || (!alive(pid)).then_some(()));
     if gone.is_none() {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        sys::kill(pid);
     }
     assert!(
         gone.is_some(),
@@ -496,7 +647,7 @@ fn output_that_expands_past_the_frame_limit_still_finishes() {
     let script = "perl -e 'print \"\\0\" x 65536; print STDERR \"\\0\" x 65536'";
     let cfg = env.config(
         json!([{"delayMs": 3500, "say": "Hey Zora noisy. Do it Zora.", "durMs": 500}]),
-        script,
+        sh(script, &["noisy"]),
     );
     let child = env.start(&cfg);
     let done = wait_for(Duration::from_secs(20), || {
@@ -516,7 +667,7 @@ fn output_that_expands_past_the_frame_limit_still_finishes() {
 fn shutdown_is_prompt_while_the_store_is_stalled() {
     let env = Env::new();
     let steps: Vec<Value> = (0..300).map(|i| json!({"delayMs": if i == 0 { 1500 } else { 5 }, "say": format!("filler sentence number {i}"), "durMs": 100})).collect();
-    let cfg = env.config(json!(steps), "echo ok");
+    let cfg = env.config(json!(steps), sh("echo ok", &["print", "ok"]));
     let child = env.start(&cfg);
     // Hold the database write lock while the plugin floods transcript segments.
     let db = env.db();
@@ -547,14 +698,14 @@ fn a_name_added_while_running_works_without_restart() {
     let env = Env::new();
     let cfg = env.config(
         json!([{"delayMs": 6000, "say": "Hey Jarvis, say hi. Do it, Jarvis.", "durMs": 800}]),
-        "echo \"ran: $1\"",
+        sh("echo \"ran: $1\"", &["ran"]),
     );
     let child = env.start(&cfg);
     std::thread::sleep(Duration::from_secs(2));
-    let out = Command::new(ZORAD)
+    let out = env
+        .cmd()
         .args(["names", "add", "Jarvis", "--config"])
         .arg(&cfg)
-        .env("HOME", &env.home)
         .output()
         .unwrap();
     assert!(
@@ -575,7 +726,7 @@ fn live_text_notifies_listening_before_the_sentence_is_final() {
     let env = Env::new();
     let cfg = env.config(
         json!([{"delayMs": 3500, "partial": "Hey Nova"}, {"delayMs": 1500, "say": "Hey Nova, say hi. Do it, Nova.", "durMs": 800}]),
-        "echo ran",
+        sh("echo ran", &["print", "ran"]),
     );
     let child = env.start(&cfg);
     let done = wait_for(Duration::from_secs(20), || {
@@ -599,7 +750,7 @@ fn stop_it_by_voice_cancels_the_running_job() {
             {"delayMs": 3500, "say": "Hey Zora, long job. Do it, Zora.", "durMs": 500},
             {"delayMs": 3000, "say": "Stop it, Zora.", "durMs": 500}
         ]),
-        "sleep 60; echo finished",
+        sh("sleep 60; echo finished", &["sleep", "60", "finished"]),
     );
     let child = env.start(&cfg);
     let done = wait_for(Duration::from_secs(20), || {
@@ -618,21 +769,65 @@ fn stop_it_by_voice_cancels_the_running_job() {
 }
 
 #[test]
+fn jobs_cancel_stops_the_harness_gracefully_and_records_it() {
+    let env = Env::new();
+    let marker = env.home.join("stopped");
+    let m = marker.display().to_string();
+    let cfg = env.config(
+        json!([{"delayMs": 3500, "say": "Hey Zora, long job. Do it, Zora.", "durMs": 500}]),
+        sh(
+            &format!("trap 'echo stopped > {m}; exit 0' TERM; sleep 60 & wait"),
+            &["graceful", &m],
+        ),
+    );
+    let child = env.start(&cfg);
+    let id = wait_for(Duration::from_secs(20), || {
+        let j = env.jobs().into_iter().next()?;
+        (j.status == "running").then_some(j.id)
+    });
+    // The harness needs a moment to set up its handler after it starts.
+    std::thread::sleep(Duration::from_millis(1500));
+    let out = id
+        .as_ref()
+        .map(|id| env.cmd().args(["jobs", "cancel", id]).output().unwrap());
+    let done = wait_for(Duration::from_secs(15), || {
+        env.commands()
+            .into_iter()
+            .find(|c| c.2 == "failed" || c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    let out = out.unwrap_or_else(|| panic!("job never ran:\n{err}"));
+    assert!(
+        out.status.success(),
+        "{}\n{err}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let done = done.unwrap_or_else(|| panic!("job not stopped:\n{err}"));
+    assert_eq!(
+        (done.2.as_str(), done.3.as_deref()),
+        ("failed", Some("cancelled")),
+        "{err}"
+    );
+    // TERM (Ctrl+Break on Windows) reached the harness before anything was killed.
+    assert!(marker.exists(), "the harness never saw TERM:\n{err}");
+}
+
+#[test]
 fn a_new_project_folder_applies_without_restart() {
     let env = Env::new();
     let cfg = env.config(
         json!([{"delayMs": 6000, "say": "Hey Zora, where. Do it, Zora.", "durMs": 800}]),
-        "pwd",
+        sh("pwd", &["pwd"]),
     );
     let child = env.start(&cfg);
     std::thread::sleep(Duration::from_secs(2));
     let other = env.home.join("other");
     std::fs::create_dir_all(&other).unwrap();
     let change = json!({"workspace": other}).to_string();
-    let out = Command::new(ZORAD)
+    let out = env
+        .cmd()
         .args(["settings", "set", &change, "--config"])
         .arg(&cfg)
-        .env("HOME", &env.home)
         .output()
         .unwrap();
     assert!(
@@ -660,7 +855,7 @@ fn speech_from_the_pause_that_arrives_after_resume_is_dropped() {
             {"delayMs": 10000, "say": "Hey Zora, secret. Do it, Zora.", "durMs": 300, "agoMs": 7000},
             {"delayMs": 1000, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 300}
         ]),
-        "echo \"ran: $1\"",
+        sh("echo \"ran: $1\"", &["ran"]),
     );
     let child = env.start(&cfg);
     std::thread::sleep(Duration::from_millis(3500));
@@ -739,7 +934,7 @@ fn acdc_plugin_puts_the_command_on_the_board() {
     let env = Env::new();
     let path = env.config(
         json!([{"delayMs": 3500, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 800}]),
-        "echo \"ran: $1\"",
+        sh("echo \"ran: $1\"", &["ran"]),
     );
     let mut cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     cfg["plugins"]["acdc"] = json!({"command": [ACDC],
@@ -800,4 +995,291 @@ fn acdc_plugin_puts_the_command_on_the_board() {
         !err.contains("say hi"),
         "command text leaked into logs:\n{err}"
     );
+}
+
+#[test]
+fn an_invalid_config_exits_with_ex_config_and_settings_lists_the_problem() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    std::fs::remove_dir_all(env.home.join("ws")).unwrap();
+    let mut child = env.start(&cfg);
+    let status = wait_for(Duration::from_secs(10), || child.try_wait().ok().flatten());
+    assert_eq!(status.and_then(|s| s.code()), Some(78));
+    let out = env
+        .cmd()
+        .args(["settings", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        v["problems"][0].as_str().unwrap().contains("workspace"),
+        "{v}"
+    );
+    assert_eq!(v["locale"], "en-US");
+    assert!(v["dictationBundleIDs"].is_array());
+    // A dry run needs no project folder, and checking for one doesn't save the flag.
+    let before = std::fs::read(&cfg).unwrap();
+    let out = env
+        .cmd()
+        .args(["settings", "--dry-run", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["problems"], json!([]), "{v}");
+    assert_eq!(std::fs::read(&cfg).unwrap(), before);
+}
+
+/// `zorad __guard` driven directly, as the core drives it.
+struct DirectGuard {
+    child: Child,
+    to: std::process::ChildStdin,
+    from: std::sync::mpsc::Receiver<Value>,
+    name: String,
+    marker: PathBuf,
+}
+
+impl DirectGuard {
+    /// Starts a guard for a harness that creates `started` and then, with `wait`, keeps running.
+    fn start(env: &Env, started: &Path, wait: bool, pause_ms: Option<u64>) -> DirectGuard {
+        use std::io::{BufRead, BufReader, Write};
+        let argv: Vec<String> = if cfg!(windows) {
+            let mode = if wait { "touch-wait" } else { "touch" };
+            vec![
+                env!("CARGO_BIN_EXE_zora-test-harness").into(),
+                mode.into(),
+                started.display().to_string(),
+            ]
+        } else {
+            let then = if wait { "; sleep 30" } else { "" };
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("echo started > {}{then}", started.display()),
+            ]
+        };
+        let mut cmd = Command::new(ZORAD);
+        cmd.arg("__guard")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        if let Some(ms) = pause_ms {
+            cmd.env("ZORA_TEST_PAUSE_BEFORE_RELEASE_MS", ms.to_string());
+        }
+        let mut child = cmd.spawn().unwrap();
+        let mut to = child.stdin.take().unwrap();
+        let (tx, from) = std::sync::mpsc::channel::<Value>();
+        let lines = BufReader::new(child.stdout.take().unwrap());
+        std::thread::spawn(move || {
+            for line in lines.lines().map_while(Result::ok) {
+                let _ = tx.send(serde_json::from_str(&line).unwrap_or(Value::Null));
+            }
+        });
+        let name = uuid::Uuid::new_v4().to_string();
+        let marker = env.home.join("cancel").join(&name);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let spec = json!({"t": "spec", "argv": argv, "cwd": env.home.join("ws"),
+                          "env": std::env::vars().collect::<Vec<_>>(), "capture_limit": 4096,
+                          "kill_grace_ms": 1000, "name": name, "cancel_marker": marker});
+        writeln!(to, "{spec}").unwrap();
+        let registered = from.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(registered["t"], "registered", "{registered}");
+        DirectGuard {
+            child,
+            to,
+            from,
+            name,
+            marker,
+        }
+    }
+
+    fn go(&mut self) {
+        use std::io::Write;
+        writeln!(self.to, "{}", json!({"t": "go"})).unwrap();
+    }
+
+    fn cancel(&self) {
+        sys::request_cancel(&self.name, &self.marker);
+    }
+
+    /// Every message until `cleaned`.
+    fn finish(mut self) -> Vec<Value> {
+        let mut seen = vec![];
+        while let Ok(m) = self.from.recv_timeout(Duration::from_secs(20)) {
+            let done = m["t"] == "cleaned";
+            seen.push(m);
+            if done {
+                break;
+            }
+        }
+        let _ = self.child.wait();
+        seen
+    }
+}
+
+fn count(seen: &[Value], t: &str) -> usize {
+    seen.iter().filter(|m| m["t"] == t).count()
+}
+
+#[test]
+fn a_job_cancelled_before_go_never_starts() {
+    let env = Env::new();
+    let started = env.home.join("started");
+    let mut g = DirectGuard::start(&env, &started, false, None);
+    g.cancel();
+    g.go();
+    let seen = g.finish();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !started.exists(),
+        "the harness ran after a cancel: {seen:?}"
+    );
+    assert_eq!(count(&seen, "exited"), 1, "{seen:?}");
+    assert!(
+        seen.iter()
+            .any(|m| m["t"] == "exited" && m["cancelled"] == true),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|m| m["t"] == "cleaned" && m["ok"] == true),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn a_cancel_racing_the_release_has_one_outcome() {
+    let env = Env::new();
+    let started = env.home.join("started");
+    // The guard checks for a cancel, then pauses before releasing; the cancel lands in that pause.
+    let mut g = DirectGuard::start(&env, &started, true, Some(1500));
+    let t0 = Instant::now();
+    g.go();
+    std::thread::sleep(Duration::from_millis(500));
+    g.cancel();
+    let seen = g.finish();
+    // Released, then stopped by the guard itself: one exit, recorded cancelled, group gone, well before the
+    // harness's 30 s.
+    assert_eq!(count(&seen, "exited"), 1, "{seen:?}");
+    assert!(
+        seen.iter()
+            .any(|m| m["t"] == "exited" && m["cancelled"] == true),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|m| m["t"] == "cleaned" && m["ok"] == true),
+        "{seen:?}"
+    );
+    assert_eq!(count(&seen, "cancelling"), 1, "{seen:?}");
+    assert!(t0.elapsed() < Duration::from_secs(15), "{seen:?}");
+}
+
+#[test]
+fn clear_and_recovery_remove_cancel_markers() {
+    let env = Env::new();
+    let dir = env.db().parent().unwrap().join("cancel");
+    {
+        let mut s = Store::open(&env.db(), false).unwrap();
+        s.record_command("old", "x", "sh", "queued");
+        s.set_job_owner("old", "some-earlier-boot", 1, 1, 999_999, 1)
+            .unwrap();
+        s.record_command("stuck", "y", "sh", "queued");
+        s.set_status("stuck", "ambiguous");
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // As `zorad jobs cancel` makes the folder (os.rs OWNER_FILE).
+    std::fs::write(
+        dir.join(".zora-cancel-markers"),
+        b"zora cancel markers v1\n",
+    )
+    .unwrap();
+    let orphan = uuid::Uuid::new_v4().to_string();
+    for id in ["old", "stuck", &orphan, "notes"] {
+        std::fs::write(dir.join(id), b"").unwrap();
+    }
+    env.zorad(&["jobs", "clear", "stuck"]);
+    assert!(!dir.join("stuck").exists(), "jobs clear left its marker");
+    let child = env.start(&env.config(json!([]), sh("echo ok", &["print", "ok"])));
+    // Orphans are pruned on Unix only (Windows keeps no marker files).
+    let recovered = wait_for(Duration::from_secs(15), || {
+        (!dir.join("old").exists() && (cfg!(windows) || !dir.join(&orphan).exists())).then_some(())
+    });
+    let (_, err) = term_and_collect(child);
+    assert!(recovered.is_some(), "markers left after recovery:\n{err}");
+    assert!(dir.join("notes").exists(), "an unrelated file was pruned");
+}
+
+#[test]
+fn jobs_cancel_ends_a_job_whose_guard_stopped_reacting() {
+    let env = Env::new();
+    let pidfile = env.home.join("descendant.pid");
+    let cfg = env.config(
+        json!([{"delayMs": 3500, "say": "Hey Zora, long job. Do it, Zora.", "durMs": 500}]),
+        stubborn_job(&pidfile),
+    );
+    let child = env.start_with(&cfg, &[("ZORA_TEST_STALL_GUARD", "1")]);
+    let pid: Option<i32> = wait_for(Duration::from_secs(20), || {
+        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+    });
+    let id = env.jobs().first().map(|j| j.id.clone());
+    let cancelled = id.as_ref().map(|id| {
+        env.cmd()
+            .args(["jobs", "cancel", id])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    });
+    let t0 = Instant::now();
+    // The core sees the request itself, gives the guard its bounded time, then kills it and cleans up.
+    let done = wait_for(Duration::from_secs(60), || {
+        env.commands()
+            .into_iter()
+            .find(|c| c.2 == "failed" || c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    assert_eq!(cancelled, Some(true), "{err}");
+    let pid = pid.unwrap_or_else(|| panic!("job never started:\n{err}"));
+    let done = done.unwrap_or_else(|| panic!("job never ended: {:?}\n{err}", env.commands()));
+    assert_eq!(
+        (done.2.as_str(), done.3.as_deref()),
+        ("failed", Some("cancelled")),
+        "{err}"
+    );
+    assert!(t0.elapsed() < Duration::from_secs(60), "{err}");
+    assert!(!alive(pid), "descendant {pid} survived:\n{err}");
+    assert!(env.jobs().is_empty(), "{:?}\n{err}", env.jobs());
+}
+
+#[test]
+fn stop_it_during_ownership_registration_never_runs_the_job() {
+    let env = Env::new();
+    let started = env.home.join("started");
+    let s = started.display().to_string();
+    let cfg = env.config(
+        json!([
+            {"delayMs": 3500, "say": "Hey Zora, long job. Do it, Zora.", "durMs": 500},
+            {"delayMs": 2000, "say": "Stop it, Zora.", "durMs": 500}
+        ]),
+        sh(&format!("echo started > {s}"), &["touch", &s]),
+    );
+    // The core holds the job between its ownership write and Go; "stop it" lands there.
+    let child = env.start_with(&cfg, &[("ZORA_TEST_PAUSE_AFTER_OWNER_MS", "5000")]);
+    let done = wait_for(Duration::from_secs(25), || {
+        env.commands()
+            .into_iter()
+            .find(|c| c.2 == "failed" || c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    let done = done.unwrap_or_else(|| panic!("job never ended:\n{err}"));
+    assert_eq!(
+        (done.2.as_str(), done.3.as_deref()),
+        ("failed", Some("cancelled")),
+        "{err}"
+    );
+    assert!(!started.exists(), "the harness ran:\n{err}");
 }

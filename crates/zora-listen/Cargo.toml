@@ -1,0 +1,29 @@
+[package]
+name = "zora-listen"
+version.workspace = true
+edition.workspace = true
+description = "Speech plugin for zorad: cpal capture and a streaming sherpa-onnx model (Linux, Windows); file mode everywhere"
+
+# Its own crate so the ONNX runtime is linked into this binary only, not the other Linux plugins.
+[[bin]]
+name = "zora-listen"
+path = "src/main.rs"
+
+[dependencies]
+zora-plugin = { path = "../zora-plugin" }
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18", features = ["pipewire"] }
+sherpa-onnx = "2.0"
+sha2 = "0.10"
+
+# WASAPI through cpal's default host.
+[target.'cfg(windows)'.dependencies]
+cpal = "0.18"
+sherpa-onnx = "2.0"
+sha2 = "0.10"
+
+[dev-dependencies]
+hound.workspace = true
+libc.workspace = true

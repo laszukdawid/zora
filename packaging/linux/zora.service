@@ -1,13 +1,17 @@
 # systemd user unit: install with packaging/linux/install.sh, then `systemctl --user enable --now zora`.
+# zorad starts the plugins from the config: speech (zora-listen), dictation (zora-dictation), and the tray with
+# notifications (zora-desktop, on the session D-Bus).
 [Unit]
 Description=Zora voice command service
-After=pipewire.service
+After=pipewire.service pipewire-pulse.service
 
 [Service]
 ExecStart=%h/.local/bin/zorad run
 Restart=on-failure
 RestartSec=5
-# The whole cgroup (core, guards, harness jobs) stops with the service.
+# 78 (EX_CONFIG): the config is invalid; restarting won't fix it. `zorad status` says why.
+RestartPreventExitStatus=78
+# The whole cgroup (core, plugins, guards, harness jobs) stops with the service.
 KillMode=control-group
 TimeoutStopSec=20
 

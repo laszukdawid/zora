@@ -4,8 +4,9 @@ Plugins are separate executables. They exchange **newline-delimited JSON** (one 
 
 - **Linux:** `zorad` starts each configured plugin, using the plugin's stdin and stdout for the protocol.
 - **macOS (inverted launch):** `Zora.app`'s main executable *is* the macOS plugin. It starts `zorad --attached-plugin`, handing over a pipe pair on file descriptors **3** (core reads) and **4** (core writes). This keeps microphone, speech and notification permissions with the app's own identity.
+- **Windows (inverted launch, for the coming tray app):** the app starts `zorad run --attached-plugin` with its stdin and stdout redirected to pipes, and the protocol runs over them: the core reads stdin and writes stdout. The core makes both handles non-inheritable at start, so no child (plugin, job guard, harness) keeps the connection open, and it writes its logs to stderr only. When the app closes the pipes the core stops, like EOF on fd 3 on macOS. Windows has no numbered descriptors to hand over, and every process launcher can redirect the standard handles.
 
-Everything else is the same in both modes. In attached mode `zorad` also starts every other configured plugin as in Linux mode, but those may declare only `notify`: the app stays the one source of transcript and dictation.
+Everything else is the same in every mode. In attached mode `zorad` also starts every other configured plugin as in Linux mode, but those may declare only `notify`: the app stays the one source of transcript and dictation.
 
 ## Clock
 
@@ -15,6 +16,7 @@ Times are **integer nanoseconds** on a named monotonic clock domain:
 |---|---|
 | `darwin-uptime-raw-ns` | `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` (same as `mach_absolute_time` converted) |
 | `linux-monotonic-ns` | `clock_gettime(CLOCK_MONOTONIC)` |
+| `windows-qpc-ns` | `QueryPerformanceCounter`, scaled by `QueryPerformanceFrequency` to nanoseconds |
 
 The domains must match.
 

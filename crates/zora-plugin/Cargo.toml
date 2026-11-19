@@ -1,0 +1,16 @@
+[package]
+name = "zora-plugin"
+version.workspace = true
+edition.workspace = true
+description = "Platform-neutral plugin side of the Zora protocol: framing, mic gate, listening engine, dictation monitor and tray model"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+hound.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

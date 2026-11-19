@@ -46,6 +46,30 @@ impl Out {
     }
 }
 
+/// A TERM-ignoring child in the plugin's process group (Windows: its job) that writes its pid to `pidfile`.
+fn spawn_stubborn(pidfile: &str) {
+    #[cfg(unix)]
+    let mut cmd = std::process::Command::new("/bin/sh");
+    #[cfg(unix)]
+    cmd.args([
+        "-c",
+        &format!("trap '' TERM; echo $$ > {pidfile}; exec sleep 60"),
+    ]);
+    #[cfg(windows)]
+    let mut cmd = std::process::Command::new(
+        std::env::current_exe()
+            .unwrap()
+            .with_file_name("zora-test-harness.exe"),
+    );
+    #[cfg(windows)]
+    cmd.args(["hold", pidfile]);
+    let _ = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn main() {
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
@@ -64,15 +88,7 @@ fn main() {
     });
     // "spawnBeforeReady" + "withholdReady": a plugin stuck in negotiation that owns a TERM-ignoring child.
     if let Some(pidfile) = config["spawnBeforeReady"].as_str() {
-        let _ = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                &format!("trap '' TERM; echo $$ > {pidfile}; exec sleep 60"),
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        spawn_stubborn(pidfile);
     }
     if config["withholdReady"].as_bool().unwrap_or(false) {
         std::thread::sleep(std::time::Duration::from_secs(120));
@@ -126,16 +142,7 @@ fn main() {
                     let c = *capturing.lock().unwrap();
                     out.send(json!({"t": "health", "healthy": h, "capturing": c, "reason": "test", "at_ns": now_ns()}));
                 } else if let Some(pidfile) = step["spawnStubborn"].as_str() {
-                    // A TERM-ignoring child in the plugin's process group.
-                    let _ = std::process::Command::new("/bin/sh")
-                        .args([
-                            "-c",
-                            &format!("trap '' TERM; echo $$ > {pidfile}; exec sleep 60"),
-                        ])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
+                    spawn_stubborn(pidfile);
                 } else if step["skipSeq"].as_bool() == Some(true) {
                     out.seq.fetch_add(1, Ordering::SeqCst);
                 } else if let Some(code) = step["exit"].as_i64() {

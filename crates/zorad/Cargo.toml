@@ -12,6 +12,11 @@ path = "src/main.rs"
 name = "zora-script-plugin"
 path = "src/bin/script_plugin.rs"
 
+# Harness stand-in for the end-to-end tests on Windows (no /bin/sh there).
+[[bin]]
+name = "zora-test-harness"
+path = "src/bin/test_harness.rs"
+
 # Notify plugin that puts voice commands on the ACDC task board.
 [[bin]]
 name = "zora-acdc"
@@ -26,6 +31,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
 uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true

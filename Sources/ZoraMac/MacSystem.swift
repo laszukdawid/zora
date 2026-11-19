@@ -2,13 +2,12 @@ import AVFAudio
 import Foundation
 import ServiceManagement
 import UserNotifications
-import ZoraCore
 import os
 
 private let log = Logger(subsystem: "dev.zora.agent", category: "system")
 
 /// macOS notification banners. Works only when running from the signed Zora.app bundle.
-public final class MacNotifier: NSObject, Notifier, UNUserNotificationCenterDelegate, @unchecked Sendable {
+public final class MacNotifier: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
     public let id = "macos"
     private let center: UNUserNotificationCenter?
     private let warned = OSAllocatedUnfairLock(initialState: false)
@@ -38,11 +37,6 @@ public final class MacNotifier: NSObject, Notifier, UNUserNotificationCenterDele
         case .notDetermined: return "not determined"
         @unknown default: return "unknown"
         }
-    }
-
-    public func notify(_ event: ZoraEvent) async {
-        let (title, body) = event.display
-        _ = await post(title: title, body: body)
     }
 
     /// Removes a delivered notification (e.g. "listening" after the user cancelled).

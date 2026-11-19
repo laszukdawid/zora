@@ -44,6 +44,7 @@ into the transcript and nowhere else.
 | Check mark | Done. The notification shows the agent's answer |
 | Warning triangle | The task failed or was dropped |
 | Crossed-out microphone | Paused. The microphone is off |
+| Gear with a cross | Zora needs setup and isn't listening. The menu says what's wrong, and **Settings…** fixes most of it |
 
 Click the icon for the menu:
 
@@ -57,37 +58,40 @@ Short sounds play too: a tick when Zora hears its name, a pop when the task star
 
 ## Install (macOS)
 
-For now, Zora is built from source. You need:
+You need:
 
 - A Mac with Apple Silicon running macOS 26
-- Xcode 26 and Rust 1.89 or later
-- An "Apple Development" signing certificate. Xcode creates one for free with any Apple ID (Xcode → Settings →
-  Accounts). It lets macOS remember the microphone permission across rebuilds.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code), installed and logged in
 
-Then:
+1. Download `Zora-<version>.dmg` from the [latest release](https://github.com/laszukdawid/zora/releases/latest),
+   open it and drag **Zora** into **Applications**.
+2. Open Terminal and run setup. It asks for microphone and notification access, downloads Apple's on-device speech
+   model, and asks which folder your agent should work in:
 
-```bash
-git clone https://github.com/laszukdawid/zora && cd zora
-packaging/macos/bundle.sh --install                     # builds Zora.app into ~/Applications
-~/Applications/Zora.app/Contents/MacOS/zora setup       # permissions, speech model, project folder
-```
+   ```bash
+   /Applications/Zora.app/Contents/MacOS/zora setup
+   ```
 
-`zora setup` asks for microphone and notification access and downloads Apple's on-device speech model. If no project
-folder is set yet, it asks which folder your agent should work in. You can also pass one with
-`--project ~/code/my-app`.
+   You can also name the folder up front with `--project ~/code/my-app`.
 
-Try it first in dry-run mode, where tasks are shown in a notification but not run. Press Ctrl-C to stop:
+3. Try it in dry-run mode first. Tasks are shown in a notification but not run. Press Ctrl-C to stop:
 
-```bash
-~/Applications/Zora.app/Contents/MacOS/zora run --dry-run
-```
+   ```bash
+   /Applications/Zora.app/Contents/MacOS/zora run --dry-run
+   ```
 
-When you're happy with it, start Zora for real, now and at every login:
+4. When you're happy with it, start Zora for real, now and at every login:
 
-```bash
-~/Applications/Zora.app/Contents/MacOS/zora install
-```
+   ```bash
+   /Applications/Zora.app/Contents/MacOS/zora install
+   ```
+
+The commands in this README assume Zora is in `/Applications`. To type less, add
+`export PATH="/Applications/Zora.app/Contents/MacOS:$PATH"` to your shell profile, then run `zora setup`,
+`zorad status` and so on.
+
+To build Zora from source instead (Xcode 26, Rust 1.89 or later), see
+[docs/development.md](docs/development.md#build-and-test).
 
 ## Everyday use
 
@@ -117,7 +121,7 @@ Jarvis" works. Changes apply within a second.
 Zora keeps about the last 4 hours of what it heard, as text:
 
 ```bash
-~/Applications/Zora.app/Contents/MacOS/zorad transcript --since 30m
+/Applications/Zora.app/Contents/MacOS/zorad transcript --since 30m
 ```
 
 ### Show tasks on the ACDC board
@@ -149,15 +153,19 @@ review or blocked when the agent finishes. The board's Zora tab also shows recen
 
 | Problem | What to do |
 |---|---|
-| No icon in the menu bar | Run `~/Applications/Zora.app/Contents/MacOS/zorad status`. A config problem is listed there. The log is in `~/Library/Logs/Zora/zora.log`. |
+| The icon is a gear with a cross | Open the menu to see what's wrong. A missing project folder is fixed in **Settings…**. Other config problems are listed by `/Applications/Zora.app/Contents/MacOS/zorad status`. Zora starts listening again by itself once the config is fixed. |
+| No icon in the menu bar | Zora isn't running. Check `~/Library/Logs/Zora/zora.log`, then run `/Applications/Zora.app/Contents/MacOS/zora install` again. |
 | The icon never changes when you say "Hey Zora" | Check the icon isn't the crossed-out microphone (paused). Then run `zora status` to check microphone permission and the speech model. |
 | "Hey Zora" is heard, but the task never runs | A dictation app may have been listening at the same time, or the task took longer than three minutes. The notification says why it was dropped. |
 | Your name is often misheard | Add a second, more distinct name in Settings. Zora already accepts common mishearings ("Zara", "Sora" for "Zora"). |
 
 ## Platforms
 
-macOS works today. Linux (Ubuntu, Arch) is next: Zora's core already runs there, but the speech and menu-bar parts
-are still to be written. Windows comes after that.
+macOS works today. Linux (Ubuntu 24.04 or newer, and Arch) has its own speech, dictation and tray plugins: speech is
+recognized on your machine by a small English model, and the tray icon has the same menu as on macOS. It needs
+PipeWire, which both use by default. On GNOME the tray icon needs the AppIndicator extension (Ubuntu has it already).
+Linux support is new and hasn't been tried on many machines yet; see [docs/development.md](docs/development.md#linux)
+to install it. Windows: experimental. The core and its own speech, dictation and tray plugins are there but not yet tried on a real machine, and voice commands stay off until you opt in; see [docs/development.md](docs/development.md#windows).
 
 ## For developers
 

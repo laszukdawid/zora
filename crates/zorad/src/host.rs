@@ -1,12 +1,10 @@
-//! Plugin host: implements docs/protocol.md for one plugin (spawned child on Linux, attached fds on macOS).
+//! Plugin host: implements docs/protocol.md for one plugin (a spawned child, or the attached app that started us).
 
 use crate::pause::Listen;
 use crate::queue::{Class, Classify, InputQueue};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -209,7 +207,7 @@ impl Classify for Item {
 #[derive(Debug, Clone)]
 pub enum Connection {
     Spawn(Vec<String>),
-    /// macOS inverted launch: the app gave us fd 3 (read) and fd 4 (write).
+    /// Inverted launch: the app started us and talks over fds 3/4 (Windows: stdin/stdout).
     Attached,
 }
 
@@ -240,24 +238,18 @@ pub async fn run_plugin(
         generation += 1;
         let started = tokio::time::Instant::now();
         let result = match &spec.connection {
-            Connection::Attached => {
-                // SAFETY: the parent app passes these descriptors to us; nothing else owns them.
-                let (r, w) = unsafe { (OwnedFd::from_raw_fd(3), OwnedFd::from_raw_fd(4)) };
-                let r = tokio::net::unix::pipe::Receiver::from_owned_fd(r);
-                let w = tokio::net::unix::pipe::Sender::from_owned_fd(w);
-                match (r, w) {
-                    (Ok(r), Ok(w)) => {
-                        until_stop(
-                            session(&spec, generation, r, w, &queue, stop.clone()),
-                            stop.clone(),
-                        )
-                        .await
-                    }
-                    _ => Err(ProtocolError("fds 3/4 are not pipes".into())),
+            Connection::Attached => match crate::os::attached_plugin() {
+                Ok((r, w)) => {
+                    until_stop(
+                        session(&spec, generation, r, w, &queue, stop.clone()),
+                        stop.clone(),
+                    )
+                    .await
                 }
-            }
+                Err(e) => Err(ProtocolError(e)),
+            },
             Connection::Spawn(cmd) => match spawn(cmd) {
-                Ok(mut child) => {
+                Ok((mut child, group)) => {
                     let (r, w) = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
                     if let Some(err) = child.stderr.take() {
                         tokio::spawn(forward_stderr(spec.id.clone(), err));
@@ -270,10 +262,10 @@ pub async fn run_plugin(
                     )
                     .await;
                     // Reap the whole plugin group (TERM, grace, KILL, verify) before any restart.
-                    if let Some(pid) = child.id() {
-                        let pgid = pid as i32;
+                    {
+                        let pgid = group.id();
                         // Wait for the leader first: an unreaped (zombie) leader still counts as a group member.
-                        crate::os::signal_group(pgid, libc::SIGTERM);
+                        group.term();
                         if tokio::time::timeout(Duration::from_secs(3), child.wait())
                             .await
                             .is_err()
@@ -282,7 +274,7 @@ pub async fn run_plugin(
                             let _ = child.wait().await;
                         }
                         let reaped = tokio::task::spawn_blocking(move || {
-                            crate::os::reap_group_blocking(pgid, Duration::from_secs(3))
+                            group.reap_blocking(Duration::from_secs(3))
                         })
                         .await
                         .unwrap_or(false);
@@ -343,41 +335,88 @@ async fn until_stop(
     }
 }
 
-fn spawn(cmd: &[String]) -> std::io::Result<tokio::process::Child> {
+fn spawn(cmd: &[String]) -> std::io::Result<(crate::os::PluginChild, crate::os::Group)> {
     let (exe, args) = cmd
         .split_first()
         .ok_or_else(|| std::io::Error::other("empty plugin command"))?;
-    tokio::process::Command::new(zora_core::config::expand_tilde(exe))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
+    crate::os::spawn_plugin(&zora_core::config::expand_tilde(exe), args)
 }
 
-/// Forwards plugin stderr (metadata-only by contract) at no more than 4 KiB/s.
+/// Forwards plugin stderr (metadata-only by contract) in whole lines, at roughly 4 KiB/s at most.
 async fn forward_stderr(id: String, mut err: impl AsyncRead + Unpin) {
     let mut buf = [0u8; 4096];
-    let mut budget = 4096usize;
-    let mut window = tokio::time::Instant::now();
+    let mut lines = StderrLines::default();
     loop {
         let n = match err.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        if window.elapsed() >= Duration::from_secs(1) {
-            window = tokio::time::Instant::now();
-            budget = 4096;
+        for line in lines.push(&buf[..n], tokio::time::Instant::now().into_std()) {
+            eprintln!("[{id}] {line}");
         }
-        let take = n.min(budget);
-        budget -= take;
-        if take > 0 {
-            let text = String::from_utf8_lossy(&buf[..take]);
-            for line in text.lines() {
-                eprintln!("[{id}] {line}");
+    }
+    if let Some(line) = lines.finish() {
+        eprintln!("[{id}] {line}");
+    }
+}
+
+/// Splits a byte stream into lines, however the writes were cut. A line over `MAX_STDERR_LINE` is cut there and the
+/// rest of it dropped; lines beyond the per-second budget are dropped whole.
+#[derive(Default)]
+struct StderrLines {
+    pending: Vec<u8>,
+    /// Inside an overlong line, dropping bytes until its newline.
+    skipping: bool,
+    budget: usize,
+    window: Option<std::time::Instant>,
+}
+
+const MAX_STDERR_LINE: usize = 1024;
+const BUDGET_PER_SECOND: usize = 4096;
+const LINE_OVERHEAD: usize = 16;
+
+impl StderrLines {
+    fn push(&mut self, bytes: &[u8], now: std::time::Instant) -> Vec<String> {
+        let mut out = Vec::new();
+        for &b in bytes {
+            if b == b'\n' {
+                if !std::mem::take(&mut self.skipping) {
+                    self.emit(now, &mut out);
+                }
+            } else if !self.skipping {
+                self.pending.push(b);
+                if self.pending.len() >= MAX_STDERR_LINE {
+                    self.emit(now, &mut out);
+                    self.skipping = true;
+                }
             }
+        }
+        out
+    }
+
+    /// A last line without a newline.
+    fn finish(&mut self) -> Option<String> {
+        let mut out = Vec::new();
+        if !self.pending.is_empty() {
+            self.emit(std::time::Instant::now(), &mut out);
+        }
+        out.pop()
+    }
+
+    fn emit(&mut self, now: std::time::Instant, out: &mut Vec<String>) {
+        let line = std::mem::take(&mut self.pending);
+        if self
+            .window
+            .is_none_or(|w| now.duration_since(w) >= Duration::from_secs(1))
+        {
+            self.window = Some(now);
+            self.budget = BUDGET_PER_SECOND;
+        }
+        // Every line costs at least its prefix and newline, so a flood of empty lines is limited too.
+        let cost = line.len() + LINE_OVERHEAD;
+        if cost <= self.budget {
+            self.budget -= cost;
+            out.push(String::from_utf8_lossy(&line).into_owned());
         }
     }
 }
@@ -815,5 +854,62 @@ async fn connected(
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stderr_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn a_line_written_in_pieces_comes_out_whole() {
+        let mut l = StderrLines::default();
+        let t = Instant::now();
+        assert!(l.push(b"notify kind=", t).is_empty());
+        assert_eq!(
+            l.push(b"jobSucceeded\nnext", t),
+            vec!["notify kind=jobSucceeded"]
+        );
+        assert_eq!(l.finish().as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn utf8_split_across_writes_survives() {
+        let mut l = StderrLines::default();
+        let t = Instant::now();
+        let s = "zażółć\n".as_bytes();
+        assert!(l.push(&s[..3], t).is_empty());
+        assert_eq!(l.push(&s[3..], t), vec!["zażółć"]);
+    }
+
+    #[test]
+    fn an_overlong_line_is_cut_once_and_its_rest_dropped() {
+        let mut l = StderrLines::default();
+        let t = Instant::now();
+        let long = vec![b'a'; MAX_STDERR_LINE * 3];
+        let out = l.push(&long, t);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), MAX_STDERR_LINE);
+        assert_eq!(l.push(b"aaa\nok\n", t), vec!["ok"]);
+    }
+
+    #[test]
+    fn lines_over_the_budget_are_dropped_whole_until_the_next_second() {
+        let mut l = StderrLines::default();
+        let t = Instant::now();
+        let line = [vec![b'x'; 1008], vec![b'\n']].concat();
+        let out = l.push(&line.repeat(5), t);
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|s| s.len() == 1008));
+        assert!(l.push(&[b'\n'; 100], t).is_empty());
+        assert_eq!(l.push(&line, t + Duration::from_secs(1)).len(), 1);
+    }
+
+    #[test]
+    fn empty_lines_are_limited_too() {
+        let mut l = StderrLines::default();
+        let out = l.push(&[b'\n'; 10_000], Instant::now());
+        assert_eq!(out.len(), BUDGET_PER_SECOND / LINE_OVERHEAD);
     }
 }

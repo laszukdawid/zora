@@ -9,22 +9,13 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "ZoraCore",
-            linkerSettings: [.linkedLibrary("sqlite3")]
-        ),
-        .target(
             name: "ZoraMac",
-            dependencies: ["ZoraCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .executableTarget(
             name: "zora",
-            dependencies: ["ZoraCore", "ZoraMac"],
+            dependencies: ["ZoraMac"],
             swiftSettings: [.swiftLanguageMode(.v5)]
-        ),
-        .testTarget(
-            name: "ZoraCoreTests",
-            dependencies: ["ZoraCore"]
         ),
     ]
 )

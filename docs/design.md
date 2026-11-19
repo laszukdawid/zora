@@ -1,6 +1,6 @@
 # Zora design (v2): cross-platform core with native plugins
 
-Agreed with GPT-6-Astra (Codex) on 2026-11-17. v1 was a macOS-only Swift build, reviewed and approved; this design keeps all of its behaviour and safety rules. **Gates** are checks that need real hardware or a desktop session before release.
+v1 was a macOS-only Swift build. v2 keeps all of its behaviour and safety rules and moves the logic into a cross-platform Rust core. **Gates** are checks that need real hardware or a desktop session before release.
 
 ## Goal
 
@@ -45,9 +45,9 @@ plugin(s) ──JSON lines──► PluginHost ──► InputQueue (ordered, bo
 - **Store.**
   - SQLite in WAL mode, with the same schema as v1 plus job-ownership columns. Writes are batched, retention covers both tables, and secure_delete is on.
   - A read-only mode for CLI queries.
-  - Paths: `~/Library/Application Support/Zora/zora.sqlite` (macOS) or `$XDG_STATE_HOME/zora/zora.sqlite` (Linux), with `0700`/`0600` permissions.
-- **Config.** JSON, the same as v1 (`~/.config/zora/config.json` on both platforms). It adds a `plugins` section. Validation rejects permission-bypass flags anywhere in a harness's argv, including `allowedTools`.
-- **Harness.** argv with `{prompt}` passed as a single argument and no shell; Claude's JSON output is summarized; the permission-mode allowlist applies.
+  - Paths: `~/Library/Application Support/Zora/zora.sqlite` (macOS) or `$XDG_STATE_HOME/zora/zora.sqlite` (Linux), with `0700`/`0600` permissions. On Windows the store and the pause file live in `%LOCALAPPDATA%\Zora` and get no mode of their own: they inherit the user profile's ACL, which grants only the user, SYSTEM and Administrators.
+- **Config.** JSON, the same as v1 (`~/.config/zora/config.json` on macOS and Linux, `%APPDATA%\Zora\config.json` on Windows). The `path` setting is `;`-separated on Windows. It adds a `plugins` section. Validation rejects permission-bypass flags anywhere in a harness's argv, including `allowedTools`.
+- **Harness.** argv with `{prompt}` passed as a single argument and no shell. On Windows a batch file never receives the prompt, because cmd.exe would parse it again: an npm shim such as `claude.cmd` is replaced by the `node` script or `.exe` it starts, and any other `.cmd`/`.bat` is refused. Claude's JSON output is summarized; the permission-mode allowlist applies.
 
 ### Daemon (`crates/zorad`, Rust): tokio current-thread runtime, plugin host, jobs, CLI
 
@@ -66,6 +66,15 @@ plugin(s) ──JSON lines──► PluginHost ──► InputQueue (ordered, bo
     - the leader's pid equals the pgid and its start time matches the gate's → clean the group
     - otherwise → **don't signal anything**; admission stays closed and a degraded notification names the pgid (`zora jobs clear <id>` after a manual check)
   - Linux also runs under a systemd user unit with `KillMode=control-group`.
+  - `zorad jobs cancel` only makes a request; the guard is the one that signals its job. On Unix the request is a marker file `cancel/<id>` beside the store, created exclusively without following links in a 0700 folder (an existing one means already requested); on Windows a named event. The guard polls for it every 100 ms and when Go arrives: while the job is still held it is never released (killed at the gate, recorded cancelled); once released, the guard TERMs its group, waits the grace period, KILLs, and records cancelled,. The core also checks for the request every 500 ms (and hears `cancelling` from the guard), and then arms the same bounded cleanup deadline as for its own cancel; a guard that stops reacting is killed when it expires, the job group is cleaned only with verified identity, and the job is recorded as cancelled once that cleanup is verified. Only when the guard is proven gone (no such pid, or that pid now has another start time; a recorded start time of 0 proves nothing) does the CLI TERM a verified group itself, as before; if the guard can't be identified, nothing is signalled. The CLI prints "cancellation requested". Markers are removed when the core finalizes a job, when recovery does, and on `jobs clear`; recovery also removes markers of jobs that are not live, but only regular files named as canonical UUIDv4 job ids, in a folder Zora made: it holds an ownership file written when `jobs cancel` created it, is owned by the user with mode 0700, and is opened with `O_DIRECTORY|O_NOFOLLOW`; files are removed relative to that descriptor.
+  - **Windows** has no process groups and no exec, so a Job Object takes the group's place:
+    - The guard creates a job named `Local\zora-job-<job id>` with `KILL_ON_JOB_CLOSE`, then creates the harness *suspended and already inside it* (`CreateProcessW` with `PROC_THREAD_ATTRIBUTE_JOB_LIST`), in a new console process group, inheriting only its three standard handles (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`). On *go* it resumes the primary thread (a suspend count other than 1 is a launch failure: the job is terminated and reported failed); without *go* it terminates the job. No instruction of the harness runs outside the job, and everything it starts joins it (no breakaway). There is no gate process.
+    - TERM is Ctrl+Break to the harness's process group (guard and harness share the guard's windowless console, created with `CREATE_NO_WINDOW`; an e2e test checks that it arrives). If Ctrl+Break can't be sent, the job is terminated at once. KILL is `TerminateJobObject`. "The group is empty" means the job's active process count is 0.
+    - The guard holds the only handle to the job. When the guard dies, Windows kills the job, so a killed core and a killed guard both end the harness.
+    - Job names are per Windows session, so `boot_id` records the kernel's boot counter and the session (`<BootId>|s<session>`). Recovery in the same session opens the job by name: missing means nothing is left (the name is unique to the job, so no pid or start-time check is needed). A job from another boot is interrupted. A job from another session of the same boot can't be seen from here, so it is **not** treated as gone: admission stays closed until it is checked and cleared.
+    - Each plugin is created suspended inside its own unnamed job, then resumed. Stopping a plugin terminates its job (it already got `stop`; Ctrl+Break can't reach its console).
+    - The core stops in order on Ctrl+C, Ctrl+Break and console close, as on SIGINT/SIGTERM. The guard ignores all three.
+    - **Trust boundary.** Containment covers lifetime, not isolation: a Job Object is not a sandbox. Any process of the same user, including the harness itself, can open the named job (or the cancel event), and a harness that keeps a handle to its own job defeats kill-on-close if the guard and the core both die; recovery still terminates the job by name. Harnesses are trusted to the same degree as on Unix, where they could equally leave their process group.
 - **CLI:** `zora run | status | transcript --since | simulate <script> | jobs [clear <id>]`. On macOS, `setup` and `install` belong to the app (permissions, speech model, `SMAppService`).
 
 ### Plugins
@@ -73,28 +82,23 @@ plugin(s) ──JSON lines──► PluginHost ──► InputQueue (ordered, bo
 | Plugin | OS | Language | Capabilities | Notes |
 |---|---|---|---|---|
 | `zora-macos` (= `Zora.app` main) | macOS 26+ | Swift | transcript, dictation, notify | SpeechAnalyzer + SpeechDetector; CoreAudio process objects; UserNotifications. It spawns `zorad --attached-plugin` (fds 3/4) and restarts it with backoff. Keeps the v1 identity: signed bundle, `NSMicrophoneUsageDescription`, `SMAppService.agent` called by the same app. |
-| `pipewire-dictation` | Linux | Rust (native `pipewire` crate) | dictation | Binds matching input-stream nodes (`application.process.binary` / `application.name` / `application.id` from config). Running state comes from node info. Requires a synchronized initial snapshot; handles removal and reconnection. Applications using pipewire-pulse are covered; a pure PulseAudio server or direct ALSA is unsupported (health unknown). |
+| `zora-dictation` (was `pipewire-dictation`) | Linux | Rust (native `pipewire` crate), `crates/zora-linux` | dictation | Binds every node; matching input-stream nodes (`application.process.binary` / `application.name` / `application.id` from config) count as dictating while their node state is running. A core `sync` round trip is the complete snapshot (initial, every second, and for each `sync`). Handles removal and reconnection. Applications using pipewire-pulse are covered; a pure PulseAudio server or direct ALSA is unsupported (health unknown). |
 | `zora-acdc` | macOS, Linux | Rust (`zorad` package, std-only HTTP to loopback) | notify | Puts each voice command on the local ACDC task board as a task and moves it with the job. Uses the notify message's `job` field. |
-| `freedesktop-notify` | Linux | Rust (`zbus` on tokio) | notify | `org.freedesktop.Notifications`. |
-| `local-stt` | Linux (macOS fallback) | Rust, separate crate and executable | transcript | cpal with its PipeWire backend (cpal ≥ 0.18), plus **sherpa-onnx streaming Zipformer `sherpa-onnx-streaming-zipformer-en-20M-2023-02-17` int8**, 1 thread, native endpointing. Times are anchored to captured samples. Silero gating and whisper.cpp are only added if measurements justify them. |
+| `zora-win-dictation` | Windows | Rust (`windows` crate, WASAPI) | dictation | Event-driven: `IMMNotificationClient`, `IAudioSessionNotification` per capture endpoint (registered before enumeration), `IAudioSessionEvents` per session. An active session of a `dictation.windowsApps` process, or of one that can't be identified (including a multi-process session), is dictation. A 250 ms snapshot reconciles; any disagreement, missed registration, callback failure, out-of-order event or device change makes the interval unknown. Off unless `dictation.windowsExperimental` is set (health unknown, so no command runs): delivery of every callback before a `sync` can't be proven. Untested on hardware (a gate). |
+| `zora-tray` | Windows | Rust (Win32) | notify | Notification-area icon, the same menu as macOS and Linux, notifications as balloons (toasts on Windows 10/11). Changes only through `zorad pause/resume/settings`. |
+| `zora-desktop` (was `freedesktop-notify`) | Linux | Rust (`zbus` + `ksni` on tokio), `crates/zora-linux` | notify | `org.freedesktop.Notifications`, plus the StatusNotifierItem tray with the macOS menu. Spawned by `zorad` like any plugin, so it gets `start`/`listening` and every event over the protocol; changes go through `zorad pause/resume/settings`. |
+| `zora-listen` (was `local-stt`) | Linux, Windows (file mode everywhere) | Rust, `crates/zora-listen` on `crates/zora-plugin` | transcript | cpal with its PipeWire backend (WASAPI on Windows; cpal ≥ 0.18), plus **sherpa-onnx streaming Zipformer `sherpa-onnx-streaming-zipformer-en-20M-2023-02-17` int8**, 1 thread, native endpointing. Times are anchored to captured samples. Silero gating and whisper.cpp are only added if measurements justify them. |
 
 ### Migration from v1
 
-The Swift v1 core stays until a **shared golden-fixture suite** (`fixtures/behavior/*.json`) passes on both the Swift and Rust cores. The fixtures cover input events (including Unicode, dictation, unknown intervals, gaps and ticks) and the expected outputs. Process-group and shutdown regressions must also pass on both platforms. The config and database formats are unchanged.
+The Swift v1 core was removed once the Rust core passed the shared golden-fixture suite (`fixtures/behavior/*.json`: input events, including Unicode, dictation, unknown intervals, gaps and ticks, with the expected outputs). The config and database formats are unchanged, so v1 config files still load.
 
 ## Gates
 
 | Area | Gate |
 |---|---|
 | macOS | Launch-at-login TCC and notification identity through `SMAppService`; real TypeWhisper dictation; sleep/wake; whole-system power. |
-| Linux, on the user's machine | Live mic coexistence with the dictation tool; observing that tool's PipeWire stream behaviour (idle, push-to-talk, release, persistent streams); notifications on the real desktop; the systemd user unit across login; suspend/resume. |
+| Linux, on the user's machine | Live mic coexistence with the dictation tool; observing that tool's PipeWire stream behaviour (idle, push-to-talk, release, persistent streams); notifications and the tray icon/menu/Settings dialogs on the real desktop (GNOME with AppIndicator, KDE); the systemd user unit across login, including the tray appearing when the service starts before the desktop; suspend/resume; a USB microphone unplugged and replugged. |
 | Linux STT targets | Idle CPU < 3% of one core, RSS < 150 MB, end phrase to dispatch < 4 s, plus missed/false command rates on a fixture set. |
 | Jobs | SIGKILL the core mid-job (and after the leader has exited, with a TERM-ignoring descendant still alive): the descendant must be dead before the next dispatch. |
-
-## This session's scope
-
-1. The Rust core, protocol and `zorad`, including guard and gate.
-2. The Swift plugin with inverted launch (the macOS vertical slice).
-3. Golden fixtures run on both cores.
-4. The Rust tests also run in linux/arm64 Docker.
-5. Stretch: synthetic PipeWire dictation tests and a mock D-Bus notifier; a WAV-based STT spike.
+| Windows | Ctrl+Break reaching a real `claude.exe`, and Claude Code installed with npm (through its `claude.cmd` shim); console close and logoff while a job runs; the tray app as the attached plugin. CI covers job containment, recovery and plugin cleanup. |

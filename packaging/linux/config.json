@@ -1,0 +1,13 @@
+{
+  "wakeNames": ["zora", "nova"],
+  "dictation": { "linuxApps": [], "monitor": "plugin" },
+  "defaultHarness": "claude",
+  "harnesses": {
+    "claude": { "type": "claude", "workspace": "~/projects/some-repo", "permissionMode": "acceptEdits" }
+  },
+  "plugins": {
+    "listen": { "command": ["~/.local/bin/zora-listen"] },
+    "dictation": { "command": ["~/.local/bin/zora-dictation"] },
+    "desktop": { "command": ["~/.local/bin/zora-desktop"] }
+  }
+}

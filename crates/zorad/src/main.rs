@@ -1,6 +1,7 @@
 mod guard;
 mod host;
 mod jobs;
+#[cfg_attr(windows, path = "os_windows.rs")]
 mod os;
 mod pause;
 mod queue;
@@ -18,7 +19,8 @@ use zora_core::suppression::DictationSignal;
 const USAGE: &str = "usage: zorad <command> [options]
 
   run [--dry-run]           Run the service (Linux: starts the configured plugins).
-  run --attached-plugin     macOS: started by Zora.app, which talks the plugin protocol on fds 3/4.
+  run --attached-plugin     macOS: started by Zora.app, which talks the plugin protocol on fds 3/4
+                            (Windows: on stdin/stdout).
   status                    Config problems, store, and jobs needing attention.
   transcript [--since 30m] [--last N] [--json]
                             Print the stored transcript (newest N lines with --last).
@@ -29,16 +31,20 @@ const USAGE: &str = "usage: zorad <command> [options]
   pause [30m|1h|...]        Stop listening: the microphone is released and nothing is transcribed.
                             Without a duration, stays paused (also across restarts) until `resume`.
   resume                    Start listening again.
-  settings [set <json>]     Print, or change, the settings the menu bar edits, as JSON: wakeNames,
+  settings [set <json>] [--dry-run]
+                            Print, or change, the settings the menu bar edits, as JSON: wakeNames,
                             phrases {start,end,cancel} and workspace (of the default harness).
+                            --dry-run lists problems as `run --dry-run` sees them.
   simulate <script>         Feed a scripted transcript through the command logic (dry run).
 
-  --config <path>           Config file (default ~/.config/zora/config.json).";
+  --config <path>           Config file (default ~/.config/zora/config.json; Windows:
+                            %APPDATA%\\Zora\\config.json).";
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("__guard") => std::process::exit(guard::guard_main()),
+        #[cfg(unix)]
         Some("__gate") => std::process::exit(guard::gate_main(args.get(2..).unwrap_or(&[]))),
         _ => {}
     }
@@ -89,13 +95,17 @@ fn load_config(path: Option<PathBuf>, create: bool) -> Result<Config, String> {
     Config::load(&path)
 }
 
+/// `zorad run` refused to start because of the config (EX_CONFIG). Supervisors don't restart on it: the menu bar
+/// shows the problem, and systemd has `RestartPreventExitStatus=78`.
+const EXIT_CONFIG: i32 = 78;
+
 fn cmd_run(path: Option<PathBuf>, rest: &[String]) -> i32 {
     let path_for_run = path.clone();
     let mut config = match load_config(path, true) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("zorad: {e}");
-            return 0; // clean exit: no restart loop for a broken config
+            return EXIT_CONFIG;
         }
     };
     if rest.iter().any(|a| a == "--dry-run") {
@@ -106,7 +116,7 @@ fn cmd_run(path: Option<PathBuf>, rest: &[String]) -> i32 {
         for p in &problems {
             eprintln!("config: {p}");
         }
-        return 0;
+        return EXIT_CONFIG;
     }
     let attached = rest.iter().any(|a| a == "--attached-plugin");
     let config_path = path_for_run.unwrap_or_else(Config::default_path);
@@ -114,13 +124,17 @@ fn cmd_run(path: Option<PathBuf>, rest: &[String]) -> i32 {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(service::run(
+    let code = rt.block_on(service::run(
         config,
         service::Options {
             attached,
             config_path,
         },
-    ))
+    ));
+    // Windows reads the attached plugin's stdin on a blocking thread that cannot be cancelled.
+    #[cfg(windows)]
+    rt.shutdown_background();
+    code
 }
 
 fn cmd_status(path: Option<PathBuf>) -> i32 {
@@ -371,7 +385,9 @@ struct PhrasesChange {
     cancel: Option<Vec<String>>,
 }
 
-fn settings_json(config: &Config, path: &std::path::Path) -> serde_json::Value {
+fn settings_json(config: &Config, path: &std::path::Path, dry_run: bool) -> serde_json::Value {
+    let mut checked = config.clone();
+    checked.dry_run |= dry_run;
     let workspace = config
         .harnesses
         .get(&config.default_harness)
@@ -383,7 +399,9 @@ fn settings_json(config: &Config, path: &std::path::Path) -> serde_json::Value {
         "harness": config.default_harness,
         "workspace": workspace,
         "configPath": path,
-        "problems": config.validate(),
+        "locale": config.locale,
+        "dictationBundleIDs": config.dictation.bundle_ids,
+        "problems": checked.validate(),
     })
 }
 
@@ -404,6 +422,7 @@ fn clean_list(items: Vec<String>) -> Vec<String> {
 }
 
 fn cmd_settings(path: Option<PathBuf>, rest: &[String]) -> i32 {
+    let original_len = rest.len();
     let path = path.unwrap_or_else(Config::default_path);
     let mut config = match load_config(Some(path.clone()), true) {
         Ok(c) => c,
@@ -412,7 +431,10 @@ fn cmd_settings(path: Option<PathBuf>, rest: &[String]) -> i32 {
             return 1;
         }
     };
-    match (rest.first().map(String::as_str), rest.get(1)) {
+    // `--dry-run`: report problems the way `zorad run --dry-run` sees them.
+    let rest: Vec<&String> = rest.iter().filter(|a| *a != "--dry-run").collect();
+    let dry_run = rest.len() < original_len;
+    match (rest.first().map(|a| a.as_str()), rest.get(1)) {
         (None, _) => {}
         (Some("set"), Some(json)) => {
             let change: SettingsChange = match serde_json::from_str(json) {
@@ -468,7 +490,7 @@ fn cmd_settings(path: Option<PathBuf>, rest: &[String]) -> i32 {
             return 2;
         }
     }
-    println!("{}", settings_json(&config, &path));
+    println!("{}", settings_json(&config, &path, dry_run));
     0
 }
 
@@ -501,19 +523,24 @@ fn cmd_jobs(rest: &[String]) -> i32 {
             eprintln!("no running job {id}");
             return 1;
         };
-        // Signal only a job group that is provably this job's (leader pid == pgid with the recorded start time);
-        // its guard then reaps the group and the core records the outcome.
-        match (job.job_pgid, job.gate_start) {
-            (Some(pgid), Some(start)) if os::start_time(pgid as i32) == Some(start) => {
-                os::signal_group(pgid as i32, libc::SIGTERM);
-                println!("job {} cancelled", job.id);
-                return 0;
+        // The guard does the signalling and records "cancelled"; nothing here confirms it.
+        let Some(marker) = jobs::cancel_marker(&job.id) else {
+            eprintln!(
+                "job {} has an id that cannot be cancelled from here",
+                job.id
+            );
+            return 1;
+        };
+        return match os::cancel_job(job, &marker) {
+            Ok(()) => {
+                println!("cancellation requested for job {}", job.id);
+                0
             }
-            _ => {
-                eprintln!("job {} has no verifiable running process group", job.id);
-                return 1;
+            Err(e) => {
+                eprintln!("job {} {e}", job.id);
+                1
             }
-        }
+        };
     }
     if rest.first().map(String::as_str) == Some("clear") {
         let Some(id) = rest.get(1) else {
@@ -524,6 +551,7 @@ fn cmd_jobs(rest: &[String]) -> i32 {
             return 1;
         };
         s.set_status(id, "interrupted");
+        jobs::remove_cancel_marker(id);
         println!("job {id} marked interrupted");
         return 0;
     }

@@ -136,6 +136,8 @@ impl Coordinator {
                     && !self.detector.is_capturing()
                     && !self.suppression.is_dictating()
                     && self.suppression.healthy()
+                    // Speech that suppression history can't cover yet will be stored, not matched.
+                    && self.suppression.covers(now)
                     && self.detector.config.mentions_start(&text)
                 {
                     self.early_listening = Some(now);
@@ -171,15 +173,28 @@ impl Coordinator {
         let dictated = s.overlaps_dictation(seg.start, seg.end);
         let uncovered = s.overlaps_unknown(seg.start, seg.end) || !s.covers(seg.start);
         // State changes happen before the store effect is emitted, so order of effects mirrors decisions.
-        let outputs = if stale {
-            self.detector.abort(DiscardReason::SuppressionUnknown)
+        let blocked = if stale || uncovered {
+            Some(DiscardReason::SuppressionUnknown)
         } else if dictated {
-            self.detector.abort(DiscardReason::Dictation)
-        } else if uncovered {
-            self.detector.abort(DiscardReason::SuppressionUnknown)
+            Some(DiscardReason::Dictation)
         } else {
-            self.detector.feed(&seg)
+            None
         };
+        let mut outputs = match blocked {
+            Some(reason) => self.detector.abort(reason),
+            None => self.detector.feed(&seg),
+        };
+        // Live text already announced "listening" for speech that won't be matched: say it was dropped, so
+        // nothing keeps showing a capture that doesn't exist.
+        if let Some(reason) = blocked
+            && outputs.is_empty()
+            && self
+                .early_listening
+                .take()
+                .is_some_and(|t| now - t <= 20 * SECOND)
+        {
+            outputs.push(DetectorOutput::Discarded(reason));
+        }
         self.apply(outputs, now, fx);
         fx.push(Effect::Store {
             segment: seg,

@@ -60,18 +60,28 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
     private var pausedUntil: Date?
     /// Shown instead of the state line until the core next reports its listening state.
     private var notice: String?
-    private lazy var settings = SettingsWindow(cli: cli)
+    /// The newest core connection the menu has heard about.
+    private var connection: UInt64 = 0
+    /// Why the core won't start; nil while the config is valid.
+    private var setupProblems: [String]?
+    private var problemItems: [NSMenuItem] = []
+    private let settingsItem = NSMenuItem(title: "Settings…", action: nil, keyEquivalent: ",")
+    private lazy var settings = SettingsWindow(cli: cli, saved: settingsSaved)
     var soundsEnabled = true
 
     private let pauseMic: () -> Void
     private let restoreMic: () -> Void
+    private let settingsSaved: () -> Void
 
     /// `pauseMic` releases the microphone right away when the user pauses from the menu; `restoreMic` ends
     /// that local pause (the pause could not be saved, or the user resumed) and shows the core's state again.
-    init(cli: ZoradCLI, pauseMic: @escaping () -> Void, restoreMic: @escaping () -> Void) {
+    /// `settingsSaved` runs after Settings saved a change.
+    init(cli: ZoradCLI, pauseMic: @escaping () -> Void, restoreMic: @escaping () -> Void,
+         settingsSaved: @escaping () -> Void) {
         self.cli = cli
         self.pauseMic = pauseMic
         self.restoreMic = restoreMic
+        self.settingsSaved = settingsSaved
         super.init()
         stateLine.isEnabled = false
         menu.addItem(stateLine)
@@ -81,7 +91,7 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
             entry.action = action
             menu.addItem(entry)
         }
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.action = #selector(openSettings)
         settingsItem.target = self
         menu.addItem(settingsItem)
         menu.addItem(historyAnchor)
@@ -91,11 +101,17 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         item.menu = menu
+        setEnabled()
         render()
     }
 
     /// The core's listening state (`start` and `listening` messages, docs/protocol.md).
-    func setListening(_ on: Bool, until: Date?) {
+    /// `connection` numbers core connections (Bridge); updates queued from an older connection are ignored.
+    func setListening(_ on: Bool, until: Date?, connection: UInt64? = nil) {
+        if let connection {
+            guard connection >= self.connection else { return }
+            self.connection = connection
+        }
         listening = on
         pausedUntil = on ? nil : until
         pendingTask?.cancel()
@@ -107,6 +123,54 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
             state = .idle
         }
         render()
+    }
+
+    /// The core is gone (exited, restarting): until a new one reports, the menu says it is starting rather than
+    /// claiming to listen.
+    func coreStopped(connection: UInt64) {
+        guard connection >= self.connection else { return }
+        self.connection = connection
+        listening = nil
+        pausedUntil = nil
+        pendingTask?.cancel()
+        pendingTask = nil
+        resetTask?.cancel()
+        notice = nil
+        state = .idle
+        setEnabled()
+        render()
+    }
+
+    /// The core refused the config (`problems`), or accepts it again (nil). While refused, the menu lists the
+    /// problems and offers Settings; pausing makes no sense without a core.
+    func setNeedsSetup(_ problems: [String]?) {
+        guard problems != setupProblems else { return }
+        let first = setupProblems == nil && problems != nil
+        setupProblems = problems
+        // Whatever was showing belongs to a core that has gone.
+        pendingTask?.cancel()
+        pendingTask = nil
+        resetTask?.cancel()
+        notice = nil
+        state = .idle
+        problemItems.forEach(menu.removeItem)
+        problemItems = (problems ?? []).map { p in
+            let entry = NSMenuItem(title: Self.friendly(p), action: nil, keyEquivalent: "")
+            entry.toolTip = p
+            entry.isEnabled = false
+            return entry
+        }
+        for (i, entry) in problemItems.enumerated() { menu.insertItem(entry, at: menu.index(of: stateLine) + 1 + i) }
+        setEnabled()
+        render()
+        // Shown once per episode, so a fresh install or a vanished project folder doesn't go unnoticed.
+        if first, problems?.contains(where: { $0.contains("workspace") }) == true { settings.show() }
+    }
+
+    /// The menu has little room; the full text is in the tooltip.
+    private static func friendly(_ problem: String) -> String {
+        if problem.contains("workspace") { return "Choose a project folder in Settings" }
+        return String(problem.prefix(80)) + (problem.count > 80 ? "…" : "")
     }
 
     /// Maps a core event kind (docs/protocol.md `notify.kind`) to a state.
@@ -200,9 +264,12 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         }
     }
 
+    /// The items work only with a core that has said whether it listens, and never while a pause or resume
+    /// is still running.
     private func setEnabled() {
-        pauseItem.isEnabled = true
-        pauseHourItem.isEnabled = true
+        let on = setupProblems == nil && !requestInFlight && listening != nil
+        pauseItem.isEnabled = on
+        pauseHourItem.isEnabled = on
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -220,7 +287,13 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         let paused = listening == false
         let symbol: String
         let label: String
-        if paused && state == .idle {
+        if setupProblems != nil {
+            symbol = "gear.badge.xmark"
+            label = "Zora needs setup: it isn't listening"
+        } else if listening == nil && state == .idle {
+            symbol = "ellipsis"
+            label = "Zora: starting…"
+        } else if paused && state == .idle {
             symbol = "mic.slash"
             label = pausedUntil.map { "Zora: paused until \($0.formatted(date: .omitted, time: .shortened))" }
                 ?? "Zora: paused (not listening)"
@@ -232,7 +305,7 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         image?.isTemplate = true
         item.button?.image = image
         item.button?.toolTip = label
-        stateLine.title = notice ?? label
+        stateLine.title = setupProblems == nil ? (notice ?? label) : label
         pauseItem.title = paused ? "Resume Listening" : "Pause Listening"
         pauseHourItem.isHidden = paused
     }

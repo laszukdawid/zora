@@ -2,7 +2,6 @@ import AVFAudio
 import CoreMedia
 import Foundation
 import Speech
-import ZoraCore
 import os
 
 private let log = Logger(subsystem: "dev.zora.agent", category: "speech")

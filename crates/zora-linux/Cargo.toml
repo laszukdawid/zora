@@ -1,0 +1,26 @@
+[package]
+name = "zora-linux"
+version.workspace = true
+edition.workspace = true
+description = "Linux plugins for zorad: dictation monitor (zora-dictation), notifications and tray (zora-desktop)"
+
+# Watches PipeWire for capture streams of the configured dictation apps.
+[[bin]]
+name = "zora-dictation"
+path = "src/bin/zora-dictation.rs"
+
+# Desktop notifications and the tray icon.
+[[bin]]
+name = "zora-desktop"
+path = "src/bin/zora-desktop.rs"
+
+[dependencies]
+zora-plugin = { path = "../zora-plugin" }
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.10"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+ksni = { version = "0.3", default-features = false, features = ["tokio"] }
+tokio.workspace = true
+serde.workspace = true

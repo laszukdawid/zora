@@ -1,6 +1,6 @@
 use zora_core::config::{Config, Harness};
 use zora_core::detector::{tokens, units};
-use zora_core::harness::{HarnessSpec, last_line_summary};
+use zora_core::harness::{HarnessSpec, NpmShim, last_line_summary, npm_shim_target};
 use zora_core::store::Store;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -27,7 +27,7 @@ fn normalizer() {
 
 #[test]
 fn config_defaults_fill_missing_keys_and_v1_files_load() {
-    let c: Config = serde_json::from_str(r#"{"capture":{"maxChars":10},"harnesses":{"c":{"workspace":"/tmp"}},"defaultHarness":"c"}"#).unwrap();
+    let c: Config = serde_json::from_value(serde_json::json!({"capture":{"maxChars":10},"harnesses":{"c":{"workspace":std::env::temp_dir()}},"defaultHarness":"c"})).unwrap();
     assert_eq!(c.capture.max_chars, 10);
     assert_eq!(c.capture.hold_back_seconds, 1.5);
     assert_eq!(c.harnesses["c"].executable, "claude");
@@ -73,6 +73,22 @@ fn config_rejects_permission_bypass_everywhere() {
 }
 
 #[test]
+fn config_rejects_harness_env_that_would_inject_variables() {
+    for (k, v) in [("A=B", "1"), ("", "1"), ("A\0B", "1"), ("A", "1\0B=2")] {
+        let mut c = Config {
+            dry_run: true,
+            ..Config::default()
+        };
+        c.harnesses
+            .get_mut("claude")
+            .unwrap()
+            .env
+            .insert(k.into(), v.into());
+        assert_eq!(c.validate().len(), 1, "{k:?}={v:?}");
+    }
+}
+
+#[test]
 fn config_requires_workspace_unless_dry_run() {
     let mut c = Config::default();
     assert!(!c.validate().is_empty());
@@ -113,6 +129,74 @@ fn harness_argv_and_summaries() {
     assert_eq!((r.success, r.summary.as_str()), (false, "exit 3: boom"));
 }
 
+/// What npm's cmd-shim writes (`writeShim_` in lib/index.js): `pathext_inline` is its current main, otherwise
+/// 6.x to 8.x (8.0.0 ships with npm 11). `vars` and `args` come from the target's shebang.
+fn cmd_shim(target: &str, shebang: Option<(&str, &str, &str)>, pathext_inline: bool) -> String {
+    let head = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n";
+    let target = format!("\"%dp0%\\{target}\"");
+    let Some((vars, prog, args)) = shebang else {
+        return format!("{head}{target}   %*\r\n");
+    };
+    let vars: String = vars
+        .split_whitespace()
+        .map(|v| format!("@SET {v}\r\n"))
+        .collect();
+    let (else_extra, inline) = if pathext_inline {
+        ("", "set PATHEXT=%PATHEXT:;.JS;=;% & ")
+    } else {
+        ("  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n", "")
+    };
+    format!(
+        "{head}{vars}\r\nIF EXIST \"%dp0%\\{prog}.exe\" (\r\n  SET \"_prog=%dp0%\\{prog}.exe\"\r\n) ELSE (\r\n  SET \"_prog={prog}\"\r\n\
+         {else_extra})\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & {inline}\"%_prog%\" {args} {target} %*\r\n"
+    )
+}
+
+#[test]
+fn npm_shims_resolve_to_what_they_start() {
+    let cli = "node_modules\\@anthropic-ai\\claude-code\\cli.js";
+    for inline in [false, true] {
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("", "node", "")), inline)),
+            Some(NpmShim::Node(cli.into()))
+        );
+        // LF line endings (a checkout that converted them) parse the same.
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("", "node", "")), inline).replace("\r\n", "\n")),
+            Some(NpmShim::Node(cli.into()))
+        );
+        // Interpreter flags, variables or another interpreter would be dropped or changed: refused.
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("", "node", "--inspect")), inline)),
+            None
+        );
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("NODE_OPTIONS=x", "node", "")), inline)),
+            None
+        );
+        assert_eq!(
+            npm_shim_target(&cmd_shim(cli, Some(("", "python", "")), inline)),
+            None
+        );
+    }
+    let exe = "node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
+    assert_eq!(
+        npm_shim_target(&cmd_shim(exe, None, false)),
+        Some(NpmShim::Program(exe.into()))
+    );
+    assert_eq!(
+        npm_shim_target(&cmd_shim("node_modules\\x\\run.ps1", None, false)),
+        None
+    );
+    // A quoted path elsewhere in the file is not the invocation.
+    let edited = cmd_shim(cli, Some(("", "node", "")), true).replace(
+        "CALL :find_dp0\r\n",
+        "CALL :find_dp0\r\nREM \"%dp0%\\evil.exe\"\r\n",
+    );
+    assert_eq!(npm_shim_target(&edited), None);
+    assert_eq!(npm_shim_target("@echo off\r\nrun.exe %*\r\n"), None);
+}
+
 #[test]
 fn store_batches_prunes_both_tables_and_keeps_live_jobs() {
     let path = tmp("z.sqlite");
@@ -138,19 +222,22 @@ fn store_batches_prunes_both_tables_and_keeps_live_jobs() {
     // Finished commands are pruned; a running job is kept until it is final.
     assert_eq!(s.count("commands"), 1);
     assert!(s.take_failure().is_none());
-    use std::os::unix::fs::PermissionsExt;
-    assert_eq!(
-        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert_eq!(
-        std::fs::metadata(path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o700
-    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
 }
 
 #[test]
@@ -449,7 +536,7 @@ mod early_listening {
     use zora_core::clock::{SECOND, secs};
     use zora_core::config::Config;
     use zora_core::coordinator::{Coordinator, Effect, Input};
-    use zora_core::model::{Segment, ZoraEvent};
+    use zora_core::model::{DiscardReason, Segment, ZoraEvent};
     use zora_core::suppression::DictationSignal;
 
     fn listening(fx: &[Effect]) -> usize {
@@ -503,6 +590,56 @@ mod early_listening {
         let fx = c.handle(Input::Segment(seg), now + 3 * SECOND);
         assert_eq!(listening(&fx), 0, "{fx:?}");
         assert!(c.is_capturing());
+    }
+
+    #[test]
+    fn live_text_before_coverage_announces_nothing() {
+        let (mut c, t0) = setup();
+        let fx = c.handle(
+            Input::Partial {
+                text: "Hey Zora".into(),
+            },
+            t0 + SECOND,
+        );
+        assert_eq!(listening(&fx), 0, "{fx:?}");
+    }
+
+    #[test]
+    fn an_announced_capture_that_cannot_be_matched_is_reported_discarded() {
+        let (mut c, t0) = setup();
+        let now = t0 + 10 * SECOND;
+        assert_eq!(
+            listening(&c.handle(
+                Input::Partial {
+                    text: "Hey Zora".into()
+                },
+                now
+            )),
+            1
+        );
+        c.handle(Input::Dictation(DictationSignal::Began(now)), now);
+        c.handle(
+            Input::Dictation(DictationSignal::Ended(now + SECOND)),
+            now + SECOND,
+        );
+        let seg = Segment {
+            generation: 0,
+            session: 1,
+            start: now - SECOND,
+            end: now + SECOND,
+            text: "Hey Zora, say hi.".into(),
+        };
+        let fx = c.handle(Input::Segment(seg), now + 2 * SECOND);
+        assert!(
+            fx.iter().any(|e| matches!(
+                e,
+                Effect::Notify(ZoraEvent::CaptureDiscarded {
+                    reason: DiscardReason::Dictation
+                })
+            )),
+            "{fx:?}"
+        );
+        assert!(!c.is_capturing());
     }
 
     #[test]
