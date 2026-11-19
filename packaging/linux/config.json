@@ -1,6 +1,6 @@
 {
   "wakeNames": ["zora", "nova"],
-  "dictation": { "linuxApps": ["nerd-dictation"], "monitor": "plugin" },
+  "dictation": { "linuxApps": [], "monitor": "plugin" },
   "defaultHarness": "claude",
   "harnesses": {
     "claude": { "type": "claude", "workspace": "~/projects/some-repo", "permissionMode": "acceptEdits" }

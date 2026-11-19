@@ -163,14 +163,34 @@ impl Recognizer for Sherpa {
     }
 }
 
-/// Downloads and checks the model. Needs `curl`, `tar` and `bzip2`.
+/// Downloads and checks the model. Needs `curl`, `tar` and `bzip2`. Everything happens in a staging directory
+/// of its own; only a checked, complete model replaces the installed one, in a single rename.
 pub fn setup(config: &Value, force: bool) -> Result<PathBuf, String> {
     let dir = model_dir(config);
     if model_present(&dir) && !force {
         return Ok(dir);
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let archive = dir.join(".download.tar.bz2");
+    let parent = dir.parent().ok_or("model directory has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    let staging = sibling(&dir, "staging");
+    std::fs::create_dir(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    let result = download_into(&staging).and_then(|model| activate(&model, &dir));
+    let _ = std::fs::remove_dir_all(&staging);
+    result.map(|()| dir)
+}
+
+/// A unique path next to `dir`, so concurrent runs never share files.
+fn sibling(dir: &Path, what: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("model");
+    dir.with_file_name(format!(".{name}.{what}-{}-{nanos}", std::process::id()))
+}
+
+fn download_into(staging: &Path) -> Result<PathBuf, String> {
+    let archive = staging.join("model.tar.bz2");
     eprintln!("downloading {URL}");
     let ok = std::process::Command::new("curl")
         .args(["--fail", "--location", "--proto", "=https", "--output"])
@@ -180,32 +200,53 @@ pub fn setup(config: &Value, force: bool) -> Result<PathBuf, String> {
         .map_err(|e| format!("cannot run curl: {e}"))?
         .success();
     if !ok {
-        let _ = std::fs::remove_file(&archive);
         return Err("download failed".into());
     }
     let digest = sha256_file(&archive)?;
     if digest != SHA256 {
-        let _ = std::fs::remove_file(&archive);
         return Err(format!(
-            "checksum mismatch (got {digest}); the download was removed"
+            "checksum mismatch (got {digest}); nothing was installed"
         ));
     }
+    let model = staging.join("model");
+    std::fs::create_dir(&model).map_err(|e| e.to_string())?;
     let members: Vec<String> = FILES.iter().map(|f| format!("{MODEL}/{f}")).collect();
     let ok = std::process::Command::new("tar")
         .arg("-xjf")
         .arg(&archive)
         .arg("-C")
-        .arg(&dir)
+        .arg(&model)
         .arg("--strip-components=1")
         .args(&members)
         .status()
         .map_err(|e| format!("cannot run tar: {e}"))?
         .success();
-    let _ = std::fs::remove_file(&archive);
-    if !ok || !model_present(&dir) {
+    if !ok || !model_present(&model) {
         return Err("cannot unpack the model (is bzip2 installed?)".into());
     }
-    Ok(dir)
+    Ok(model)
+}
+
+/// Puts a complete `staged` model in place of `dir`, keeping the old one if anything fails.
+fn activate(staged: &Path, dir: &Path) -> Result<(), String> {
+    if !model_present(staged) {
+        return Err("the new model is incomplete; nothing was installed".into());
+    }
+    let old = sibling(dir, "old");
+    let had_old = dir.exists();
+    if had_old {
+        std::fs::rename(dir, &old).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    if let Err(e) = std::fs::rename(staged, dir) {
+        if had_old {
+            let _ = std::fs::rename(&old, dir);
+        }
+        return Err(format!("{}: {e}", dir.display()));
+    }
+    if had_old {
+        let _ = std::fs::remove_dir_all(&old);
+    }
+    Ok(())
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -236,6 +277,34 @@ mod tests {
         );
         assert!(model_dir(&json!({})).ends_with(format!("zora/models/{MODEL}")));
         assert!(!model_present(Path::new("/nonexistent")));
+    }
+
+    fn fake_model(dir: &Path, complete: bool) {
+        std::fs::create_dir_all(dir).unwrap();
+        let n = if complete { FILES.len() } else { 2 };
+        for f in &FILES[..n] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn activation_replaces_only_with_a_complete_model() {
+        let root = std::env::temp_dir().join(format!("zora-stt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let live = root.join("models").join(MODEL);
+        fake_model(&live, true);
+        std::fs::write(live.join("marker"), b"old").unwrap();
+        let partial = root.join("partial");
+        fake_model(&partial, false);
+        assert!(activate(&partial, &live).is_err());
+        assert!(live.join("marker").exists(), "the installed model is kept");
+        let full = root.join("full");
+        fake_model(&full, true);
+        activate(&full, &live).unwrap();
+        assert!(model_present(&live) && !live.join("marker").exists());
+        let leftovers = std::fs::read_dir(root.join("models")).unwrap().count();
+        assert_eq!(leftovers, 1, "the old copy is removed");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

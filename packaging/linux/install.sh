@@ -12,11 +12,18 @@ systemctl --user daemon-reload
 
 "$HOME/.local/bin/zora-listen" setup
 
-config="${XDG_CONFIG_HOME:-$HOME/.config}/zora/config.json"
-if [ ! -e "$config" ]; then
-    install -Dm600 packaging/linux/config.json "$config"
-    echo "wrote $config; set harnesses.claude.workspace and dictation.linuxApps"
+# The same path zorad reads (it does not follow XDG_CONFIG_HOME). A hard link never replaces an existing file, so
+# a config written meanwhile is kept.
+config="$HOME/.config/zora/config.json"
+mkdir -p "$(dirname "$config")"
+tmp="$(mktemp "$(dirname "$config")/.config.json.XXXXXX")"
+install -m600 packaging/linux/config.json "$tmp"
+if ln "$tmp" "$config" 2>/dev/null; then
+    echo "wrote $config"
+    echo "set harnesses.claude.workspace, and either name your dictation tool in dictation.linuxApps"
+    echo "(run zora-dictation watch and dictate to see its name) or set dictation.monitor to \"none\""
 else
     echo "$config exists; merge the \"plugins\" and \"dictation\" parts of packaging/linux/config.json into it"
 fi
+rm -f "$tmp"
 echo "then: zorad status && systemctl --user enable --now zora"

@@ -101,10 +101,12 @@ The tray's Settings dialogs use `zenity` or `kdialog`; without either, the tray 
 
 ### Config
 
-`packaging/linux/config.json` is a complete starting config; `install.sh` copies it when there is none yet.
+`packaging/linux/config.json` is a complete starting config; `install.sh` copies it to `~/.config/zora/config.json`
+(where `zorad` reads it) when there is none yet. It lists no dictation app, so no command runs until you name yours
+or turn the monitor off (below).
 
 ```json
-"dictation": { "linuxApps": ["nerd-dictation"], "monitor": "plugin" },
+"dictation": { "linuxApps": [], "monitor": "plugin" },
 "plugins": {
   "listen":    { "command": ["~/.local/bin/zora-listen"] },
   "dictation": { "command": ["~/.local/bin/zora-dictation"] },
@@ -118,19 +120,25 @@ The tray's Settings dialogs use `zenity` or `kdialog`; without either, the tray 
 - `zora-listen` takes `model` (a model directory; default `$XDG_DATA_HOME/zora/models/<model>`), `threads` (default
   1), `endpointSeconds` (silence that ends an utterance, default 1.0) and `partials` (live text for the early
   "listening" notice, default `true`).
-- `linuxApps` lists the dictation tool by process binary, application name or id; `pw-dump | grep application.`
-  while it records shows what it reports. With no names listed, the monitor reports itself unhealthy and no command
-  runs. Without a dictation tool, set `"dictation": {"monitor": "none"}` and drop the `dictation` plugin.
+- `linuxApps` names the program that actually records for your dictation tool, by process binary, application name
+  or id. That is often not the tool itself: Nerd Dictation, for one, records through a helper such as `parec` by
+  default. Run `zora-dictation watch`, dictate, and use the name it shows for the stream that turns running (a
+  generic helper like `parec` also pauses Zora when anything else records with it, which is the safe direction).
+  With no names listed, the monitor reports itself unhealthy and no command runs. Without a dictation tool, set
+  `"dictation": {"monitor": "none"}` and drop the `dictation` plugin.
 
 ### How the pieces behave
 
 - **Microphone.** `zora-listen` opens the microphone only after its model has loaded and the core has said
-  `listening: true`, closes it on a pause, and drops audio it has not transcribed yet. It also closes it when the
+  `start` and then `listening: true`, closes it on a pause, and drops audio it has not transcribed yet (from the moment
+  the pause arrives, before the device has finished closing; a result still being decoded is not sent). It also closes it when the
   core goes away (it is the core's child and exits when its input closes). Open, close and stop run in one thread in
   message order, so a late resume can never reopen it after a pause or a stop.
-- **Dictation monitor.** It fails closed: health is unknown until the first complete snapshot (a PipeWire core
-  `sync` round trip after binding every node), when PipeWire is not running or the connection drops (it reconnects
-  every second), and when observations stall for more than 1.5 s. A pure PulseAudio or ALSA system is not supported
+- **Dictation monitor.** It reports a dictation stream starting or stopping as soon as PipeWire says so, so even a
+  short one between two checks is suppressed. It fails closed: health is unknown until the first complete snapshot
+  (a PipeWire core `sync` round trip that returns after every bound node has sent its state), when PipeWire is not
+  running, when the connection drops or a round trip goes unanswered for 3 s (it reconnects every second), and when
+  observations stall for more than 1.5 s. A pure PulseAudio or ALSA system is not supported
   and stays unknown, so no command runs there.
 - **Tray.** `zora-desktop` is a notify plugin that `zorad` starts, not a separate autostart program: the protocol
   already delivers the listening state and every event it shows, and the icon goes away with the service instead of
