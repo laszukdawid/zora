@@ -141,9 +141,15 @@ impl Out {
 
     /// Adds `seq` and `generation`. Returns false once the core has stopped reading, or when the message is too
     /// long to send; that one is dropped without using up a sequence number.
-    pub fn send(&self, mut v: Value) -> bool {
+    pub fn send(&self, v: Value) -> bool {
+        self.send_if(v, || true)
+    }
+
+    /// Like `send`, but asks `still` once it holds the writer, just before writing: a message that waited
+    /// behind another write is dropped if it has gone stale meanwhile (a pause, say).
+    pub fn send_if(&self, mut v: Value, still: impl FnOnce() -> bool) -> bool {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if st.broken {
+        if st.broken || !still() {
             return false;
         }
         let seq = st.seq + 1;
@@ -380,6 +386,48 @@ mod tests {
             (Some(1), Some(2))
         );
         assert!(!out.is_broken());
+    }
+
+    #[test]
+    fn a_message_gone_stale_while_waiting_for_the_writer_is_dropped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        struct Gate(Mutex<mpsc::Receiver<()>>, Buf);
+        impl Write for Gate {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.lock().unwrap().recv();
+                self.1.write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (release, wait) = mpsc::channel();
+        let buf = Buf::default();
+        let out = Arc::new(Out::new(Box::new(Gate(Mutex::new(wait), buf.clone()))));
+        let allowed = Arc::new(AtomicBool::new(true));
+        let a = {
+            let out = out.clone();
+            std::thread::spawn(move || out.send(json!({"t": "gap", "reason": "first"})))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let b = {
+            let (out, allowed) = (out.clone(), allowed.clone());
+            std::thread::spawn(move || {
+                out.send_if(json!({"t": "segment", "text": "late"}), || {
+                    allowed.load(Ordering::SeqCst)
+                })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        allowed.store(false, Ordering::SeqCst); // the pause arrives while both wait
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        assert!(a.join().unwrap());
+        assert!(!b.join().unwrap());
+        let l = lines(&buf);
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0]["reason"], "first");
     }
 
     #[test]
