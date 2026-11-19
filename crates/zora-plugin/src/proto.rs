@@ -69,12 +69,10 @@ pub fn parse(line: &str) -> CoreMsg {
             listening: listening.unwrap_or(false),
             until: v["until"].as_f64(),
         },
-        Some("listening") => match listening {
-            Some(listening) => CoreMsg::Listening {
-                listening,
-                until: v["until"].as_f64(),
-            },
-            None => CoreMsg::Other,
+        // A malformed `listening` is read as a pause, so it can only ever close the microphone.
+        Some("listening") => CoreMsg::Listening {
+            listening: listening.unwrap_or(false),
+            until: v["until"].as_f64(),
         },
         Some("sync") => match v["id"].as_u64() {
             Some(id) => CoreMsg::Sync {
@@ -141,17 +139,22 @@ impl Out {
         write_line(&mut st, &v)
     }
 
-    /// Adds `seq` and `generation`. Returns false once the core has stopped reading.
+    /// Adds `seq` and `generation`. Returns false once the core has stopped reading, or when the message is too
+    /// long to send; that one is dropped without using up a sequence number.
     pub fn send(&self, mut v: Value) -> bool {
         let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if st.broken {
             return false;
         }
-        st.seq += 1;
+        let seq = st.seq + 1;
         if let Some(o) = v.as_object_mut() {
-            o.insert("seq".into(), json!(st.seq));
+            o.insert("seq".into(), json!(seq));
             o.insert("generation".into(), json!(st.generation));
         }
+        if v.to_string().len() >= MAX_LINE {
+            return false;
+        }
+        st.seq = seq;
         write_line(&mut st, &v)
     }
 
@@ -302,7 +305,14 @@ mod tests {
     fn unknown_or_incomplete_messages_are_ignored() {
         assert_eq!(parse("{not json"), CoreMsg::Other);
         assert_eq!(parse(r#"{"t":"future-thing"}"#), CoreMsg::Other);
-        assert_eq!(parse(r#"{"t":"listening"}"#), CoreMsg::Other);
+        assert_eq!(
+            parse(r#"{"t":"listening","listening":"yes"}"#),
+            CoreMsg::Listening {
+                listening: false,
+                until: None
+            },
+            "a malformed listening message pauses"
+        );
         assert_eq!(parse(r#"{"t":"sync"}"#), CoreMsg::Other);
         // `start` without a state must not open the microphone.
         assert_eq!(
@@ -354,6 +364,22 @@ mod tests {
             read_line(&mut "ab\ncd".as_bytes()).unwrap().as_deref(),
             Some("ab")
         );
+    }
+
+    #[test]
+    fn oversized_message_keeps_the_sequence_unbroken() {
+        let buf = Buf::default();
+        let out = Out::new(Box::new(buf.clone()));
+        assert!(out.send(json!({"t": "gap", "reason": "a"})));
+        assert!(!out.send(json!({"t": "segment", "text": "x".repeat(MAX_LINE)})));
+        assert!(out.send(json!({"t": "gap", "reason": "b"})));
+        let l = lines(&buf);
+        assert_eq!(l.len(), 2);
+        assert_eq!(
+            (l[0]["seq"].as_u64(), l[1]["seq"].as_u64()),
+            (Some(1), Some(2))
+        );
+        assert!(!out.is_broken());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! `Recognizer` so tests (and the e2e file mode) run without a model.
 
 use crate::clock::{MILLI, Ns, SECOND, now_ns};
-use crate::mic::{Audio, AudioInput, AudioSink, MicEvent, run_mic};
+use crate::mic::{Audio, AudioInput, AudioSink, Live, MicEvent, run_mic};
 use crate::proto::{CoreMsg, Out, clock_reply, handshake, parse, read_line};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -133,7 +133,7 @@ impl Resampler {
 /// Turns chunks into protocol events. Owns the recognizer; runs on one thread.
 pub struct Engine<R: Recognizer> {
     rec: R,
-    epoch: Arc<AtomicU64>,
+    live: Arc<Live>,
     seen_epoch: u64,
     session: u64,
     resampler: Option<Resampler>,
@@ -147,15 +147,18 @@ pub struct Engine<R: Recognizer> {
     buf: Vec<f32>,
 }
 
+/// Longest segment text sent; the protocol's line limit is 64 KiB and escaping can double the size.
+const MAX_TEXT: usize = 16 * 1024;
+
 /// More than this between two chunks is a discontinuity (suspend, stalled device).
 const MAX_JUMP: Ns = 500 * MILLI;
 
 impl<R: Recognizer> Engine<R> {
-    pub fn new(rec: R, epoch: Arc<AtomicU64>) -> Self {
-        let seen_epoch = epoch.load(Ordering::SeqCst);
+    pub fn new(rec: R, live: Arc<Live>) -> Self {
+        let seen_epoch = live.epoch();
         Engine {
             rec,
-            epoch,
+            live,
             seen_epoch,
             session: 1,
             resampler: None,
@@ -175,7 +178,7 @@ impl<R: Recognizer> Engine<R> {
 
     /// Drops untranscribed audio when the microphone was closed or reopened since the last chunk.
     pub fn check_epoch(&mut self) {
-        let e = self.epoch.load(Ordering::SeqCst);
+        let e = self.live.epoch();
         if e != self.seen_epoch {
             self.seen_epoch = e;
             self.restart();
@@ -194,6 +197,13 @@ impl<R: Recognizer> Engine<R> {
 
     pub fn handle(&mut self, audio: Audio, emit: &mut dyn FnMut(Event)) {
         self.check_epoch();
+        // Rechecked as each result goes out: a pause during decoding must not let it through.
+        let (live, epoch) = (self.live.clone(), self.seen_epoch);
+        let emit = &mut |ev: Event| {
+            if live.current(epoch) {
+                emit(ev)
+            }
+        };
         match audio {
             Audio::Samples {
                 epoch,
@@ -294,6 +304,13 @@ impl<R: Recognizer> Engine<R> {
         let start_ns = time(u.start.min(u.end)).min(end_ns);
         // The core rejects anything older than 15 minutes.
         if start_ns < now - 15 * 60 * SECOND + SECOND {
+            return;
+        }
+        if text.len() > MAX_TEXT {
+            emit(Event::Gap {
+                at_ns: start_ns,
+                reason: "utterance too long to send".into(),
+            });
             return;
         }
         emit(Event::Segment {
@@ -477,6 +494,21 @@ impl Recognizer for ScriptedRecognizer {
     }
 }
 
+/// What a core message means for the microphone: the event for the mic thread, and whether audio is allowed
+/// from now on. Nothing is allowed before `start`; a malformed `listening` arrives as a pause.
+pub fn mic_control(started: &mut bool, msg: &CoreMsg) -> Option<(MicEvent, bool)> {
+    match msg {
+        CoreMsg::Start { listening, .. } => {
+            *started = true;
+            Some((MicEvent::Start(*listening), *listening))
+        }
+        CoreMsg::Listening { listening, .. } => {
+            Some((MicEvent::Listening(*listening), *listening && *started))
+        }
+        _ => None,
+    }
+}
+
 /// The whole `transcript` plugin over stdin/stdout: handshake, microphone on/off, the engine, and `stop`.
 /// `make_recognizer` runs on the engine thread after `ready` (loading a model can take a while); until it
 /// succeeds the microphone stays closed and `status{ready:false}` says why.
@@ -499,18 +531,18 @@ where
         }
     };
     let config = session.config.clone();
-    let epoch = Arc::new(AtomicU64::new(0));
+    let live = Arc::new(Live::default());
     let (audio_tx, audio_rx) = mpsc::sync_channel::<Audio>(QUEUE);
     let (mic_tx, mic_rx) = mpsc::channel::<MicEvent>();
 
     let engine = {
-        let (out, epoch, mic_tx) = (out.clone(), epoch.clone(), mic_tx.clone());
+        let (out, live, mic_tx) = (out.clone(), live.clone(), mic_tx.clone());
         let partials = config["partials"].as_bool().unwrap_or(true);
         std::thread::spawn(move || match make_recognizer(&config) {
             Ok(rec) => {
                 out.send(json!({"t": "status", "ready": true, "reason": "speech ready"}));
                 let _ = mic_tx.send(MicEvent::Ready);
-                let mut engine = Engine::new(rec, epoch);
+                let mut engine = Engine::new(rec, live);
                 engine.partials = partials;
                 run_engine(engine, audio_rx, |ev| {
                     out.send(ev.to_json());
@@ -529,13 +561,13 @@ where
         })
     };
     let mic = {
-        let (out, epoch, mic_tx) = (out.clone(), epoch.clone(), mic_tx.clone());
+        let (out, live, mic_tx) = (out.clone(), live.clone(), mic_tx.clone());
         let status_out = out.clone();
         std::thread::spawn(move || {
             run_mic(
                 make_input,
                 mic_rx,
-                epoch,
+                live,
                 audio_tx,
                 mic_tx,
                 Box::new(move |ready, reason| {
@@ -557,12 +589,21 @@ where
     };
 
     let mut stopped = false;
+    let mut started = false;
     while let Ok(Some(line)) = read_line(&mut input) {
-        match parse(&line) {
-            CoreMsg::Start { listening, .. } | CoreMsg::Listening { listening, .. } => {
-                eprintln!("zora-listen: listening={listening}");
-                let _ = mic_tx.send(MicEvent::Listening(listening));
+        let msg = parse(&line);
+        if let Some((ev, allow)) = mic_control(&mut started, &msg) {
+            eprintln!("zora-listen: {ev:?}, listening={allow}");
+            // Takes effect here, before the mic thread gets to it.
+            if allow {
+                live.allow();
+            } else {
+                live.revoke();
             }
+            let _ = mic_tx.send(ev);
+            continue;
+        }
+        match msg {
             CoreMsg::Clock { id } => {
                 out.send(clock_reply(id));
             }
@@ -578,8 +619,9 @@ where
             break;
         }
     }
-    // The core went away: close the microphone before exiting.
-    let _ = mic_tx.send(MicEvent::Stop);
+    // The core went away: drop what wasn't transcribed and close the microphone before exiting.
+    live.revoke();
+    let _ = mic_tx.send(MicEvent::Disconnect);
     join_mic(Duration::from_secs(2));
     drop(engine);
     0
@@ -595,10 +637,12 @@ mod tests {
             .collect()
     }
 
-    fn engine(lines: &[&str]) -> (Engine<ScriptedRecognizer>, Arc<AtomicU64>) {
-        let epoch = Arc::new(AtomicU64::new(1));
+    fn engine(lines: &[&str]) -> (Engine<ScriptedRecognizer>, Arc<Live>) {
+        let live = Arc::new(Live::default());
+        live.bump();
+        live.allow();
         let rec = ScriptedRecognizer::new(lines.iter().map(|s| s.to_string()));
-        (Engine::new(rec, epoch.clone()), epoch)
+        (Engine::new(rec, live.clone()), live)
     }
 
     /// Feeds `samples` (16 kHz mono) in 20 ms chunks ending at `t0 + offset`.
@@ -683,21 +727,22 @@ mod tests {
         assert!(segments(&evs).is_empty());
         let session = e.session();
         // Paused mid-utterance; no further audio arrives.
-        epoch.store(2, Ordering::SeqCst);
+        epoch.revoke();
         e.check_epoch();
         assert_eq!(e.session(), session + 1);
         // A chunk still queued from the old epoch is ignored.
         let evs = feed(&mut e, &vec![0.0; 16_000], t0 + SECOND, 1);
         assert!(segments(&evs).is_empty());
         // Resumed: only new speech is transcribed; "secret" was never finished.
-        epoch.store(3, Ordering::SeqCst);
+        epoch.bump();
+        epoch.allow();
         let mut a = tone(0.5, RATE, 0.3);
         a.extend(vec![0.0; 16_000]);
         let evs = feed(&mut e, &a, t0 + 5 * SECOND, 3);
         assert_eq!(segments(&evs)[0].2, "secret", "the script just moves on");
         let (mut e2, epoch2) = engine(&["first"]);
         feed(&mut e2, &tone(1.0, RATE, 0.3), t0, 1);
-        epoch2.store(2, Ordering::SeqCst);
+        epoch2.revoke();
         let (tx, rx) = mpsc::channel();
         let mut evs = vec![];
         e2.handle(Audio::Finish { epoch: 1, done: tx }, &mut |ev| evs.push(ev));
@@ -773,6 +818,100 @@ mod tests {
         e.partials = false;
         let evs = feed(&mut e, &tone(1.0, RATE, 0.3), now_ns() - SECOND, 1);
         assert!(!evs.iter().any(|e| matches!(e, Event::Partial { .. })));
+    }
+
+    /// Pauses (as the protocol thread would) while the recognizer is still decoding.
+    struct PausedMidDecode(ScriptedRecognizer, Arc<Live>);
+
+    impl Recognizer for PausedMidDecode {
+        fn accept(&mut self, s: &[f32]) {
+            self.0.accept(s)
+        }
+        fn partial(&mut self) -> String {
+            self.0.partial()
+        }
+        fn endpoint(&mut self) -> Option<Utterance> {
+            let u = self.0.endpoint();
+            if u.is_some() {
+                self.1.revoke();
+            }
+            u
+        }
+        fn finish(&mut self) -> Option<Utterance> {
+            self.0.finish()
+        }
+        fn reset(&mut self) {
+            self.0.reset()
+        }
+    }
+
+    #[test]
+    fn a_result_finished_after_a_pause_is_not_sent() {
+        let live = Arc::new(Live::default());
+        live.bump();
+        live.allow();
+        let rec = PausedMidDecode(
+            ScriptedRecognizer::new(["secret".to_string()]),
+            live.clone(),
+        );
+        let mut e = Engine::new(rec, live);
+        let mut a = tone(0.5, RATE, 0.3);
+        a.extend(vec![0.0; 16_000]);
+        let mut evs = vec![];
+        for c in a.chunks(320) {
+            e.handle(
+                Audio::Samples {
+                    epoch: 1,
+                    data: c.to_vec(),
+                    channels: 1,
+                    rate: RATE,
+                    end_ns: now_ns(),
+                    lost_before: false,
+                },
+                &mut |ev| evs.push(ev),
+            );
+        }
+        assert!(segments(&evs).is_empty(), "{evs:?}");
+    }
+
+    #[test]
+    fn an_utterance_too_long_to_send_becomes_a_gap() {
+        let (mut e, _) = engine(&[&"word ".repeat(5000)]);
+        let mut a = tone(0.5, RATE, 0.3);
+        a.extend(vec![0.0; 16_000]);
+        let evs = feed(&mut e, &a, now_ns() - 10 * SECOND, 1);
+        assert!(segments(&evs).is_empty());
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Event::Gap { reason, .. } if reason.contains("too long")))
+        );
+    }
+
+    #[test]
+    fn microphone_control_needs_start_first() {
+        let mut started = false;
+        let l = |on| CoreMsg::Listening {
+            listening: on,
+            until: None,
+        };
+        assert_eq!(
+            mic_control(&mut started, &l(true)),
+            Some((MicEvent::Listening(true), false)),
+            "no audio before start"
+        );
+        let start = CoreMsg::Start {
+            listening: true,
+            until: None,
+        };
+        assert_eq!(
+            mic_control(&mut started, &start),
+            Some((MicEvent::Start(true), true))
+        );
+        assert_eq!(
+            mic_control(&mut started, &l(false)),
+            Some((MicEvent::Listening(false), false))
+        );
+        assert_eq!(mic_control(&mut started, &CoreMsg::Stop), None);
     }
 
     #[test]
