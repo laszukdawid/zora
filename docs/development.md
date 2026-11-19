@@ -26,9 +26,32 @@ docker run --rm --platform linux/arm64 -v "$PWD":/src:ro -w /src rust:1.98 \
 packaging/macos/bundle.sh --install                            # build, sign and install Zora.app
 ```
 
+A source build needs Xcode 26, Rust 1.89 or later, and an "Apple Development" signing certificate (Xcode creates
+one for free with any Apple ID under Xcode → Settings → Accounts). `bundle.sh --install` installs to
+`~/Applications`; run `~/Applications/Zora.app/Contents/MacOS/zora setup` afterwards.
+
 `Zora.app` starts the core itself (`Contents/MacOS/zorad`), so microphone and notification permissions stay with
 the app's identity. `ZORA_SIGN_IDENTITY` picks the signing identity; the default is the first "Apple Development"
 one. An ad-hoc signature would lose the microphone permission on every rebuild.
+
+## Releases
+
+Pushing a tag `v<version>` that matches the Cargo workspace version runs `.github/workflows/release.yml`. It
+builds Zora.app, signs it with a Developer ID certificate, notarizes and staples both the app and
+`Zora-<version>.dmg`, and creates a **draft** GitHub release with the dmg and its SHA-256. Check it, then publish.
+
+The workflow needs these repository secrets, in a `release` environment:
+
+| Secret | What |
+|---|---|
+| `MACOS_CERT_P12` | The "Developer ID Application" certificate and its private key, exported as .p12 and base64-encoded |
+| `MACOS_CERT_PASSWORD` | The .p12 export password |
+| `NOTARY_KEY` | Contents of an App Store Connect API key (`AuthKey_<id>.p8`) with the Developer role |
+| `NOTARY_KEY_ID`, `NOTARY_ISSUER` | That key's ID and the issuer ID shown on App Store Connect → Users and Access → Integrations |
+
+To build a release locally instead, store the notarization credentials once with
+`xcrun notarytool store-credentials zora-notary --key <path.p8> --key-id <id> --issuer <issuer>`, then run
+`ZORA_NOTARY_PROFILE=zora-notary packaging/macos/release.sh`. The dmg lands in `dist/`.
 
 ## Linux
 
@@ -58,7 +81,8 @@ dictation tool, set `"dictation": {"monitor": "none"}`.
 | `zora status` (macOS) | Permissions, speech model, login item, dictation monitor |
 | `zora install` / `uninstall` (macOS) | Start Zora at login, or stop doing so |
 
-On macOS both live in `~/Applications/Zora.app/Contents/MacOS/`.
+On macOS both live in `Zora.app/Contents/MacOS/`: `/Applications` for a release, `~/Applications` for a
+`bundle.sh --install` build.
 
 `zorad run` exits with status 78 (`EX_CONFIG`) when the config is invalid. Supervisors must not restart it in a
 loop: the macOS app shows "needs setup" in the menu bar and starts the core again once `zorad settings` reports no
