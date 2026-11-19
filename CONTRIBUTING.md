@@ -14,7 +14,7 @@ cargo test --workspace          # golden fixtures, unit tests, end-to-end tests 
 swift build                     # macOS app only
 ```
 
-CI runs the same checks on macOS and Linux for every pull request.
+CI only checks formatting, lints and that the macOS app builds, so run the tests yourself before opening a pull request.
 
 ## What a pull request should include
 

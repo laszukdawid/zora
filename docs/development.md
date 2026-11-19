@@ -61,8 +61,7 @@ Secrets of the `release` environment:
 Anyone who can push a `v*` tag can run the signing job, and it runs scripts from the tagged commit. So keep the
 secrets behind two repository settings: the `release` environment requires your approval (Settings →
 Environments → release → Required reviewers), and a tag ruleset lets only maintainers create `v*` tags and nobody
-move or delete them. The build job also refuses a tag whose commit isn't on `main` or whose CI run on `main`
-hasn't passed, so wait for CI to finish before you push the tag. Approve the signing job only for a tag you pushed
+move or delete them. Approve the signing job only for a tag you pushed
 yourself.
 
 To build a release locally instead, store the notarization credentials once with
@@ -169,7 +168,7 @@ or turn the monitor off (below).
 
 ## Windows
 
-The core (`zorad`) builds and passes the full test suite on Windows 10 and later; CI runs it on `windows-2025`.
+The core (`zorad`) builds and passed its full test suite on Windows (windows-2025) during development.
 The plugins are new and have so far only been compiled, not run on Windows. **Windows is experimental: no
 voice command runs there by default.** The dictation monitor reports health unknown until you opt in with
 `"dictation": {"windowsExperimental": true}` (or set `"monitor": "none"` if you use no dictation app). WASAPI
@@ -221,7 +220,7 @@ What differs from Unix (details in [design.md](design.md)):
 To type-check the Windows code from macOS or Linux, use `rustup target add x86_64-pc-windows-msvc` and
 `cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc`. Bundled SQLite needs a C compiler for
 that target, so point `CC_x86_64_pc_windows_msvc` and `AR_x86_64_pc_windows_msvc` at a stub that only creates
-its output file (nothing is linked), or rely on CI.
+its output file (nothing is linked).
 
 ## Command line
 
