@@ -330,6 +330,12 @@ pub struct Graph {
     /// Nodes that ever matched a configured app: they stay matching until removed, whatever happens to their
     /// identity, so running and stopping alone decide their edges.
     sticky: std::collections::HashSet<u32>,
+    /// The same, by `object.serial` (unique for a server's lifetime): kept across reconnects to the same server,
+    /// so a recorder that survives a reconnect with only a generic name still counts.
+    matched_serials: std::collections::HashSet<u64>,
+    serials: std::collections::HashMap<u32, u64>,
+    /// The server those serials belong to.
+    server: Option<String>,
     /// Blind spots opened by an identity change on a running node: they close when it stops or goes away.
     until_stopped: std::collections::HashSet<u32>,
 }
@@ -342,7 +348,18 @@ impl Graph {
             streams: Default::default(),
             blind: Default::default(),
             sticky: Default::default(),
+            matched_serials: Default::default(),
+            serials: Default::default(),
+            server: None,
             until_stopped: Default::default(),
+        }
+    }
+
+    /// The server this connection reached (from the core info). Serials from another server mean nothing.
+    pub fn server(&mut self, identity: &str) {
+        if self.server.as_deref() != Some(identity) {
+            self.matched_serials.clear();
+            self.server = Some(identity.to_string());
         }
     }
 
@@ -350,8 +367,11 @@ impl Graph {
         self.streams.get(&id).map(|n| n.effective(&self.apps))
     }
 
-    /// A node appeared. `media_class` is from its registry entry, when it carries one.
-    pub fn discovered(&mut self, id: u32, media_class: Option<&str>, now: Ns) {
+    /// A node appeared. `media_class` and `serial` (`object.serial`) are from its registry entry.
+    pub fn discovered(&mut self, id: u32, media_class: Option<&str>, serial: Option<u64>, now: Ns) {
+        if let Some(serial) = serial {
+            self.serials.insert(id, serial);
+        }
         let node = self.streams.entry(id).or_default();
         node.global_class = media_class.map(String::from);
         if node.effective(&self.apps) != Class::Irrelevant {
@@ -394,8 +414,14 @@ impl Graph {
             != identity_before;
         let class = node.effective(&self.apps);
         let driver = node.is_driver();
+        if let Some(serial) = node.prop("object.serial").and_then(|v| v.parse().ok()) {
+            self.serials.entry(id).or_insert(serial);
+        }
         if let Class::Capture { matches: true, .. } = class {
             self.sticky.insert(id);
+            if let Some(serial) = self.serials.get(&id) {
+                self.matched_serials.insert(*serial);
+            }
         }
         // What a running node did while its identity changed is not known: blind until it stops.
         let relevant = relevant_before || class != Class::Irrelevant;
@@ -424,6 +450,9 @@ impl Graph {
         let mut out = self.close_blind(id, driver, now);
         self.streams.remove(&id);
         self.sticky.remove(&id);
+        if let Some(serial) = self.serials.remove(&id) {
+            self.matched_serials.remove(&serial);
+        }
         out.extend(self.edges(now));
         out
     }
@@ -446,7 +475,12 @@ impl Graph {
     /// The node is running and is (or once was) a configured dictation app's capture stream.
     fn dictating(&self, id: u32) -> bool {
         let running = self.streams.get(&id).is_some_and(|n| n.running);
-        (running && self.sticky.contains(&id))
+        let matched = self.sticky.contains(&id)
+            || self
+                .serials
+                .get(&id)
+                .is_some_and(|s| self.matched_serials.contains(s));
+        (running && matched)
             || matches!(
                 self.class(id),
                 Some(Class::Capture {
@@ -464,8 +498,10 @@ impl Graph {
         self.streams.get(&id)
     }
 
-    /// The connection is gone; everything learned on it is forgotten.
+    /// The connection is gone; everything learned on it is forgotten, except which serials matched (they are
+    /// dropped when the next connection reaches a different server).
     pub fn clear(&mut self) {
+        self.serials.clear();
         self.streams.clear();
         self.blind.clear();
         self.sticky.clear();
@@ -557,6 +593,12 @@ mod tests {
         g
     }
 
+    impl Graph {
+        fn discovered_t(&mut self, id: u32, class: Option<&str>, now: Ns) {
+            self.discovered(id, class, None, now);
+        }
+    }
+
     fn unknown(from_ns: Ns, to_ns: Ns) -> Msg {
         Msg::Unknown { from_ns, to_ns }
     }
@@ -567,7 +609,7 @@ mod tests {
     fn registry_class_and_info_identity_together_detect_a_recorder() {
         let t = 10 * SECOND;
         let mut g = graph(t);
-        g.discovered(1, Some(CAPTURE_CLASS), t);
+        g.discovered_t(1, Some(CAPTURE_CLASS), t);
         // The info names the app but not the class; the registry supplied that.
         let out = g.info(1, Some([("application.name", REC)]), true, t + 100 * MILLI);
         assert_eq!(
@@ -595,7 +637,7 @@ mod tests {
     fn every_blind_interval_is_unknown_when_it_closes() {
         let t = 10 * SECOND;
         let mut g = graph(t);
-        g.discovered(1, Some(CAPTURE_CLASS), t);
+        g.discovered_t(1, Some(CAPTURE_CLASS), t);
         let rec = [("media.class", CAPTURE_CLASS), ("application.name", REC)];
         assert_eq!(g.info(1, Some(rec), false, t), [unknown(t, t)]);
         // Idle, then it loses its identity, runs while unclassified, and comes back as another app.
@@ -632,13 +674,13 @@ mod tests {
         );
         assert!(g.complete());
         // A node seen only through its registry entry and removed unseen: also unknown.
-        g.discovered(2, None, t + 500 * MILLI);
+        g.discovered_t(2, None, t + 500 * MILLI);
         assert_eq!(
             g.removed(2, t + 600 * MILLI),
             [unknown(t + 500 * MILLI, t + 600 * MILLI)]
         );
         // Even when the first info proves it irrelevant (its registry entry had no class).
-        g.discovered(3, None, t + 600 * MILLI);
+        g.discovered_t(3, None, t + 600 * MILLI);
         let out = g.info(
             3,
             Some([("media.class", "Audio/Sink")]),
@@ -652,13 +694,13 @@ mod tests {
     fn only_registry_proof_or_a_driver_marker_avoid_blind_spots() {
         let t = 10 * SECOND;
         let mut g = graph(t);
-        g.discovered(1, Some("Audio/Sink"), t);
+        g.discovered_t(1, Some("Audio/Sink"), t);
         assert!(g.complete(), "proved irrelevant at discovery");
         assert!(
             g.info(1, Some([("node.name", "speakers")]), false, t)
                 .is_empty()
         );
-        g.discovered(2, None, t);
+        g.discovered_t(2, None, t);
         let driver = [
             ("node.name", "Dummy-Driver"),
             ("factory.name", "support.node.driver"),
@@ -679,7 +721,7 @@ mod tests {
         ];
         for (i, (global, props)) in cases.into_iter().enumerate() {
             let id = 10 + i as u32;
-            g.discovered(id, global, t);
+            g.discovered_t(id, global, t);
             g.info(id, Some(props), false, t);
             assert_eq!(g.class(id), Some(Class::Unclassified), "case {i}");
             assert!(!g.complete());
@@ -692,7 +734,7 @@ mod tests {
     fn a_running_recorder_that_goes_blind_still_counts_as_capturing() {
         let t = 10 * SECOND;
         let mut g = graph(t);
-        g.discovered(1, Some(CAPTURE_CLASS), t);
+        g.discovered_t(1, Some(CAPTURE_CLASS), t);
         let rec = [("media.class", CAPTURE_CLASS), ("application.name", REC)];
         g.info(1, Some(rec), true, t);
         assert!(g.capturing());
@@ -729,7 +771,7 @@ mod tests {
     fn losing_only_the_matching_property_while_running_does_not_end_capture() {
         let t = 10 * SECOND;
         let mut g = graph(t);
-        g.discovered(1, Some(CAPTURE_CLASS), t);
+        g.discovered_t(1, Some(CAPTURE_CLASS), t);
         let both = [
             ("media.class", CAPTURE_CLASS),
             ("application.process.binary", REC),
@@ -763,7 +805,7 @@ mod tests {
     fn a_node_that_once_matched_stays_matching_until_removed() {
         let t = 10 * SECOND;
         let mut g = graph(t);
-        g.discovered(1, Some(CAPTURE_CLASS), t);
+        g.discovered_t(1, Some(CAPTURE_CLASS), t);
         let both = [
             ("media.class", CAPTURE_CLASS),
             ("application.process.binary", REC),
@@ -803,16 +845,61 @@ mod tests {
         ));
         // Removal forgets it; a new node with the generic name alone is not matching.
         g.removed(1, later + 300 * MILLI);
-        g.discovered(2, Some(CAPTURE_CLASS), later);
+        g.discovered_t(2, Some(CAPTURE_CLASS), later);
         g.info(2, Some(generic), true, later + 400 * MILLI);
         assert!(!g.capturing());
+    }
+
+    #[test]
+    fn a_match_survives_a_reconnect_to_the_same_server() {
+        let t = 10 * SECOND;
+        let rec = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.process.binary", REC),
+        ];
+        let generic = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.name", "Recorder"),
+        ];
+        let mut g = graph(t);
+        g.server("pipewire-0:1234");
+        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t);
+        g.info(5, Some(rec), true, t);
+        assert!(g.capturing());
+        // The connection drops and comes back to the same server; the node now shows only a generic name.
+        g.clear();
+        g.server("pipewire-0:1234");
+        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 5 * SECOND);
+        g.info(5, Some(generic), true, t + 5 * SECOND);
+        assert!(g.capturing(), "still the recorder");
+        // A restarted server reuses nothing: the same serial there is another node.
+        g.clear();
+        g.server("pipewire-0:9999");
+        g.discovered(5, Some(CAPTURE_CLASS), Some(77), t + 9 * SECOND);
+        g.info(5, Some(generic), true, t + 9 * SECOND);
+        assert!(!g.capturing());
+        // The serial can also come from the info properties.
+        let mut g = graph(t);
+        g.server("s");
+        g.discovered(1, Some(CAPTURE_CLASS), None, t);
+        let with_serial = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.process.binary", REC),
+            ("object.serial", "42"),
+        ];
+        g.info(1, Some(with_serial), true, t);
+        g.clear();
+        g.server("s");
+        g.discovered(1, Some(CAPTURE_CLASS), Some(42), t + SECOND);
+        g.info(1, Some(generic), true, t + SECOND);
+        assert!(g.capturing());
     }
 
     #[test]
     fn identity_changes_on_irrelevant_nodes_are_ignored() {
         let t = 10 * SECOND;
         let mut g = graph(t);
-        g.discovered(1, Some("Audio/Sink"), t);
+        g.discovered_t(1, Some("Audio/Sink"), t);
         g.info(1, Some([("application.name", "a")]), true, t);
         g.info(1, Some([("application.name", "b")]), true, t + SECOND);
         assert!(g.complete());
@@ -823,7 +910,7 @@ mod tests {
         let t = 10 * SECOND;
         let mut g = graph(t);
         // node.driver=true with a matching app and no class: could be the recorder.
-        g.discovered(1, None, t);
+        g.discovered_t(1, None, t);
         g.info(
             1,
             Some([("node.driver", "true"), ("application.name", REC)]),
@@ -832,7 +919,7 @@ mod tests {
         );
         assert_eq!(g.class(1), Some(Class::Unclassified));
         // Even the driver factory with an app identity is not exempt.
-        g.discovered(2, None, t);
+        g.discovered_t(2, None, t);
         let f = [
             ("factory.name", "support.node.driver"),
             ("application.name", REC),
@@ -840,7 +927,7 @@ mod tests {
         g.info(2, Some(f), false, t);
         assert_eq!(g.class(2), Some(Class::Unclassified));
         // A capture node that can drive the graph is a capture node; its blind interval is reported.
-        g.discovered(3, Some(CAPTURE_CLASS), t);
+        g.discovered_t(3, Some(CAPTURE_CLASS), t);
         let c = [
             ("media.class", CAPTURE_CLASS),
             ("node.driver", "true"),
@@ -861,7 +948,7 @@ mod tests {
     fn graph_reports_edges_from_node_info() {
         let t = 10 * SECOND;
         let mut g = graph(t);
-        g.discovered(3, Some(CAPTURE_CLASS), t);
+        g.discovered_t(3, Some(CAPTURE_CLASS), t);
         let props = [("media.class", CAPTURE_CLASS), ("application.name", REC)];
         assert_eq!(g.info(3, Some(props), false, t), [unknown(t, t)]);
         assert!(g.complete() && g.known(3));

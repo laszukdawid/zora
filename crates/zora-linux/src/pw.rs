@@ -146,8 +146,19 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
     let nodes: Rc<RefCell<HashMap<u32, (Node, NodeListener)>>> = Rc::default();
 
     let core_listener = {
-        let (s1, s2) = (Rc::downgrade(shared), Rc::downgrade(shared));
+        let (s1, s2, s3) = (
+            Rc::downgrade(shared),
+            Rc::downgrade(shared),
+            Rc::downgrade(shared),
+        );
         core.add_listener_local()
+            .info(move |info| {
+                // The cookie is random per server start, so it tells a restarted server from the same one.
+                if let Some(shared) = s3.upgrade() {
+                    let identity = format!("{}:{}", info.name(), info.cookie());
+                    shared.borrow_mut().graph.server(&identity);
+                }
+            })
             .done(move |id, seq| {
                 if id == pw::core::PW_ID_CORE
                     && let Some(shared) = s1.upgrade()
@@ -189,7 +200,15 @@ fn connect(context: &pw::context::ContextRc, shared: &Rc<RefCell<Shared>>) -> Re
                 };
                 let id = obj.id;
                 let class = obj.props.as_ref().and_then(|p| p.get("media.class"));
-                shared.borrow_mut().graph.discovered(id, class, now_ns());
+                let serial = obj
+                    .props
+                    .as_ref()
+                    .and_then(|p| p.get("object.serial"))
+                    .and_then(|v| v.parse().ok());
+                shared
+                    .borrow_mut()
+                    .graph
+                    .discovered(id, class, serial, now_ns());
                 let Ok(node) = reg.bind::<Node, _>(obj) else {
                     eprintln!("zora-dictation: cannot bind node {id}");
                     return;
