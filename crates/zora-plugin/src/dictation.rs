@@ -327,8 +327,8 @@ pub struct Graph {
     streams: std::collections::HashMap<u32, StreamNode>,
     /// Blind spots and since when.
     blind: std::collections::HashMap<u32, Ns>,
-    /// Nodes seen capturing for a configured app while running: they count as capturing until seen not
-    /// running or removed, whatever happens to their identity meanwhile.
+    /// Nodes that ever matched a configured app: they stay matching until removed, whatever happens to their
+    /// identity, so running and stopping alone decide their edges.
     sticky: std::collections::HashSet<u32>,
     /// Blind spots opened by an identity change on a running node: they close when it stops or goes away.
     until_stopped: std::collections::HashSet<u32>,
@@ -394,14 +394,7 @@ impl Graph {
             != identity_before;
         let class = node.effective(&self.apps);
         let driver = node.is_driver();
-        if !running {
-            self.sticky.remove(&id);
-        } else if class
-            == (Class::Capture {
-                matches: true,
-                running: true,
-            })
-        {
+        if let Class::Capture { matches: true, .. } = class {
             self.sticky.insert(id);
         }
         // What a running node did while its identity changed is not known: blind until it stops.
@@ -450,9 +443,10 @@ impl Graph {
         self.blind.is_empty()
     }
 
-    /// A configured dictation app is capturing through this node now, or was and hasn't been seen to stop.
+    /// The node is running and is (or once was) a configured dictation app's capture stream.
     fn dictating(&self, id: u32) -> bool {
-        self.sticky.contains(&id)
+        let running = self.streams.get(&id).is_some_and(|n| n.running);
+        (running && self.sticky.contains(&id))
             || matches!(
                 self.class(id),
                 Some(Class::Capture {
@@ -615,13 +609,27 @@ mod tests {
             .is_empty()
         );
         assert!(!g.complete());
-        assert!(g.info(1, NONE, true, t + 200 * MILLI).is_empty());
+        // It once matched, so running counts as dictation even while unclassified.
+        let out = g.info(1, NONE, true, t + 200 * MILLI);
+        assert!(
+            matches!(out[..], [Msg::Dictation { began: true, .. }]),
+            "{out:?}"
+        );
         let other = [
             ("media.class", CAPTURE_CLASS),
             ("application.name", "browser"),
         ];
         let out = g.info(1, Some(other), false, t + 400 * MILLI);
-        assert_eq!(out, [unknown(t + 100 * MILLI, t + 400 * MILLI)]);
+        assert_eq!(
+            out,
+            [
+                unknown(t + 100 * MILLI, t + 400 * MILLI),
+                Msg::Dictation {
+                    began: false,
+                    at_ns: t + 400 * MILLI
+                }
+            ]
+        );
         assert!(g.complete());
         // A node seen only through its registry entry and removed unseen: also unknown.
         g.discovered(2, None, t + 500 * MILLI);
@@ -736,7 +744,7 @@ mod tests {
         ];
         let out = g.info(1, Some(generic), true, t + 300 * MILLI);
         assert!(out.is_empty(), "no ended: {out:?}");
-        assert!(g.capturing(), "sticky until seen not running");
+        assert!(g.capturing(), "still a matching node");
         assert!(!g.complete(), "the identity change opened a blind interval");
         assert!(g.monitor.observe(true, t + 400 * MILLI).is_empty());
         assert!(matches!(
@@ -749,6 +757,55 @@ mod tests {
         let out = g.info(1, NONE, false, t + SECOND);
         assert_eq!(out[0], unknown(t + 300 * MILLI, t + SECOND));
         assert!(matches!(out[1], Msg::Dictation { began: false, .. }));
+    }
+
+    #[test]
+    fn a_node_that_once_matched_stays_matching_until_removed() {
+        let t = 10 * SECOND;
+        let mut g = graph(t);
+        g.discovered(1, Some(CAPTURE_CLASS), t);
+        let both = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.process.binary", REC),
+            ("application.name", "Generic Recorder"),
+        ];
+        g.info(1, Some(both), true, t);
+        let generic = [
+            ("media.class", CAPTURE_CLASS),
+            ("application.name", "Generic Recorder"),
+        ];
+        g.info(1, Some(generic), true, t + 100 * MILLI);
+        let out = g.info(1, NONE, false, t + 200 * MILLI);
+        assert!(matches!(
+            out.last(),
+            Some(Msg::Dictation { began: false, .. })
+        ));
+        // Much later (the old blind interval long out of any lookback) it records again on the same node.
+        let later = t + 60 * SECOND;
+        g.monitor.observe(false, later);
+        let out = g.info(1, NONE, true, later + 100 * MILLI);
+        assert_eq!(
+            out.last(),
+            Some(&Msg::Dictation {
+                began: true,
+                at_ns: later + 100 * MILLI
+            })
+        );
+        assert!(g.complete());
+        assert!(g.monitor.observe(true, later + 200 * MILLI).is_empty());
+        assert!(matches!(
+            g.monitor.synced(1, later + 200 * MILLI),
+            Msg::Synced {
+                capturing: true,
+                healthy: true,
+                ..
+            }
+        ));
+        // Removal forgets it; a new node with the generic name alone is not matching.
+        g.removed(1, later + 300 * MILLI);
+        g.discovered(2, Some(CAPTURE_CLASS), later);
+        g.info(2, Some(generic), true, later + 400 * MILLI);
+        assert!(!g.capturing());
     }
 
     #[test]

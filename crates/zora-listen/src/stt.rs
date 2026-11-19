@@ -44,23 +44,36 @@ fn expand_tilde(p: &str) -> String {
     }
 }
 
-/// Every model file is there and not empty.
+/// Every model file is there and not empty, with the sizes its manifest records. A model without a manifest
+/// (installed by hand, or before manifests) is accepted; one with a manifest that can't be read is not.
 pub fn model_present(dir: &Path) -> bool {
-    let sizes = manifest(dir).map(|m| {
-        m.into_iter()
-            .map(|(name, size, _)| (name, size))
-            .collect::<std::collections::HashMap<_, _>>()
-    });
-    FILES.iter().all(|f| {
-        std::fs::metadata(dir.join(f)).is_ok_and(|m| {
-            m.is_file() && m.len() > 0 && sizes.as_ref().is_none_or(|s| s.get(*f) == Some(&m.len()))
-        })
-    })
+    model_status(dir).is_ok()
+}
+
+/// `model_present`, with the reason when it isn't.
+pub fn model_status(dir: &Path) -> Result<(), String> {
+    let entries = manifest(dir)?;
+    for f in FILES {
+        let path = dir.join(f);
+        let len = match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() && m.len() > 0 => m.len(),
+            _ => return Err(format!("{} is missing or empty", path.display())),
+        };
+        if let Some(entries) = &entries
+            && !entries.iter().any(|(n, size, _)| n == f && *size == len)
+        {
+            return Err(format!("{} does not match the manifest", path.display()));
+        }
+    }
+    Ok(())
 }
 
 /// Written into each version setup installs: every model file's name, size and SHA-256, taken right after the
 /// downloaded archive passed its checksum.
 const MANIFEST: &str = "manifest";
+
+/// A manifest line: file name, size, SHA-256.
+type Entry = (String, u64, String);
 
 fn write_manifest(dir: &Path) -> Result<(), String> {
     let mut text = String::new();
@@ -74,24 +87,40 @@ fn write_manifest(dir: &Path) -> Result<(), String> {
     std::fs::write(dir.join(MANIFEST), text).map_err(|e| e.to_string())
 }
 
-/// The manifest's entries, or None when there is none (a version from before manifests, or not setup's).
-fn manifest(dir: &Path) -> Option<Vec<(String, u64, String)>> {
-    let text = std::fs::read_to_string(dir.join(MANIFEST)).ok()?;
-    text.lines()
+/// The manifest's entries; `None` when there is no manifest. A manifest that can't be read, doesn't parse, or
+/// doesn't list every model file is an error, never "no manifest".
+fn manifest(dir: &Path) -> Result<Option<Vec<Entry>>, String> {
+    let path = dir.join(MANIFEST);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let bad = || format!("{} is damaged", path.display());
+    let entries: Vec<Entry> = text
+        .lines()
         .map(|l| {
-            let mut it = l.split(' ');
-            Some((
-                it.next()?.to_string(),
-                it.next()?.parse().ok()?,
-                it.next()?.to_string(),
-            ))
+            let f: Vec<&str> = l.split(' ').collect();
+            match f[..] {
+                [name, size, sum]
+                    if sum.len() == 64 && sum.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    Some((name.to_string(), size.parse().ok()?, sum.to_string()))
+                }
+                _ => None,
+            }
         })
-        .collect()
+        .collect::<Option<_>>()
+        .ok_or_else(bad)?;
+    if !FILES.iter().all(|f| entries.iter().any(|(n, ..)| n == f)) {
+        return Err(bad());
+    }
+    Ok(Some(entries))
 }
 
 /// Every model file matches the manifest, byte for byte (by size and SHA-256).
 fn verify(dir: &Path) -> Result<(), String> {
-    let entries = manifest(dir).ok_or_else(|| format!("{} has no manifest", dir.display()))?;
+    let entries = manifest(dir)?.ok_or_else(|| format!("{} has no manifest", dir.display()))?;
     for f in FILES {
         let Some((_, size, sum)) = entries.iter().find(|(n, ..)| n == f) else {
             return Err(format!("{f} is not in the manifest"));
@@ -117,9 +146,9 @@ impl Sherpa {
         let dir = model_dir(config);
         // Resolve the link once, so every file comes from the same version even if setup swaps it meanwhile.
         let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
-        if !model_present(&dir) {
+        if let Err(e) = model_status(&dir) {
             return Err(format!(
-                "speech model missing in {}; run `zora-listen setup`",
+                "speech model not usable in {} ({e}); run `zora-listen setup`",
                 dir.display()
             ));
         }
@@ -516,6 +545,35 @@ mod tests {
         assert!(!model_present(&live), "size no longer matches");
         assert!(verify(&live).is_err());
         assert!(prune(&serde_json::json!({"model": live})).is_err());
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    #[test]
+    fn a_damaged_manifest_is_never_read_as_no_manifest() {
+        let r = root("badmanifest");
+        let live = r.join(MODEL);
+        install(&live, false, fetch_tagged("a")).unwrap();
+        assert!(model_present(&live));
+        // A truncated file, and a manifest that no longer parses.
+        std::fs::write(live.join(FILES[0]), b"x").unwrap();
+        std::fs::write(live.join(MANIFEST), b"garbage\n").unwrap();
+        assert!(!model_present(&live));
+        assert!(model_status(&live).unwrap_err().contains("damaged"));
+        let err = Sherpa::load(&serde_json::json!({"model": live}))
+            .err()
+            .unwrap();
+        assert!(err.contains("damaged"), "{err}");
+        // Non-forced setup doesn't report the damaged model as ready: it installs a fresh one.
+        install(&live, false, fetch_tagged("b")).unwrap();
+        assert_eq!(tag(&live), "b");
+        assert!(verify(&live).is_ok());
+        // A manifest missing an entry is damaged too; no manifest at all is allowed.
+        let m = std::fs::read_to_string(live.join(MANIFEST)).unwrap();
+        let first = m.lines().next().unwrap().to_string() + "\n";
+        std::fs::write(live.join(MANIFEST), first).unwrap();
+        assert!(!model_present(&live));
+        std::fs::remove_file(live.join(MANIFEST)).unwrap();
+        assert!(model_present(&live));
         let _ = std::fs::remove_dir_all(&r);
     }
 
