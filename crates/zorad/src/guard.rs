@@ -3,12 +3,14 @@
 //! Order (see docs/design.md): guard spawns gate (new pgid = gate pid, blocked on a go-pipe) → guard reports
 //! `registered` → core commits ownership durably → core sends `go` → gate execs the harness. If the core goes
 //! away at any point (stdin EOF), the guard reaps the whole job group before exiting.
+//!
+//! Windows has no exec and no process groups: the harness starts suspended inside a named Job Object and is resumed
+//! on `go` (os_windows.rs).
 
 use crate::os;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -21,6 +23,22 @@ pub struct JobSpec {
     pub env: Vec<(String, String)>,
     pub capture_limit: usize,
     pub kill_grace_ms: u64,
+    /// The job id; names the Job Object on Windows.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// The job's command with its workspace, exact environment and captured output.
+pub fn command(program: &OsStr, args: &[String], spec: &JobSpec) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(spec.env.iter().cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -159,70 +177,19 @@ pub fn guard_main() -> i32 {
         return 2;
     }
 
-    let mut fds = [0i32; 2];
-    // SAFETY: fds is a valid 2-element array.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        send(
-            &out,
-            &GuardMsg::Failed {
-                error: "pipe failed".into(),
-            },
-        );
-        return 2;
-    }
-    // SAFETY: pipe() returned two new descriptors we now own; CLOEXEC keeps them out of the harness (dup2 onto
-    // fd 3 in the gate clears the flag for that copy only).
-    let (go_read, go_write) = unsafe {
-        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
-        (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
-    };
-    let go_read_raw = go_read.as_raw_fd();
-    let go_write_raw = go_write.as_raw_fd();
-
-    let exe = std::env::current_exe().unwrap_or_else(|_| "zorad".into());
-    let mut cmd = Command::new(exe);
-    cmd.arg("__gate").arg("--").args(&spec.argv);
-    cmd.current_dir(&spec.cwd)
-        .env_clear()
-        .envs(spec.env.iter().cloned());
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.process_group(0);
-    // SAFETY: only async-signal-safe calls between fork and exec.
-    unsafe {
-        cmd.pre_exec(move || {
-            libc::close(go_write_raw);
-            if libc::dup2(go_read_raw, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // dup2(3, 3) is a no-op that keeps CLOEXEC (pipe() often returns fd 3), so clear it explicitly.
-            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            send(
-                &out,
-                &GuardMsg::Failed {
-                    error: format!("cannot start gate: {e}"),
-                },
-            );
+    let mut held = match os::spawn_held(&spec) {
+        Ok(h) => h,
+        Err(error) => {
+            send(&out, &GuardMsg::Failed { error });
             return 2;
         }
     };
-    drop(go_read);
-    let pgid = child.id() as i32;
+    let group = held.group.clone();
+    let pgid = group.id();
     let grace = Duration::from_millis(spec.kill_grace_ms);
-    let stdout_h = capped_reader(child.stdout.take().unwrap(), spec.capture_limit);
-    let stderr_h = capped_reader(child.stderr.take().unwrap(), spec.capture_limit);
-    // SAFETY: getpid has no preconditions.
-    let me = unsafe { libc::getpid() };
+    let stdout_h = capped_reader(held.child.stdout.take().unwrap(), spec.capture_limit);
+    let stderr_h = capped_reader(held.child.stderr.take().unwrap(), spec.capture_limit);
+    let me = std::process::id() as i32;
     send(
         &out,
         &GuardMsg::Registered {
@@ -235,18 +202,16 @@ pub fn guard_main() -> i32 {
 
     // Fence: nothing executes until the core has committed ownership and says go.
     match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Some(CoreMsg::Go)) => {
-            let mut w = std::fs::File::from(go_write);
-            let _ = w.write_all(b"g");
-        }
+        Ok(Some(CoreMsg::Go)) => held.release(),
         _ => {
-            os::signal_group(pgid, libc::SIGKILL);
-            let _ = child.wait();
-            let ok = os::reap_group_blocking(pgid, Duration::ZERO);
+            group.kill();
+            let _ = held.child.wait();
+            let ok = group.reap_blocking(Duration::ZERO);
             send(&out, &GuardMsg::Cleaned { ok });
             return 1;
         }
     }
+    let mut child = held.child;
 
     // Wait for the leader while watching for cancel / liveness loss.
     let (done_tx, done_rx) = mpsc::channel();
@@ -263,22 +228,21 @@ pub fn guard_main() -> i32 {
                 if !cancelled =>
             {
                 cancelled = true;
-                os::signal_group(pgid, libc::SIGTERM);
-                let killer_grace = grace;
+                group.term();
+                let (killer, killer_grace) = (group.clone(), grace);
                 std::thread::spawn(move || {
                     std::thread::sleep(killer_grace);
-                    os::signal_group(pgid, libc::SIGKILL);
+                    killer.kill();
                 });
             }
             _ => {}
         }
     };
     // The job is over only when its whole group is gone.
-    let ok = os::reap_group_blocking(pgid, grace);
+    let ok = group.reap_blocking(grace);
     // Bounded: a detached process that inherited the pipes must not keep the guard (and workspace) busy.
     let (stdout, t1) = take_captured(&stdout_h.0, &stdout_h.1, Duration::from_secs(2));
     let (stderr, t2) = take_captured(&stderr_h.0, &stderr_h.1, Duration::from_secs(1));
-    use std::os::unix::process::ExitStatusExt;
     let (out_text, cut1) = fit_encoded(
         String::from_utf8_lossy(&stdout).into_owned(),
         MAX_FIELD_ENCODED,
@@ -291,7 +255,7 @@ pub fn guard_main() -> i32 {
         &out,
         &GuardMsg::Exited {
             code: status.and_then(|s| s.code()),
-            signal: status.and_then(|s| s.signal()),
+            signal: status.and_then(|s| os::exit_signal(&s)),
             stdout: out_text,
             stderr: err_text,
             truncated: t1 || t2 || cut1 || cut2,
@@ -303,7 +267,9 @@ pub fn guard_main() -> i32 {
 }
 
 /// Blocks until the guard says go (one byte on fd 3), then execs the harness in place (same pid and pgid).
+#[cfg(unix)]
 pub fn gate_main(argv: &[String]) -> i32 {
+    use std::os::unix::process::CommandExt;
     let mut b = [0u8; 1];
     // SAFETY: fd 3 was set up by the guard.
     let n = unsafe { libc::read(3, b.as_mut_ptr().cast(), 1) };

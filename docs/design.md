@@ -45,9 +45,9 @@ plugin(s) ──JSON lines──► PluginHost ──► InputQueue (ordered, bo
 - **Store.**
   - SQLite in WAL mode, with the same schema as v1 plus job-ownership columns. Writes are batched, retention covers both tables, and secure_delete is on.
   - A read-only mode for CLI queries.
-  - Paths: `~/Library/Application Support/Zora/zora.sqlite` (macOS) or `$XDG_STATE_HOME/zora/zora.sqlite` (Linux), with `0700`/`0600` permissions.
-- **Config.** JSON, the same as v1 (`~/.config/zora/config.json` on both platforms). It adds a `plugins` section. Validation rejects permission-bypass flags anywhere in a harness's argv, including `allowedTools`.
-- **Harness.** argv with `{prompt}` passed as a single argument and no shell; Claude's JSON output is summarized; the permission-mode allowlist applies.
+  - Paths: `~/Library/Application Support/Zora/zora.sqlite` (macOS) or `$XDG_STATE_HOME/zora/zora.sqlite` (Linux), with `0700`/`0600` permissions. On Windows the store and the pause file live in `%LOCALAPPDATA%\Zora` and get no mode of their own: they inherit the user profile's ACL, which grants only the user, SYSTEM and Administrators.
+- **Config.** JSON, the same as v1 (`~/.config/zora/config.json` on macOS and Linux, `%APPDATA%\Zora\config.json` on Windows). The `path` setting is `;`-separated on Windows. It adds a `plugins` section. Validation rejects permission-bypass flags anywhere in a harness's argv, including `allowedTools`.
+- **Harness.** argv with `{prompt}` passed as a single argument and no shell. On Windows a batch file never receives the prompt, because cmd.exe would parse it again: an npm shim such as `claude.cmd` is replaced by the `node` script or `.exe` it starts, and any other `.cmd`/`.bat` is refused. Claude's JSON output is summarized; the permission-mode allowlist applies.
 
 ### Daemon (`crates/zorad`, Rust): tokio current-thread runtime, plugin host, jobs, CLI
 
@@ -66,6 +66,13 @@ plugin(s) ──JSON lines──► PluginHost ──► InputQueue (ordered, bo
     - the leader's pid equals the pgid and its start time matches the gate's → clean the group
     - otherwise → **don't signal anything**; admission stays closed and a degraded notification names the pgid (`zora jobs clear <id>` after a manual check)
   - Linux also runs under a systemd user unit with `KillMode=control-group`.
+  - **Windows** has no process groups and no exec, so a Job Object takes the group's place:
+    - The guard creates a job named `Local\zora-job-<job id>` with `KILL_ON_JOB_CLOSE`. It starts the harness *suspended* in a new console process group, assigns it to the job, and reports. On *go* it resumes the harness; without *go* it terminates the job. The harness is in the job before its first instruction, and everything it starts joins the job too (no breakaway). There is no gate process.
+    - TERM is Ctrl+Break to the harness's process group (guard and harness share a hidden console, created with `CREATE_NO_WINDOW`). KILL is `TerminateJobObject`. "The group is empty" means the job's active process count is 0.
+    - The guard holds the only handle to the job. When the guard dies, Windows kills the job, so a killed core and a killed guard both end the harness.
+    - Recovery and `jobs cancel` open the job by name. The name is unique to the job, so no pid or start-time check is needed, and a missing job means nothing is left. `boot_id` is empty on Windows, because named jobs don't survive a reboot.
+    - Each plugin runs in its own unnamed job (started suspended, assigned, resumed). Stopping a plugin terminates its job.
+    - The core stops in order on Ctrl+C, Ctrl+Break and console close, as on SIGINT/SIGTERM. The guard ignores all three.
 - **CLI:** `zora run | status | transcript --since | simulate <script> | jobs [clear <id>]`. On macOS, `setup` and `install` belong to the app (permissions, speech model, `SMAppService`).
 
 ### Plugins
@@ -90,3 +97,4 @@ The Swift v1 core was removed once the Rust core passed the shared golden-fixtur
 | Linux, on the user's machine | Live mic coexistence with the dictation tool; observing that tool's PipeWire stream behaviour (idle, push-to-talk, release, persistent streams); notifications and the tray icon/menu/Settings dialogs on the real desktop (GNOME with AppIndicator, KDE); the systemd user unit across login, including the tray appearing when the service starts before the desktop; suspend/resume; a USB microphone unplugged and replugged. |
 | Linux STT targets | Idle CPU < 3% of one core, RSS < 150 MB, end phrase to dispatch < 4 s, plus missed/false command rates on a fixture set. |
 | Jobs | SIGKILL the core mid-job (and after the leader has exited, with a TERM-ignoring descendant still alive): the descendant must be dead before the next dispatch. |
+| Windows | Ctrl+Break reaching a real `claude.exe`, and Claude Code installed with npm (through its `claude.cmd` shim); console close and logoff while a job runs; the tray app as the attached plugin. CI covers job containment, recovery and plugin cleanup. |

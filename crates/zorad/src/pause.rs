@@ -88,25 +88,18 @@ pub fn resume(path: &Path) -> Result<(), String> {
 
 fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use zora_core::config::{create_private_dir, create_private_file};
     if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        create_private_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
     // A temp file per writer, so two writers never share one inode.
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    let mut f =
+        create_private_file(&tmp).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     f.write_all(data)
         .and_then(|_| f.sync_all())
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    drop(f);
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("cannot write {}: {e}", path.display())
@@ -114,6 +107,30 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
 }
 
 /// Local time of day for a wall timestamp, e.g. "14:30".
+#[cfg(windows)]
+pub fn local_hhmm(t: f64) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    // FILETIME counts 100 ns intervals since 1601.
+    let ticks = ((t + 11_644_473_600.0) * 1e7) as u64;
+    let ft = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    // SAFETY: valid pointers to stack values; a null time zone means the current one.
+    unsafe {
+        let (mut utc, mut local): (SYSTEMTIME, SYSTEMTIME) = std::mem::zeroed();
+        if FileTimeToSystemTime(&ft, &mut utc) == 0
+            || SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0
+        {
+            return "?".into();
+        }
+        format!("{:02}:{:02}", local.wHour, local.wMinute)
+    }
+}
+
+/// Local time of day for a wall timestamp, e.g. "14:30".
+#[cfg(unix)]
 pub fn local_hhmm(t: f64) -> String {
     let secs = t as libc::time_t;
     // SAFETY: localtime_r writes only into `tm`.

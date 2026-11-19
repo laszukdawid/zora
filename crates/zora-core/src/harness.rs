@@ -154,7 +154,22 @@ pub fn last_line_summary(exit_code: i32, stdout: &str, stderr: &str) -> HarnessR
     }
 }
 
+/// The command line that starts `executable`: the resolved program, or on Windows what an npm shim starts.
+pub fn resolve_command(executable: &str, search_path: &[String]) -> Result<Vec<String>, String> {
+    let exe = resolve_executable(executable, search_path)
+        .ok_or_else(|| format!("{executable} not found on PATH"))?;
+    #[cfg(windows)]
+    {
+        let lower = exe.to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            return windows_shim(&exe, search_path);
+        }
+    }
+    Ok(vec![exe])
+}
+
 /// Resolves a bare executable name against the configured search path.
+#[cfg(unix)]
 pub fn resolve_executable(executable: &str, search_path: &[String]) -> Option<String> {
     let expanded = expand_tilde(executable);
     let is_exec = |p: &Path| {
@@ -172,4 +187,81 @@ pub fn resolve_executable(executable: &str, search_path: &[String]) -> Option<St
         .map(|d| Path::new(d).join(&expanded))
         .find(|p| is_exec(p))
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Like Unix, plus the `PATHEXT` suffixes when the name has none of them.
+#[cfg(windows)]
+pub fn resolve_executable(executable: &str, search_path: &[String]) -> Option<String> {
+    let expanded = expand_tilde(executable);
+    let candidates = |base: &Path| -> Vec<std::path::PathBuf> {
+        let has_ext = base.extension().is_some_and(|e| {
+            ["exe", "com", "cmd", "bat"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x))
+        });
+        if has_ext {
+            return vec![base.to_path_buf()];
+        }
+        [".exe", ".com", ".cmd", ".bat"]
+            .iter()
+            .map(|x| std::path::PathBuf::from(format!("{}{x}", base.display())))
+            .collect()
+    };
+    if expanded.contains(['/', '\\', ':']) {
+        return candidates(Path::new(&expanded))
+            .into_iter()
+            .find(|p| p.is_file())
+            .map(|p| p.to_string_lossy().into_owned());
+    }
+    search_path
+        .iter()
+        .flat_map(|d| candidates(&Path::new(d).join(&expanded)))
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// cmd.exe parses a batch file's arguments again, so a batch file never receives the prompt. An npm shim
+/// (`claude.cmd`) is replaced by what it starts: its `.exe`, or `node` with its script. Other batch files are refused.
+#[cfg(windows)]
+fn windows_shim(shim: &str, search_path: &[String]) -> Result<Vec<String>, String> {
+    let refuse = || {
+        format!(
+            "{shim} is a batch file, which cannot receive the prompt safely; point the harness at a .exe \
+             (for Claude Code, the native installer's claude.exe)"
+        )
+    };
+    let text = std::fs::read(shim).map_err(|_| refuse())?;
+    let target = npm_shim_target(&String::from_utf8_lossy(&text)).ok_or_else(refuse)?;
+    let dir = Path::new(shim).parent().unwrap_or(Path::new("."));
+    let target = dir.join(target);
+    if !target.is_file() {
+        return Err(refuse());
+    }
+    let target = target.to_string_lossy().into_owned();
+    if target.to_ascii_lowercase().ends_with(".exe") {
+        return Ok(vec![target]);
+    }
+    let node = dir.join("node.exe");
+    let node = if node.is_file() {
+        node.to_string_lossy().into_owned()
+    } else {
+        resolve_executable("node.exe", search_path)
+            .ok_or_else(|| format!("node not found on PATH (needed by {shim})"))?
+    };
+    Ok(vec![node, target])
+}
+
+/// What an npm `cmd-shim` starts, relative to the shim's folder: the first quoted `"%dp0%\…"` path ending in
+/// `.js`, `.cjs`, `.mjs` or `.exe` (other than `node.exe`).
+pub fn npm_shim_target(cmd_text: &str) -> Option<String> {
+    cmd_text.split("\"%dp0%\\").skip(1).find_map(|rest| {
+        let path = &rest[..rest.find('"')?];
+        let lower = path.to_ascii_lowercase();
+        let ok = [".js", ".cjs", ".mjs", ".exe"]
+            .iter()
+            .any(|x| lower.ends_with(x))
+            && !lower.ends_with("node.exe")
+            && !path.contains(['%', '\n', '\r']);
+        ok.then(|| path.to_string())
+    })
 }

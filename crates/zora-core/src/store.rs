@@ -367,7 +367,12 @@ impl Store {
     }
 }
 
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
+
+/// Windows: the store lives under `%LOCALAPPDATA%`, whose ACL already limits it to the user.
+#[cfg(windows)]
+fn set_mode(_path: &Path, _mode: u32) {}

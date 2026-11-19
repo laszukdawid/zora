@@ -190,7 +190,7 @@ impl Default for Config {
             retention_hours: 4.0,
             dry_run: false,
             speech_detector: true,
-            path: "/opt/homebrew/bin:/usr/local/bin:~/.local/bin:/usr/bin:/bin".into(),
+            path: DEFAULT_PATH.into(),
             phrases: Phrases::default(),
             capture: Capture::default(),
             dictation: Dictation::default(),
@@ -207,25 +207,82 @@ impl Default for Config {
 pub const ALLOWED_PERMISSION_MODES: [&str; 5] =
     ["acceptEdits", "auto", "dontAsk", "manual", "plan"];
 
+#[cfg(unix)]
+const DEFAULT_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:~/.local/bin:/usr/bin:/bin";
+/// The native Claude Code installer, npm globals, then the system.
+#[cfg(windows)]
+const DEFAULT_PATH: &str = "~/.local/bin;~/AppData/Roaming/npm;C:/Program Files/nodejs;C:/Program Files/Git/cmd;C:/Windows/System32;C:/Windows;C:/Windows/System32/WindowsPowerShell/v1.0";
+
+/// Separator of the `path` setting and of `PATH`.
+pub const PATH_SEPARATOR: &str = if cfg!(windows) { ";" } else { ":" };
+
+/// `HOME`; on Windows `USERPROFILE` first.
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(p) = std::env::var_os("USERPROFILE").filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 pub fn expand_tilde(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return Path::new(&home).join(rest).to_string_lossy().into_owned();
+    let rest = p
+        .strip_prefix("~/")
+        .or_else(|| p.strip_prefix("~\\").filter(|_| cfg!(windows)));
+    if let Some(rest) = rest {
+        if let Some(home) = home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
         }
     } else if p == "~"
-        && let Some(home) = std::env::var_os("HOME")
+        && let Some(home) = home_dir()
     {
         return home.to_string_lossy().into_owned();
     }
     p.to_string()
 }
 
+/// A Windows known folder from its environment variable, else its usual place under the profile.
+#[cfg(windows)]
+pub fn windows_dir(var: &str, fallback: &[&str]) -> PathBuf {
+    std::env::var_os(var)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+            fallback.iter().fold(home, |p, c| p.join(c))
+        })
+}
+
+/// Creates a new file only its owner can read: mode 0600 on Unix. Windows has no mode; the file inherits the ACL
+/// of its folder, which under the user profile (`%APPDATA%`, `%LOCALAPPDATA%`) grants only the user and the system.
+pub fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)
+}
+
+/// Creates a folder (and its parents) only its owner can enter: mode 0700 on Unix; see `create_private_file`.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dir)
+}
+
 impl Config {
+    /// `~/.config/zora/config.json`; on Windows `%APPDATA%\Zora\config.json`.
     pub fn default_path() -> PathBuf {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".config/zora/config.json")
+        #[cfg(windows)]
+        return windows_dir("APPDATA", &["AppData", "Roaming"])
+            .join("Zora")
+            .join("config.json");
+        #[cfg(unix)]
+        home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config/zora/config.json")
     }
 
     pub fn load(path: &Path) -> Result<Config, String> {
@@ -251,13 +308,7 @@ impl Config {
         // Private from the first byte (it may hold harness env values); a replaced file keeps its own mode.
         {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)
-                .map_err(|e| e.to_string())?;
+            let mut f = create_private_file(&tmp).map_err(|e| e.to_string())?;
             f.write_all(&data).map_err(|e| e.to_string())?;
         }
         if let Ok(meta) = std::fs::metadata(path)
@@ -286,7 +337,7 @@ impl Config {
 
     pub fn search_path(&self) -> Vec<String> {
         self.path
-            .split(':')
+            .split(PATH_SEPARATOR)
             .filter(|s| !s.is_empty())
             .map(expand_tilde)
             .collect()

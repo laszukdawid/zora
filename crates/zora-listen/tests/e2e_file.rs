@@ -1,6 +1,8 @@
 //! zorad with zora-listen in file mode and the scripted recognizer: the whole transcript path (protocol,
 //! microphone gate, engine, segment times, pause) without a speech model or a microphone. Needs the `zorad`
-//! binary next to this test's (built by `cargo test --workspace`); skipped otherwise.
+//! binary next to this test's (built by `cargo test --workspace`); skipped otherwise. Unix only until the Windows
+//! plugins exist (it stops zorad with SIGTERM).
+#![cfg(unix)]
 
 use serde_json::json;
 use std::io::{BufRead, BufReader};

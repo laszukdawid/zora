@@ -151,6 +151,34 @@ or turn the monitor off (below).
   `--fake-stt <script>` (tests only) replaces the model: each stretch of sound becomes the next line of the script;
   `crates/zora-listen/tests/e2e_file.rs` runs `zorad` with it.
 
+## Windows
+
+The core (`zorad`) builds and passes the full test suite on Windows 10 and later; CI runs it on `windows-2025`.
+The speech, dictation and notification plugins and the tray app are not written yet.
+
+```powershell
+cargo test --workspace -- --test-threads=4   # needs the MSVC build tools (bundled SQLite is compiled from C)
+cargo run -p zorad -- run --dry-run
+```
+
+What differs from Unix (details in [design.md](design.md)):
+
+- Files: config in `%APPDATA%\Zora\config.json`, store and pause state in `%LOCALAPPDATA%\Zora`. They rely on
+  the user profile's permissions instead of `0600`.
+- Jobs run inside a named Job Object instead of a process group; Ctrl+Break stands in for SIGTERM.
+- The `path` setting is `;`-separated. Its default looks in `~\.local\bin` (the native Claude Code installer),
+  `%APPDATA%\npm`, Node.js, Git and the system folders. A batch file never receives the prompt: npm's
+  `claude.cmd` is run as the `node` script it wraps, and other `.cmd`/`.bat` harnesses are refused.
+- `zorad run --attached-plugin` talks the protocol on stdin/stdout instead of fds 3/4 (see
+  [protocol.md](protocol.md)).
+- The end-to-end tests use `zora-test-harness` in place of `/bin/sh` scripts. The escaped-pipe test is Unix-only:
+  nothing can leave a Windows job.
+
+To type-check the Windows code from macOS or Linux, use `rustup target add x86_64-pc-windows-msvc` and
+`cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc`. Bundled SQLite needs a C compiler for
+that target, so point `CC_x86_64_pc_windows_msvc` and `AR_x86_64_pc_windows_msvc` at a stub that only creates
+its output file (nothing is linked), or rely on CI.
+
 ## Command line
 
 | Command | What it does |
