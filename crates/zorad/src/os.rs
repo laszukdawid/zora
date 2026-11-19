@@ -314,7 +314,8 @@ fn guard_state(pid: Option<i64>, start: Option<i64>) -> Guard {
     let (Some(pid), Some(start)) = (pid, start) else {
         return Guard::Unknown;
     };
-    if pid <= 0 || pid > i32::MAX as i64 {
+    // A guard that couldn't read its own start time registered 0: nothing can be proven about it.
+    if pid <= 0 || pid > i32::MAX as i64 || start == 0 {
         return Guard::Unknown;
     }
     // SAFETY: signal 0 only checks for existence.
@@ -362,10 +363,28 @@ pub fn cancel_job(job: &zora_core::store::JobRecord, marker: &Path) -> Result<()
 /// Creates the cancel marker: a regular file, made exclusively and without following links, in a folder only the
 /// user can enter. An existing marker means cancellation was already requested.
 pub fn request_cancel(marker: &Path) -> Result<(), String> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     let dir = marker.parent().ok_or("no marker folder")?;
-    zora_core::config::create_private_dir(dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    if let Some(store) = dir.parent() {
+        zora_core::config::create_private_dir(store)
+            .map_err(|e| format!("cannot create {}: {e}", store.display()))?;
+    }
+    // Only a folder made here gets the ownership file, so pruning never claims a folder Zora didn't create.
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(dir.join(OWNER_FILE))
+                .map_err(|e| format!("cannot mark {}: {e}", dir.display()))?;
+            f.write_all(OWNER_CONTENT)
+                .map_err(|e| format!("cannot mark {}: {e}", dir.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("cannot create {}: {e}", dir.display())),
+    }
     match std::fs::symlink_metadata(dir) {
         Ok(m) if m.is_dir() && m.permissions().mode() & 0o077 == 0 => {}
         _ => {
@@ -402,29 +421,103 @@ pub fn cancel_requested(_id: &str, marker: &Path) -> bool {
     marker_present(marker)
 }
 
-/// Removes markers of jobs that are not `live`: only regular files named like job ids, and only in a real folder
-/// of ours with mode 0700 (never through a link).
+/// The file that marks `cancel/` as made by Zora, and its exact contents.
+const OWNER_FILE: &str = ".zora-cancel-markers";
+const OWNER_CONTENT: &[u8] = b"zora cancel markers v1\n";
+
+/// Removes markers of jobs that are not `live`, from a folder Zora made: opened without following links
+/// (`O_DIRECTORY|O_NOFOLLOW`), owned by us with mode 0700, holding the ownership file. Only regular files named as
+/// canonical UUIDv4 job ids are removed, relative to that folder's descriptor.
 pub fn prune_cancel_markers(dir: &Path, live: &std::collections::HashSet<String>) {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
         return;
     };
-    // SAFETY: geteuid has no preconditions.
-    let ours = meta.uid() == unsafe { libc::geteuid() };
-    if !meta.is_dir() || !ours || meta.permissions().mode() & 0o777 != 0o700 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if crate::jobs::marker_name(&name)
-            && !live.contains(&name)
-            && e.file_type().is_ok_and(|t| t.is_file())
-        {
-            let _ = std::fs::remove_file(e.path());
+    // SAFETY: plain syscalls on descriptors owned here; every buffer is valid for its call.
+    unsafe {
+        let fd = libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return;
         }
+        let dirfd = OwnedFd::from_raw_fd(fd);
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(dirfd.as_raw_fd(), &mut st) != 0
+            || st.st_uid != libc::geteuid()
+            || st.st_mode & 0o777 != 0o700
+            || !owner_file_ok(dirfd.as_raw_fd())
+        {
+            return;
+        }
+        let listing = libc::dup(dirfd.as_raw_fd());
+        if listing < 0 {
+            return;
+        }
+        let d = libc::fdopendir(listing);
+        if d.is_null() {
+            libc::close(listing);
+            return;
+        }
+        let mut doomed = Vec::new();
+        loop {
+            let ent = libc::readdir(d);
+            if ent.is_null() {
+                break;
+            }
+            let name = std::ffi::CStr::from_ptr((*ent).d_name.as_ptr());
+            if let Ok(s) = name.to_str()
+                && job_id(s)
+                && !live.contains(s)
+            {
+                doomed.push(name.to_owned());
+            }
+        }
+        libc::closedir(d);
+        for name in doomed {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstatat(
+                dirfd.as_raw_fd(),
+                name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ) == 0
+                && st.st_mode & libc::S_IFMT == libc::S_IFREG
+            {
+                libc::unlinkat(dirfd.as_raw_fd(), name.as_ptr(), 0);
+            }
+        }
+    }
+}
+
+/// A canonical (lowercase, hyphenated) UUIDv4, as the core names jobs.
+fn job_id(name: &str) -> bool {
+    uuid::Uuid::parse_str(name)
+        .is_ok_and(|u| u.get_version_num() == 4 && u.hyphenated().to_string() == name)
+}
+
+/// Whether the ownership file is a regular file with exactly the expected contents.
+fn owner_file_ok(dirfd: i32) -> bool {
+    let name = std::ffi::CString::new(OWNER_FILE).unwrap();
+    // SAFETY: the descriptor is owned below; the buffer is valid for the read.
+    unsafe {
+        let fd = libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return false;
+        }
+        let f = OwnedFd::from_raw_fd(fd);
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(f.as_raw_fd(), &mut st) != 0 || st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return false;
+        }
+        let mut buf = [0u8; 64];
+        let n = libc::read(f.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len());
+        n >= 0 && buf[..n as usize] == *OWNER_CONTENT
     }
 }
 
@@ -546,6 +639,9 @@ mod tests {
         let mut j = job(None, pgid, start);
         let marker = tmp().join("cancel/j");
         assert!(cancel_job(&j, &marker).is_err());
+        // A live guard that registered start time 0 (it couldn't read its own).
+        j.guard_start = Some(0);
+        assert!(cancel_job(&j, &marker).is_err());
         j.guard_pid = None;
         assert!(cancel_job(&j, &marker).is_err());
         std::thread::sleep(Duration::from_millis(300));
@@ -556,35 +652,57 @@ mod tests {
     }
 
     #[test]
-    fn pruning_touches_only_our_orphan_markers() {
+    fn pruning_touches_only_orphan_markers_in_a_folder_zora_made() {
         let root = tmp();
         let dir = root.join("cancel");
-        zora_core::config::create_private_dir(&dir).unwrap();
-        for f in ["orphan1", "live1", "notes.txt"] {
+        let live_id = uuid::Uuid::new_v4().to_string();
+        let orphan = uuid::Uuid::new_v4().to_string();
+        let linked = uuid::Uuid::new_v4().to_string();
+        let upper = uuid::Uuid::new_v4().to_string().to_uppercase();
+        let v1 = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        request_cancel(&dir.join(&live_id)).unwrap(); // makes the folder and its ownership file
+        for f in [orphan.as_str(), "notes", "notes.txt", &upper, v1] {
             std::fs::write(dir.join(f), b"").unwrap();
         }
-        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::create_dir(dir.join(uuid::Uuid::new_v4().to_string())).unwrap();
         let outside = root.join("outside");
         std::fs::write(&outside, b"").unwrap();
-        std::os::unix::fs::symlink(&outside, dir.join("link1")).unwrap();
-        let live: std::collections::HashSet<String> = ["live1".to_string()].into();
+        std::os::unix::fs::symlink(&outside, dir.join(&linked)).unwrap();
+        let live: std::collections::HashSet<String> = [live_id.clone()].into();
         prune_cancel_markers(&dir, &live);
-        assert!(!dir.join("orphan1").exists());
-        for kept in ["live1", "notes.txt", "sub"] {
+        assert!(!dir.join(&orphan).exists());
+        for kept in [
+            live_id.as_str(),
+            "notes",
+            "notes.txt",
+            &upper,
+            v1,
+            OWNER_FILE,
+        ] {
             assert!(dir.join(kept).exists(), "{kept} was removed");
         }
-        assert!(std::fs::symlink_metadata(dir.join("link1")).is_ok() && outside.exists());
+        assert!(std::fs::symlink_metadata(dir.join(&linked)).is_ok() && outside.exists());
 
-        // A link in place of the folder, or a folder others can enter, is left alone.
+        // Without the ownership file (or through a link, or open to others) nothing is touched.
         let other = root.join("other");
         zora_core::config::create_private_dir(&other).unwrap();
-        std::fs::write(other.join("orphan2"), b"").unwrap();
+        let o = uuid::Uuid::new_v4().to_string();
+        for f in [o.as_str(), "notes"] {
+            std::fs::write(other.join(f), b"").unwrap();
+        }
+        prune_cancel_markers(&other, &live);
+        assert!(other.join(&o).exists() && other.join("notes").exists());
+        std::fs::write(other.join(OWNER_FILE), OWNER_CONTENT).unwrap();
         let link = root.join("cancel-link");
         std::os::unix::fs::symlink(&other, &link).unwrap();
         prune_cancel_markers(&link, &live);
-        assert!(other.join("orphan2").exists());
+        assert!(other.join(&o).exists());
         std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
         prune_cancel_markers(&other, &live);
-        assert!(other.join("orphan2").exists());
+        assert!(other.join(&o).exists());
+        std::fs::write(other.join(OWNER_FILE), b"something else").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+        prune_cancel_markers(&other, &live);
+        assert!(other.join(&o).exists());
     }
 }

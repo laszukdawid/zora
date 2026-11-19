@@ -301,6 +301,8 @@ impl JobManager {
         let mut failed: Option<String> = None;
         let mut timed_out = false;
         let mut cancel_sent = false;
+        // A cancel was asked for (by voice, the core, or `zorad jobs cancel`), apart from timeouts and shutdown.
+        let mut cancel_asked = false;
         // Once the guard has been told to stop (Cancel or EOF), it gets a bounded time to report `cleaned`.
         let stop_limit = self.kill_grace + Duration::from_secs(10);
         let mut give_up: Option<tokio::time::Instant> = None;
@@ -342,6 +344,7 @@ impl JobManager {
                         Ok(GuardMsg::Cleaned { ok }) => { cleaned = Some(ok); break; }
                         Ok(GuardMsg::Failed { error }) => failed = Some(error),
                         Ok(GuardMsg::Cancelling) => {
+                            cancel_asked = true;
                             cancel_sent = true;
                             give_up.get_or_insert(tokio::time::Instant::now() + stop_limit);
                         }
@@ -355,6 +358,7 @@ impl JobManager {
                     send_guard(&mut stdin, CoreMsg::Cancel).await;
                 }
                 Some(()) = cancel.recv(), if !cancel_sent => {
+                    cancel_asked = true;
                     cancel_sent = true;
                     give_up = Some(tokio::time::Instant::now() + stop_limit);
                     send_guard(&mut stdin, CoreMsg::Cancel).await;
@@ -363,6 +367,7 @@ impl JobManager {
                 _ = tokio::time::sleep_until(give_up.unwrap_or(deadline)), if give_up.is_some() => break,
                 _ = request_check.tick(), if !cancel_sent && registration.is_some() => {
                     if os::cancel_requested(&job.id, &marker) {
+                        cancel_asked = true;
                         cancel_sent = true;
                         give_up = Some(tokio::time::Instant::now() + stop_limit);
                         send_guard(&mut stdin, CoreMsg::Cancel).await;
@@ -429,6 +434,8 @@ impl JobManager {
             Some(GuardMsg::Exited {
                 signal: Some(sig), ..
             }) => fail(format!("killed by signal {sig}")),
+            // The guard never reported, but the cancel it was given is done and verified.
+            _ if cancel_asked && cleanup_ok => fail("cancelled".into()),
             _ => fail("job guard ended unexpectedly".into()),
         };
         (result, cleanup_ok)

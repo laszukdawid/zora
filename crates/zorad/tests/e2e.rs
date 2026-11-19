@@ -1191,7 +1191,14 @@ fn clear_and_recovery_remove_cancel_markers() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    for id in ["old", "stuck", "orphan"] {
+    // As `zorad jobs cancel` makes the folder (os.rs OWNER_FILE).
+    std::fs::write(
+        dir.join(".zora-cancel-markers"),
+        b"zora cancel markers v1\n",
+    )
+    .unwrap();
+    let orphan = uuid::Uuid::new_v4().to_string();
+    for id in ["old", "stuck", &orphan, "notes"] {
         std::fs::write(dir.join(id), b"").unwrap();
     }
     env.zorad(&["jobs", "clear", "stuck"]);
@@ -1199,10 +1206,11 @@ fn clear_and_recovery_remove_cancel_markers() {
     let child = env.start(&env.config(json!([]), sh("echo ok", &["print", "ok"])));
     // Orphans are pruned on Unix only (Windows keeps no marker files).
     let recovered = wait_for(Duration::from_secs(15), || {
-        (!dir.join("old").exists() && (cfg!(windows) || !dir.join("orphan").exists())).then_some(())
+        (!dir.join("old").exists() && (cfg!(windows) || !dir.join(&orphan).exists())).then_some(())
     });
     let (_, err) = term_and_collect(child);
     assert!(recovered.is_some(), "markers left after recovery:\n{err}");
+    assert!(dir.join("notes").exists(), "an unrelated file was pruned");
 }
 
 #[test]
@@ -1236,10 +1244,11 @@ fn jobs_cancel_ends_a_job_whose_guard_stopped_reacting() {
     let (_, err) = term_and_collect(child);
     assert_eq!(cancelled, Some(true), "{err}");
     let pid = pid.unwrap_or_else(|| panic!("job never started:\n{err}"));
-    assert!(
-        done.is_some(),
-        "job never ended: {:?}\n{err}",
-        env.commands()
+    let done = done.unwrap_or_else(|| panic!("job never ended: {:?}\n{err}", env.commands()));
+    assert_eq!(
+        (done.2.as_str(), done.3.as_deref()),
+        ("failed", Some("cancelled")),
+        "{err}"
     );
     assert!(t0.elapsed() < Duration::from_secs(60), "{err}");
     assert!(!alive(pid), "descendant {pid} survived:\n{err}");
