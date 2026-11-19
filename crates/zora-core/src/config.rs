@@ -62,6 +62,8 @@ pub struct Dictation {
     pub bundle_ids: Vec<String>,
     /// Linux: PipeWire application.process.binary / application.name / application.id values.
     pub linux_apps: Vec<String>,
+    /// Windows: process image names (e.g. `MyDictation.exe`) whose capture sessions mean dictation.
+    pub windows_apps: Vec<String>,
     pub pad_seconds: f64,
     /// "plugin" (default) or "none" (no dictation tool: always healthy, never dictating).
     pub monitor: String,
@@ -72,6 +74,7 @@ impl Default for Dictation {
         Dictation {
             bundle_ids: vec!["com.typewhisper.mac".into()],
             linux_apps: vec![],
+            windows_apps: vec![],
             pad_seconds: 1.0,
             monitor: "plugin".into(),
         }

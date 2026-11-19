@@ -169,12 +169,26 @@ or turn the monitor off (below).
 ## Windows
 
 The core (`zorad`) builds and passes the full test suite on Windows 10 and later; CI runs it on `windows-2025`.
-The speech, dictation and notification plugins and the tray app are not written yet.
+The plugins are new and have so far only been compiled, not run on Windows:
+
+| Plugin | Capability | How |
+|---|---|---|
+| `zora-listen` | transcript | The same plugin as on Linux: cpal (WASAPI, the default microphone) and sherpa-onnx's streaming Zipformer. The model goes to `%LOCALAPPDATA%\Zora\models`; `zora-listen setup` needs the `curl.exe` and `tar.exe` that ship with Windows 10 and later. Links need privileges on Windows, so setup names the model version in use in `<model>.version` instead of linking it. |
+| `zora-win-dictation` | dictation | Reads every active capture endpoint's audio sessions (WASAPI `IAudioSessionManager2`) four times a second. A session that is active and whose process image is named in `dictation.windowsApps` (by file name, with or without `.exe`, any case) means dictation; so does an active session whose process can't be identified. Health is unknown with no names configured, on any WASAPI error, after a stalled poll, and for the interval in which a capture device appeared or went away. `zora-win-dictation watch` lists capture sessions so you can find the name to configure. |
+| `zora-tray` | notify | The notification-area icon with the same menu as macOS and Linux (state, Pause/Resume Listening, Pause for 1 Hour, Settings → Names / Project Folder, the last five results, Restart Zora) and notifications as balloons, which Windows 10 and 11 show as toasts. Changes go only through `zorad pause`, `resume` and `settings`. Restart Zora runs the scheduled task `Zora` (option `task`). |
 
 ```powershell
 cargo test --workspace -- --test-threads=4   # needs the MSVC build tools (bundled SQLite is compiled from C)
 cargo run -p zorad -- run --dry-run
+powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
 ```
+
+`install.ps1` builds the four programs (or takes them from `-From <folder>`), copies them to
+`%LOCALAPPDATA%\Zora\bin`, writes `%APPDATA%\Zora\config.json` only if there is none, runs `zora-listen setup`
+(`-NoModel` skips it) and registers a scheduled task `Zora` that starts `zorad run` at logon without a console
+window (`-NoTask` skips it). Running the task again stops the old instance first, which is how the tray restarts
+Zora. The config lists no dictation app and no project folder: set both before Zora runs commands (the script
+prints how). zorad's own log goes nowhere when started by the task; run `zorad run` in a terminal to see it.
 
 What differs from Unix (details in [design.md](design.md)):
 
@@ -253,7 +267,7 @@ Names, phrases, capture limits and the default harness apply live; everything el
   "retentionHours": 4,
   "phrases": { "start": ["hey zora"], "end": ["do it zora", "zora do it"], "cancel": ["zora cancel", "never mind zora"] },
   "capture": { "holdBackSeconds": 1.5, "timeoutSeconds": 180, "maxGapSeconds": 30, "maxChars": 4000 },
-  "dictation": { "bundleIDs": ["com.typewhisper.mac"], "linuxApps": ["my-dictation-tool"], "padSeconds": 1, "monitor": "plugin" },
+  "dictation": { "bundleIDs": ["com.typewhisper.mac"], "linuxApps": ["my-dictation-tool"], "windowsApps": ["MyDictation.exe"], "padSeconds": 1, "monitor": "plugin" },
   "defaultHarness": "claude",
   "harnesses": {
     "claude": { "type": "claude", "workspace": "~/projects/some-repo", "permissionMode": "acceptEdits" },

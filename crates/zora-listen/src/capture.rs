@@ -1,4 +1,4 @@
-//! Microphone capture with cpal (its PipeWire backend when PipeWire runs, ALSA otherwise).
+//! Microphone capture with cpal: its PipeWire backend when PipeWire runs, ALSA otherwise; WASAPI on Windows.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, SampleFormat, SizedSample};

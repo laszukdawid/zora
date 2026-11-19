@@ -204,8 +204,12 @@ pub async fn run(config: Config, opts: Options) -> i32 {
                 let mut cfg = p.config.clone();
                 if let Some(obj) = cfg.as_object_mut() {
                     obj.entry("locale").or_insert(json!(config.locale));
-                    obj.entry("apps")
-                        .or_insert(json!(config.dictation.linux_apps));
+                    let apps = if cfg!(windows) {
+                        &config.dictation.windows_apps
+                    } else {
+                        &config.dictation.linux_apps
+                    };
+                    obj.entry("apps").or_insert(json!(apps));
                 }
                 PluginSpec {
                     id: id.clone(),

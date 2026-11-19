@@ -1254,3 +1254,32 @@ fn jobs_cancel_ends_a_job_whose_guard_stopped_reacting() {
     assert!(!alive(pid), "descendant {pid} survived:\n{err}");
     assert!(env.jobs().is_empty(), "{:?}\n{err}", env.jobs());
 }
+
+#[test]
+fn stop_it_during_ownership_registration_never_runs_the_job() {
+    let env = Env::new();
+    let started = env.home.join("started");
+    let s = started.display().to_string();
+    let cfg = env.config(
+        json!([
+            {"delayMs": 3500, "say": "Hey Zora, long job. Do it, Zora.", "durMs": 500},
+            {"delayMs": 2000, "say": "Stop it, Zora.", "durMs": 500}
+        ]),
+        sh(&format!("echo started > {s}"), &["touch", &s]),
+    );
+    // The core holds the job between its ownership write and Go; "stop it" lands there.
+    let child = env.start_with(&cfg, &[("ZORA_TEST_PAUSE_AFTER_OWNER_MS", "5000")]);
+    let done = wait_for(Duration::from_secs(25), || {
+        env.commands()
+            .into_iter()
+            .find(|c| c.2 == "failed" || c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    let done = done.unwrap_or_else(|| panic!("job never ended:\n{err}"));
+    assert_eq!(
+        (done.2.as_str(), done.3.as_deref()),
+        ("failed", Some("cancelled")),
+        "{err}"
+    );
+    assert!(!started.exists(), "the harness ran:\n{err}");
+}

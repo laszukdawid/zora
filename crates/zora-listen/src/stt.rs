@@ -19,22 +19,80 @@ const FILES: [&str; 4] = [
     "tokens.txt",
 ];
 
-/// `$XDG_DATA_HOME/zora/models/<model>`, or the plugin config's `model` directory.
+/// `$XDG_DATA_HOME/zora/models/<model>` (Windows: `%LOCALAPPDATA%\Zora\models\<model>`), or the plugin
+/// config's `model` directory.
 pub fn model_dir(config: &Value) -> PathBuf {
     if let Some(dir) = config["model"].as_str() {
         return PathBuf::from(expand_tilde(dir));
     }
-    let data = std::env::var_os("XDG_DATA_HOME")
+    data_dir().join(MODEL)
+}
+
+#[cfg(not(windows))]
+fn data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home().join(".local/share"));
-    data.join("zora/models").join(MODEL)
+        .unwrap_or_else(|| home().join(".local/share"))
+        .join("zora/models")
+}
+
+#[cfg(windows)]
+fn data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home().join("AppData").join("Local"))
+        .join("Zora")
+        .join("models")
 }
 
 fn home() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(p) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(p);
+    }
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The model files in use. On Unix `dir` is a link setup made (or a plain directory). Links need privileges on
+/// Windows, so there setup names the version in `<dir>.version` instead, and `dir` counts only as a plain
+/// directory.
+pub fn resolve(dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        return read_pointer(dir).unwrap_or_else(|| dir.to_path_buf());
+    }
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+fn pointer_file(dir: &Path) -> PathBuf {
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+    dir.with_file_name(format!("{}.version", name.unwrap_or_default()))
+}
+
+/// The managed version `<dir>.version` names, when it is a plain version name of an existing version.
+fn read_pointer(dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(pointer_file(dir)).ok()?;
+    let name = text.trim();
+    let n: u64 = name.strip_prefix(&format!("{MODEL}-"))?.parse().ok()?;
+    let version = dir.parent()?.join(VERSIONS).join(format!("{MODEL}-{n}"));
+    std::fs::symlink_metadata(&version)
+        .is_ok_and(|m| m.is_dir())
+        .then_some(version)
+}
+
+/// Points `<dir>.version` at `name`, replacing the file in one rename (the commit point on Windows).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn write_pointer(dir: &Path, name: &str) -> Result<(), String> {
+    let file = pointer_file(dir);
+    let tmp = file.with_extension("version.tmp");
+    std::fs::write(&tmp, format!("{name}\n")).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", file.display())
+    })
 }
 
 fn expand_tilde(p: &str) -> String {
@@ -149,7 +207,7 @@ impl Sherpa {
     pub fn load(config: &Value) -> Result<Sherpa, String> {
         let dir = model_dir(config);
         // Resolve the link once, so every file comes from the same version even if setup swaps it meanwhile.
-        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let dir = resolve(&dir);
         if let Err(e) = model_status(&dir) {
             return Err(format!(
                 "speech model not usable in {} ({e}); run `zora-listen setup`",
@@ -284,7 +342,7 @@ pub fn prune(config: &Value) -> Result<usize, String> {
         ));
     };
     // The fallbacks go only when the version kept is whole.
-    if let Err(e) = verify(&dir) {
+    if let Err(e) = verify(&resolve(&dir)) {
         return Err(format!(
             "{e}; nothing removed (run `zora-listen setup --force`)"
         ));
@@ -312,7 +370,7 @@ fn install(
 ) -> Result<PathBuf, String> {
     let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     let plain = |d: &Path| std::fs::symlink_metadata(d).is_ok_and(|m| m.is_dir());
-    if model_present(dir) && !force {
+    if model_present(&resolve(dir)) && !force {
         return Ok(dir.to_path_buf());
     }
     if plain(dir) {
@@ -325,7 +383,7 @@ fn install(
     std::fs::create_dir_all(root).map_err(|e| err(root, e))?;
     let _lock = lock(&root.join(".setup.lock"))?;
     // Another run may have finished while this one waited.
-    if model_present(dir) && !force {
+    if model_present(&resolve(dir)) && !force {
         return Ok(dir.to_path_buf());
     }
     let versions = managed_versions(root)?;
@@ -363,31 +421,35 @@ fn install(
     let version = versions.join(&name);
     std::fs::rename(&model, &version).map_err(|e| err(&version, e))?;
     let _ = std::fs::remove_dir_all(&staging);
-    let link = root.join(format!(".{MODEL}.link"));
-    let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(Path::new(VERSIONS).join(&name), &link)
-        .map_err(|e| err(&link, e))?;
-    // The commit point.
-    std::fs::rename(&link, dir).map_err(|e| err(dir, e))?;
+    commit(root, dir, &name)?;
     Ok(dir.to_path_buf())
 }
 
+/// Makes `name` the version in use, in one rename: a new link renamed over `dir`.
+#[cfg(unix)]
+fn commit(root: &Path, dir: &Path, name: &str) -> Result<(), String> {
+    let link = root.join(format!(".{MODEL}.link"));
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(Path::new(VERSIONS).join(name), &link)
+        .map_err(|e| format!("{}: {e}", link.display()))?;
+    std::fs::rename(&link, dir).map_err(|e| format!("{}: {e}", dir.display()))
+}
+
+/// Makes `name` the version in use: `<dir>.version` names it (see `resolve`).
+#[cfg(windows)]
+fn commit(_root: &Path, dir: &Path, name: &str) -> Result<(), String> {
+    write_pointer(dir, name)
+}
+
 fn lock(path: &Path) -> Result<std::fs::File, String> {
-    use std::os::fd::AsRawFd;
     let f = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    // SAFETY: a valid open descriptor; the lock is released when the file is closed.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!(
-            "{}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
+    // Released when the file is closed (flock on Unix, LockFileEx on Windows).
+    f.lock().map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(f)
 }
 
@@ -453,9 +515,9 @@ fn newest(versions: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// The version `dir` links to, if it is one of the managed ones.
+/// The version `dir` links (or on Windows points) to, if it is one of the managed ones.
 fn current_version(dir: &Path, versions: &Path) -> Option<u64> {
-    let target = std::fs::canonicalize(dir).ok()?;
+    let target = std::fs::canonicalize(resolve(dir)).ok()?;
     let versions = std::fs::canonicalize(versions).ok()?;
     if target.parent()? != versions {
         return None;
@@ -520,6 +582,34 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 }
 
 #[cfg(test)]
+mod pointer_tests {
+    use super::*;
+
+    #[test]
+    fn the_version_file_names_only_a_managed_version() {
+        let root = std::env::temp_dir().join(format!("zora-pointer-{}", std::process::id()));
+        let dir = root.join(MODEL);
+        std::fs::create_dir_all(root.join(VERSIONS).join(format!("{MODEL}-2"))).unwrap();
+        assert_eq!(read_pointer(&dir), None);
+        write_pointer(&dir, &format!("{MODEL}-2")).unwrap();
+        assert_eq!(
+            read_pointer(&dir),
+            Some(root.join(VERSIONS).join(format!("{MODEL}-2")))
+        );
+        for bad in [
+            format!("{MODEL}-3"),
+            "../elsewhere".into(),
+            format!("{MODEL}-2/.."),
+        ] {
+            write_pointer(&dir, &bad).unwrap();
+            assert_eq!(read_pointer(&dir), None, "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+// They exercise setup's links, which are Unix-only (Windows uses `<dir>.version`, tested above).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;

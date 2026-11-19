@@ -1,8 +1,8 @@
 //! The `transcript` plugin: local speech to text. Nothing is sent anywhere and no audio is stored.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod capture;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod stt;
 
 use std::path::PathBuf;
@@ -30,10 +30,10 @@ fn main() {
             println!("{USAGE}");
             0
         }
-        Some("setup") => linux::setup(args.iter().any(|a| a == "--force")),
-        Some("prune") => linux::prune(),
+        Some("setup") => native::setup(args.iter().any(|a| a == "--force")),
+        Some("prune") => native::prune(),
         Some("transcribe") => match args.get(1) {
-            Some(f) => linux::transcribe(&PathBuf::from(f)),
+            Some(f) => native::transcribe(&PathBuf::from(f)),
             None => {
                 eprintln!("{USAGE}");
                 2
@@ -68,7 +68,7 @@ fn plugin(args: &[String]) -> i32 {
             };
             run_listen_plugin(move || input, move |_| Ok(ScriptedRecognizer::new(lines)))
         }
-        (input, None) => linux::run(input),
+        (input, None) => native::run(input),
         (None, Some(_)) => {
             eprintln!("zora-listen: --fake-stt needs --file");
             2
@@ -76,8 +76,8 @@ fn plugin(args: &[String]) -> i32 {
     }
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", windows))]
+mod native {
     use crate::capture::CpalInput;
     use crate::stt::{self, Sherpa};
     use serde_json::json;
@@ -147,12 +147,12 @@ mod linux {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-mod linux {
+#[cfg(not(any(target_os = "linux", windows)))]
+mod native {
     use std::path::Path;
     use zora_plugin::listen::FileInput;
 
-    const ONLY: &str = "zora-listen: the microphone and speech model are Linux-only; elsewhere only --file with --fake-stt works";
+    const ONLY: &str = "zora-listen: the microphone and speech model need Linux or Windows; elsewhere only --file with --fake-stt works";
 
     pub fn run(_: Option<FileInput>) -> i32 {
         eprintln!("{ONLY}");
