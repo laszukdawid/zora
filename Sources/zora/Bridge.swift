@@ -343,7 +343,7 @@ final class Bridge: @unchecked Sendable {
         }
         guard current else { return }
         log.info("listening \(on ? "on" : "paused", privacy: .public)")
-        Task { @MainActor [weak self] in self?.indicator?.setListening(on, until: until) }
+        Task { @MainActor [weak self] in self?.indicator?.setListening(on, until: until, connection: conn) }
         onMic { [weak self] in await self?.applyMic() }
     }
 
@@ -351,24 +351,25 @@ final class Bridge: @unchecked Sendable {
     /// keeps it closed until the core confirms; `false` withdraws it (the pause surely wasn't saved, or the user
     /// resumed).
     private func setLocalPause(_ on: Bool) {
-        let core: (Bool?, Date?) = lock.withLock {
+        let core: (Bool?, Date?, UInt64) = lock.withLock {
             localPause = on
-            return (coreListening, coreUntil)
+            return (coreListening, coreUntil, connection)
         }
         // Withdrawn: the menu shows the core's state again (it may have shown a pause the core never got).
         if !on, let listening = core.0 {
-            Task { @MainActor [weak self] in self?.indicator?.setListening(listening, until: core.1) }
+            Task { @MainActor [weak self] in self?.indicator?.setListening(listening, until: core.1, connection: core.2) }
         }
         onMic { [weak self] in await self?.applyMic() }
     }
 
     /// The core connection ended: close the mic until a new core says to listen.
     private func coreLost() {
-        lock.withLock {
+        let gone: UInt64 = lock.withLock {
             coreListening = nil
             connection += 1
+            return connection
         }
-        Task { @MainActor [weak self] in self?.indicator?.coreStopped() }
+        Task { @MainActor [weak self] in self?.indicator?.coreStopped(connection: gone) }
         onMic { [weak self] in await self?.applyMic() }
     }
 

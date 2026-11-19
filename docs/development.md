@@ -57,7 +57,8 @@ Secrets of the `release` environment:
 Anyone who can push a `v*` tag can run the signing job, and it runs scripts from the tagged commit. So keep the
 secrets behind two repository settings: the `release` environment requires your approval (Settings →
 Environments → release → Required reviewers), and a tag ruleset lets only maintainers create `v*` tags and nobody
-move or delete them. The build job also refuses a tag whose commit isn't on `main` or hasn't passed CI. Approve
+move or delete them. The build job also refuses a tag whose commit isn't on `main` or whose CI run on `main` hasn't passed, so wait
+for CI to finish before you push the tag. Approve
 the signing job only for a tag you pushed yourself.
 
 To build a release locally instead, store the notarization credentials once with

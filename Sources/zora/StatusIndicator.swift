@@ -60,6 +60,8 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
     private var pausedUntil: Date?
     /// Shown instead of the state line until the core next reports its listening state.
     private var notice: String?
+    /// The newest core connection the menu has heard about.
+    private var connection: UInt64 = 0
     /// Why the core won't start; nil while the config is valid.
     private var setupProblems: [String]?
     private var problemItems: [NSMenuItem] = []
@@ -104,7 +106,12 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
     }
 
     /// The core's listening state (`start` and `listening` messages, docs/protocol.md).
-    func setListening(_ on: Bool, until: Date?) {
+    /// `connection` numbers core connections (Bridge); updates queued from an older connection are ignored.
+    func setListening(_ on: Bool, until: Date?, connection: UInt64? = nil) {
+        if let connection {
+            guard connection >= self.connection else { return }
+            self.connection = connection
+        }
         listening = on
         pausedUntil = on ? nil : until
         pendingTask?.cancel()
@@ -120,7 +127,9 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
 
     /// The core is gone (exited, restarting): until a new one reports, the menu says it is starting rather than
     /// claiming to listen.
-    func coreStopped() {
+    func coreStopped(connection: UInt64) {
+        guard connection >= self.connection else { return }
+        self.connection = connection
         listening = nil
         pausedUntil = nil
         pendingTask?.cancel()
@@ -152,7 +161,6 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
             return entry
         }
         for (i, entry) in problemItems.enumerated() { menu.insertItem(entry, at: menu.index(of: stateLine) + 1 + i) }
-        if problems == nil { listening = nil }
         setEnabled()
         render()
         // Shown once per episode, so a fresh install or a vanished project folder doesn't go unnoticed.

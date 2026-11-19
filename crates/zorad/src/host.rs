@@ -357,7 +357,7 @@ fn spawn(cmd: &[String]) -> std::io::Result<tokio::process::Child> {
         .spawn()
 }
 
-/// Forwards plugin stderr (metadata-only by contract) at no more than 4 KiB/s, in whole lines.
+/// Forwards plugin stderr (metadata-only by contract) in whole lines, at roughly 4 KiB/s at most.
 async fn forward_stderr(id: String, mut err: impl AsyncRead + Unpin) {
     let mut buf = [0u8; 4096];
     let mut lines = StderrLines::default();
