@@ -615,6 +615,48 @@ fn shutdown_reaps_plugin_process_group() {
     assert_eq!(code, Some(0), "{err}");
 }
 
+/// Children are reaped by zorad, not the kernel, even when zorad inherits SIGCHLD ignored: only an unreaped
+/// leader keeps a group id from being reused, so the plugin's group is still cleaned up.
+#[cfg(unix)]
+#[test]
+fn shutdown_reaps_plugin_process_group_with_sigchld_ignored() {
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    let pidfile = env.home.join("plugin-child.pid");
+    let cfg = env.config_with(
+        json!([{"delayMs": 200, "spawnStubborn": pidfile.display().to_string()}]),
+        sh("echo ok", &["print", "ok"]),
+        json!({"lingerAfterStop": true}),
+    );
+    let mut c = env.cmd();
+    c.args(["run", "--config"])
+        .arg(&cfg)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: only an async-signal-safe call between fork and exec.
+    unsafe {
+        c.pre_exec(|| {
+            libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let child = c.spawn().unwrap();
+    let pid: i32 = wait_for(Duration::from_secs(10), || {
+        std::fs::read_to_string(&pidfile).ok()?.trim().parse().ok()
+    })
+    .expect("plugin child not started");
+    let (code, err) = term_and_collect(child);
+    let gone = wait_for(Duration::from_secs(2), || (!alive(pid)).then_some(()));
+    if gone.is_none() {
+        sys::kill(pid);
+    }
+    assert!(
+        gone.is_some(),
+        "plugin descendant {pid} outlived zorad:\n{err}"
+    );
+    assert_eq!(code, Some(0), "{err}");
+}
+
 #[test]
 fn shutdown_during_negotiation_reaps_plugin_group() {
     let env = Env::new();
@@ -871,6 +913,303 @@ fn speech_from_the_pause_that_arrives_after_resume_is_dropped() {
     );
     assert_eq!(commands.len(), 1, "speech from the pause ran: {commands:?}");
     assert_eq!(commands[0].1, "say hi");
+}
+
+impl Env {
+    /// `zorad settings set <change>` on `cfg`: exit code and stderr.
+    fn settings_set(&self, cfg: &Path, change: Value) -> (Option<i32>, String) {
+        let out = self
+            .cmd()
+            .args(["settings", "set", &change.to_string(), "--config"])
+            .arg(cfg)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn settings_set_changes_only_the_requested_keys() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let mut doc = read_json(&cfg);
+    doc["futureKey"] = json!({"from": "a newer zorad"});
+    std::fs::write(&cfg, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let (code, err) = env.settings_set(&cfg, json!({"wakeNames": ["Zora", "Jarvis"]}));
+    assert_eq!(code, Some(0), "{err}");
+    let after = read_json(&cfg);
+    assert_eq!(after["wakeNames"], json!(["zora", "jarvis"]));
+    doc["wakeNames"] = after["wakeNames"].clone();
+    assert_eq!(after, doc, "keys other than wakeNames changed");
+}
+
+#[test]
+fn a_settings_change_based_on_stale_values_is_refused() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let before = std::fs::read(&cfg).unwrap();
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"wakeNames": ["zora", "jarvis"], "expect": {"wakeNames": ["zora"]}}),
+    );
+    assert_eq!(code, Some(3), "{err}");
+    assert!(err.contains("wakeNames changed"), "{err}");
+    assert_eq!(
+        std::fs::read(&cfg).unwrap(),
+        before,
+        "a refused change wrote"
+    );
+    // The values actually loaded go through.
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"wakeNames": ["zora", "jarvis"], "expect": {"wakeNames": ["zora", "nova"]}}),
+    );
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(read_json(&cfg)["wakeNames"], json!(["zora", "jarvis"]));
+}
+
+#[test]
+fn concurrent_config_writers_do_not_lose_changes() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let names: Vec<String> = (0..8)
+        .map(|i| format!("name{}", "abcdefgh".as_bytes()[i] as char))
+        .collect();
+    let children: Vec<Child> = names
+        .iter()
+        .map(|n| {
+            env.cmd()
+                .args(["names", "add", n, "--config"])
+                .arg(&cfg)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut c in children {
+        assert!(c.wait().unwrap().success());
+    }
+    let have = read_json(&cfg)["wakeNames"].clone();
+    for n in &names {
+        assert!(
+            have.as_array().unwrap().contains(&json!(n)),
+            "{n} lost: {have}"
+        );
+    }
+}
+
+#[test]
+fn first_run_default_config_never_replaces_a_concurrent_change() {
+    let env = Env::new();
+    let cfg = env.home.join("fresh").join("config.json");
+    for round in 0..3 {
+        let _ = std::fs::remove_file(&cfg);
+        // Readers that create the default file race writers that add names.
+        let children: Vec<(Option<String>, Child)> = (0..8)
+            .map(|i| {
+                let name = (i % 2 == 0).then(|| format!("round{round}name{i}"));
+                let mut c = env.cmd();
+                match &name {
+                    Some(n) => c.args(["names", "add", n.as_str()]),
+                    None => c.args(["settings"]),
+                };
+                let child = c
+                    .arg("--config")
+                    .arg(&cfg)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                (name, child)
+            })
+            .collect();
+        let mut names = vec![];
+        for (n, mut c) in children {
+            assert!(c.wait().unwrap().success());
+            names.extend(n);
+        }
+        let have = read_json(&cfg)["wakeNames"].clone();
+        for n in &names {
+            assert!(
+                have.as_array().unwrap().contains(&json!(n)),
+                "{n} lost: {have}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_workspace_edit_for_another_harness_is_refused() {
+    let env = Env::new();
+    let cfg = env.config(json!([]), sh("true", &["print", "ok"]));
+    let before = std::fs::read(&cfg).unwrap();
+    let ws = env.home.join("ws").display().to_string();
+    // Loaded while "claude" was the default; the file's default is now "sh".
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"workspace": ws, "expect": {"harness": "claude", "workspace": ws}}),
+    );
+    assert_eq!(code, Some(3), "{err}");
+    assert!(err.contains("harness"), "{err}");
+    assert_eq!(std::fs::read(&cfg).unwrap(), before);
+    let (code, err) = env.settings_set(
+        &cfg,
+        json!({"workspace": ws, "expect": {"harness": "sh", "workspace": ws}}),
+    );
+    assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn live_text_from_before_a_pause_does_not_notify_after_resume() {
+    let env = Env::new();
+    let cfg = env.config(
+        // Tagged with epoch 1 (before the pause), delivered after the resume (epoch 3).
+        json!([{"delayMs": 7000, "partial": "Hey Nova", "epoch": 1}]),
+        sh("echo ran", &["print", "ran"]),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(2000));
+    env.zorad(&["resume"]);
+    std::thread::sleep(Duration::from_millis(6000));
+    let (_, err) = term_and_collect(child);
+    assert!(err.contains("listening=true epoch=3"), "{err}");
+    assert!(err.contains("pause confirmed=true"), "{err}");
+    assert!(!err.contains("notify kind=captureStarted"), "{err}");
+}
+
+#[test]
+fn a_plugin_without_pause_support_is_stopped_while_paused_and_restarted_on_resume() {
+    let env = Env::new();
+    let cfg = env.config_with(
+        // Each connection replays the script: the first is stopped before speaking, the restarted one speaks.
+        json!([{"delayMs": 6000, "say": "Hey Zora, say hi. Do it, Zora.", "durMs": 800}]),
+        sh("echo \"ran: $1\"", &["ran"]),
+        json!({"listeningCapability": false}),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1000));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(5000));
+    env.zorad(&["resume"]);
+    let done = wait_for(Duration::from_secs(25), || {
+        env.commands().into_iter().find(|c| c.2 == "succeeded")
+    });
+    let (_, err) = term_and_collect(child);
+    assert!(
+        err.contains("plugin script can't confirm its microphone is off"),
+        "{err}"
+    );
+    assert_eq!(err.matches("listening=true epoch=1 ").count(), 2, "{err}");
+    assert!(!err.contains("listening=false"), "{err}");
+    assert_eq!(done.map(|c| c.1).as_deref(), Some("say hi"), "{err}");
+}
+
+/// Asserts that the needles appear in `err` in this order.
+fn in_order(err: &str, needles: &[&str]) {
+    let mut from = 0;
+    for n in needles {
+        match err[from..].find(n) {
+            Some(i) => from += i + n.len(),
+            None => panic!("{n:?} missing or out of order in:\n{err}"),
+        }
+    }
+}
+
+#[test]
+fn a_late_confirmation_clears_pause_not_confirmed() {
+    let env = Env::new();
+    // Confirms after the 5 s report but before the 8 s stop deadline.
+    let cfg = env.config_with(
+        json!([]),
+        sh("true", &["print", "ok"]),
+        json!({"confirmDelayMs": 6500}),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(9000));
+    env.zorad(&["resume"]);
+    std::thread::sleep(Duration::from_millis(2000));
+    let (_, err) = term_and_collect(child);
+    in_order(
+        &err,
+        &[
+            "pause confirmed=false",
+            "late mic epoch=2",
+            "pause confirmed=true",
+            // The same connection carries on: a restarted one would start again at epoch 1.
+            "listening=true epoch=3 ",
+        ],
+    );
+    assert_eq!(
+        err.matches("did not confirm its microphone is off").count(),
+        1,
+        "{err}"
+    );
+    assert_eq!(err.matches("listening=true epoch=1 ").count(), 1, "{err}");
+}
+
+#[test]
+fn a_microphone_reopened_while_paused_unconfirms_the_pause() {
+    let env = Env::new();
+    let cfg = env.config(
+        json!([{"delayMs": 6000, "mic": true}]),
+        sh("true", &["print", "ok"]),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    std::thread::sleep(Duration::from_millis(7000));
+    let (_, err) = term_and_collect(child);
+    // Confirmed, reopened (reported at once), then closed again when the plugin is stopped and reaped.
+    in_order(
+        &err,
+        &[
+            "pause confirmed=true",
+            "plugin script opened its microphone while paused",
+            "pause confirmed=false",
+            "pause confirmed=true",
+        ],
+    );
+}
+
+#[test]
+fn a_plugin_that_never_confirms_a_pause_is_stopped_and_reported() {
+    let env = Env::new();
+    let cfg = env.config_with(
+        json!([]),
+        sh("true", &["print", "ok"]),
+        json!({"confirmPause": false}),
+    );
+    let child = env.start(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+    env.zorad(&["pause"]);
+    // The 8 s stop deadline, plus up to a second to notice the pause and time to reap.
+    std::thread::sleep(Duration::from_millis(11000));
+    env.zorad(&["resume"]);
+    std::thread::sleep(Duration::from_millis(3000));
+    let (_, err) = term_and_collect(child);
+    // Reported at 5 s; stopped on the plugin's own deadline, and the verified reap confirms the pause.
+    in_order(
+        &err,
+        &[
+            "plugin script did not confirm its microphone is off",
+            "pause confirmed=false",
+            "pause confirmed=true",
+        ],
+    );
+    // Stopped, started again on resume.
+    assert_eq!(err.matches("listening=true epoch=1 ").count(), 2, "{err}");
 }
 
 /// Requests the fake board saw: (path, Host header, JSON body).

@@ -217,14 +217,19 @@ pub fn guard_main() -> i32 {
         }
     };
     if let Err(why) = released {
-        group.kill();
+        if group.leader_waitable() {
+            group.kill();
+        }
         // Bounded: a leader that survives the kill leaves the job unverified, not the guard stuck.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(held.wait());
+            let _ = tx.send(held.wait_exit());
         });
-        let _ = rx.recv_timeout(Duration::from_secs(5));
-        let ok = group.reap_blocking(Duration::ZERO);
+        // A leader that never exits leaves the group unverified; it is never signalled once it could be reaped.
+        let ok = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(leader) => group.finish_blocking(Duration::ZERO, leader).0,
+            Err(_) => false,
+        };
         match why {
             Unreleased::Failed(error) => send(&out, &GuardMsg::Failed { error }),
             Unreleased::Cancelled => send(
@@ -249,12 +254,20 @@ pub fn guard_main() -> i32 {
     // Wait for the leader while watching for cancel / liveness loss.
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = done_tx.send(held.wait());
+        let _ = done_tx.send(held.wait_exit());
     });
     let mut cancelled = false;
-    let status = loop {
-        if let Ok(s) = done_rx.recv_timeout(Duration::from_millis(100)) {
-            break s;
+    // KILL after the grace, from this loop: the leader is unreaped until it ends, so the group id is still ours.
+    let mut kill_at: Option<std::time::Instant> = None;
+    let leader = loop {
+        if let Ok(l) = done_rx.recv_timeout(Duration::from_millis(100)) {
+            break l;
+        }
+        if kill_at.is_some_and(|t| std::time::Instant::now() >= t) {
+            kill_at = None;
+            if group.leader_waitable() {
+                group.kill();
+            }
         }
         let from_core = matches!(
             rx.try_recv(),
@@ -266,16 +279,14 @@ pub fn guard_main() -> i32 {
                 // `zorad jobs cancel`: the core arms its cleanup deadline as for its own cancel.
                 send(&out, &GuardMsg::Cancelling);
             }
-            group.term();
-            let (killer, killer_grace) = (group.clone(), grace);
-            std::thread::spawn(move || {
-                std::thread::sleep(killer_grace);
-                killer.kill();
-            });
+            if group.leader_waitable() {
+                group.term();
+            }
+            kill_at = Some(std::time::Instant::now() + grace);
         }
     };
     // The job is over only when its whole group is gone. A cancel accepted at any point until then counts.
-    let ok = group.reap_blocking(grace);
+    let (ok, status) = group.finish_blocking(grace, leader);
     let cancelled = cancelled || group.cancel_requested();
     // Bounded: a detached process that inherited the pipes must not keep the guard (and workspace) busy.
     let (stdout, t1) = take_captured(&stdout_h.0, &stdout_h.1, Duration::from_secs(2));

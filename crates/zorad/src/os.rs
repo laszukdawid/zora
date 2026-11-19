@@ -5,7 +5,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Stdio};
 use std::time::{Duration, Instant};
 
 /// Identifier of the current boot; process ids and start times are only comparable within one boot.
@@ -169,8 +169,27 @@ impl Group {
         signal_group(self.0, libc::SIGKILL);
     }
 
-    pub fn reap_blocking(&self, grace: Duration) -> bool {
-        reap_group_blocking(self.0, grace)
+    /// Ends the group after its leader exited (see `Held::wait_exit`): the rest of the group is stopped while the
+    /// leader still pins the id, then the leader is reaped. True once the group is verifiably empty; also the
+    /// leader's (exit code, signal).
+    pub fn finish_blocking(&self, grace: Duration, leader: Leader) -> (bool, ExitInfo) {
+        // Without a pinned leader the id may already be someone else's: check only.
+        if leader.pinned {
+            stop_pinned_group_blocking(self.0, grace);
+        }
+        let mut child = leader.child;
+        let status = child.wait().ok().map(|s| (s.code(), s.signal()));
+        (wait_group_empty(self.0, Duration::from_secs(2)), status)
+    }
+
+    /// For a group that already failed to reap: only checks whether it is gone, never signals it, since its
+    /// number may since belong to an unrelated group.
+    pub fn leader_waitable(&self) -> bool {
+        wait_exit_unreaped(self.0, Some(Duration::ZERO)).is_some()
+    }
+
+    pub fn retry_reap(&self) -> bool {
+        group_empty(self.0)
     }
 
     /// Whether `zorad jobs cancel` left this job's cancel marker.
@@ -201,10 +220,13 @@ impl Held {
         Ok(())
     }
 
-    /// Blocks until the leader exits: (exit code, signal).
-    pub fn wait(mut self) -> Option<(Option<i32>, Option<i32>)> {
-        let s: ExitStatus = self.child.wait().ok()?;
-        Some((s.code(), s.signal()))
+    /// Blocks until the leader exits, leaving it unreaped so the group id stays ours until `finish_blocking`.
+    pub fn wait_exit(self) -> Leader {
+        let pinned = wait_exit_unreaped(self.child.id() as i32, None) == Some(true);
+        Leader {
+            child: self.child,
+            pinned,
+        }
     }
 }
 
@@ -285,6 +307,204 @@ pub fn spawn_plugin(exe: &str, args: &[String]) -> std::io::Result<(PluginChild,
         .spawn()?;
     let pgid = child.id().unwrap_or(0) as i32;
     Ok((child, Group(pgid, None)))
+}
+
+/// Waits up to `limit` (None: forever) for our child `pid` to exit, leaving it unreaped: the zombie keeps its
+/// pid, and so its process group id, from being reused. Some(true): exited; Some(false): still running; None: not
+/// waitable (already reaped), so nothing is pinned.
+pub fn wait_exit_unreaped(pid: i32, limit: Option<Duration>) -> Option<bool> {
+    let end = limit.map(|l| Instant::now() + l);
+    loop {
+        // SAFETY: a zeroed siginfo_t is valid; WNOWAIT leaves the child waitable.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if r == -1 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return None;
+        }
+        if info.si_signo != 0 {
+            return Some(true);
+        }
+        if end.is_some_and(|e| Instant::now() >= e) {
+            return Some(false);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Members of process group `pgid` other than `leader`, or None where they can't be listed.
+fn others_in_group(pgid: i32, leader: i32) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut pids = vec![0i32; 4096];
+        // SAFETY: the buffer is valid for its byte size.
+        let n = unsafe {
+            libc::proc_listpgrppids(
+                pgid,
+                pids.as_mut_ptr().cast(),
+                (pids.len() * std::mem::size_of::<i32>()) as libc::c_int,
+            )
+        };
+        if n < 0 {
+            return None;
+        }
+        Some(pids.iter().filter(|&&p| p != 0 && p != leader).count())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut n = 0;
+        for e in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
+                continue;
+            };
+            let stat = match std::fs::read(e.path().join("stat")) {
+                Ok(b) => b,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.raw_os_error() == Some(libc::ESRCH) =>
+                {
+                    continue; // exited meanwhile
+                }
+                Err(_) => return None, // can't tell: not proven empty
+            };
+            let pgrp = stat_pgrp(&stat)?;
+            if pgrp == pgid && pid != leader {
+                n += 1;
+            }
+        }
+        Some(n)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (pgid, leader);
+        None
+    }
+}
+
+/// The process group in a `/proc/<pid>/stat` line ("pid (comm) state ppid pgrp ..."). `comm` may hold spaces,
+/// parentheses and bytes that aren't UTF-8, so the fields are read after the last ')'.
+#[cfg(any(target_os = "linux", test))]
+fn stat_pgrp(stat: &[u8]) -> Option<i32> {
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    std::str::from_utf8(&stat[close + 1..])
+        .ok()?
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
+}
+
+/// Stops the rest of a group whose leader (`pgid`) has exited but is still unreaped, so its id can't have been
+/// reused: TERM, wait `grace` for the other members, then KILL. The caller reaps the leader afterwards and from
+/// then on only checks `group_empty`.
+fn stop_pinned_group_blocking(pgid: i32, grace: Duration) {
+    let alone = || others_in_group(pgid, pgid) == Some(0);
+    let wait_alone = |limit: Duration| {
+        let end = Instant::now() + limit;
+        while Instant::now() < end {
+            if alone() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        alone()
+    };
+    if alone() {
+        return;
+    }
+    signal_group(pgid, libc::SIGTERM);
+    if !wait_alone(grace) {
+        signal_group(pgid, libc::SIGKILL);
+        wait_alone(Duration::from_secs(2));
+    }
+}
+
+/// Polls `group_empty` for up to `limit`; for a group whose leader is reaped, so it never signals.
+fn wait_group_empty(pgid: i32, limit: Duration) -> bool {
+    let end = Instant::now() + limit;
+    while Instant::now() < end {
+        if group_empty(pgid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    group_empty(pgid)
+}
+
+/// A leader's (exit code, signal), when known.
+pub type ExitInfo = Option<(Option<i32>, Option<i32>)>;
+
+/// A job's group leader that has exited but isn't reaped yet; see `Group::finish_blocking`.
+pub struct Leader {
+    child: Child,
+    /// Seen exited and still unreaped, so it holds the group id.
+    pinned: bool,
+}
+
+/// Children must stay waitable until we reap them: with SIGCHLD inherited as ignored (or SA_NOCLDWAIT) the kernel
+/// reaps them itself, and nothing would pin a group id. Called first thing in every zorad process.
+pub fn default_sigchld() {
+    // SAFETY: a zeroed sigaction is SIG_DFL with no flags and an empty mask.
+    unsafe {
+        let sa: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut());
+    }
+}
+
+/// Stops a plugin and its process group. Every signal goes out while the leader is unreaped (a live process or a
+/// zombie pins the group id); the leader is reaped last and the group then only checked. True once it is
+/// verifiably empty.
+pub async fn stop_plugin(child: &mut PluginChild, group: &Group) -> bool {
+    let pgid = group.0;
+    let Some(pid) = child.id() else {
+        return group_empty(pgid); // already reaped: nothing is pinned, so only check
+    };
+    let pid = pid as i32;
+    let exited = tokio::task::spawn_blocking(move || {
+        // No signal before the leader is known to be waitable: otherwise nothing pins the id.
+        wait_exit_unreaped(pid, Some(Duration::ZERO))?;
+        signal_group(pgid, libc::SIGTERM);
+        let mut exited = wait_exit_unreaped(pid, Some(Duration::from_secs(3)));
+        if exited == Some(false) {
+            signal_group(pgid, libc::SIGKILL);
+            exited = wait_exit_unreaped(pid, Some(Duration::from_secs(2)));
+        }
+        if exited == Some(true) {
+            stop_pinned_group_blocking(pgid, Duration::from_secs(3));
+        }
+        Some(exited == Some(true))
+    })
+    .await
+    .unwrap_or(Some(false));
+    match exited {
+        None => {
+            return tokio::task::spawn_blocking(move || {
+                wait_group_empty(pgid, Duration::from_secs(2))
+            })
+            .await
+            .unwrap_or(false);
+        }
+        Some(false) => return false,
+        Some(true) => {}
+    }
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    tokio::task::spawn_blocking(move || wait_group_empty(pgid, Duration::from_secs(2)))
+        .await
+        .unwrap_or(false)
 }
 
 pub fn job_gone(_id: &str, pgid: i32) -> bool {
@@ -560,6 +780,78 @@ pub fn attached_plugin() -> Result<
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn stat_lines_with_odd_names_still_give_the_group() {
+        assert_eq!(stat_pgrp(b"42 (sh) S 1 4242 4242 0"), Some(4242));
+        assert_eq!(stat_pgrp(b"42 (a) b (\xff\xfe) R 1 77 77 0"), Some(77));
+        assert_eq!(stat_pgrp(b"42 (truncated"), None);
+    }
+
+    #[test]
+    fn a_leader_that_was_not_seen_exiting_leaves_check_only_cleanup() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        child.wait().unwrap(); // reaped: nothing pins the id any more
+        let group = Group(pgid, None);
+        assert!(!group.leader_waitable());
+        let started = Instant::now();
+        while others_in_group(pgid, pgid) == Some(0) && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let leader = Leader {
+            child,
+            pinned: false,
+        };
+        let (ok, _) = group.finish_blocking(Duration::ZERO, leader);
+        assert!(!ok, "a member is left");
+        assert!(
+            others_in_group(pgid, pgid).is_some_and(|n| n >= 1),
+            "an unpinned group is never signalled"
+        );
+        signal_group(pgid, libc::SIGKILL); // test cleanup
+    }
+
+    #[test]
+    fn a_group_is_stopped_while_its_exited_leader_still_pins_the_id() {
+        // The leader leaves a TERM-ignoring member behind and exits.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "(trap '' TERM; sleep 30) & exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        assert_eq!(
+            wait_exit_unreaped(pgid, Some(Duration::from_secs(5))),
+            Some(true)
+        );
+        assert!(
+            !group_empty(pgid),
+            "the zombie leader still holds the group"
+        );
+        let started = Instant::now();
+        while others_in_group(pgid, pgid) == Some(0) && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(others_in_group(pgid, pgid).is_some_and(|n| n >= 1));
+        stop_pinned_group_blocking(pgid, Duration::from_millis(200));
+        assert_eq!(
+            others_in_group(pgid, pgid),
+            Some(0),
+            "TERM ignored, so KILL"
+        );
+        child.wait().unwrap();
+        assert!(wait_group_empty(pgid, Duration::from_secs(2)));
+        assert_eq!(
+            wait_exit_unreaped(pgid, Some(Duration::ZERO)),
+            None,
+            "reaped"
+        );
+    }
     use zora_core::store::JobRecord;
 
     fn tmp() -> PathBuf {

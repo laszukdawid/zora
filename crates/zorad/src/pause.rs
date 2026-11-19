@@ -3,7 +3,9 @@
 //! file is simply ignored).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// What the service tells plugins (`start` and `listening` messages, docs/protocol.md).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -19,6 +21,15 @@ impl Listen {
         listening: true,
         until: None,
     };
+}
+
+/// What plugin hosts watch. `turn` counts on/off transitions (each host maps it to its connection's epoch);
+/// `confirmed` is set once every transcript plugin confirmed the pause, or the deadline passed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ListenState {
+    pub listen: Listen,
+    pub turn: u64,
+    pub confirmed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -141,9 +152,247 @@ pub fn local_hhmm(t: f64) -> String {
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
+/// Which microphones a pause still waits on: transcript plugins that haven't confirmed it (by id), and plugin process
+/// groups that couldn't be reaped (by id and generation). Those stay counted, across pauses, until verified gone; a
+/// replacement connection can't vouch for them.
+#[derive(Debug, Default)]
+pub struct PauseTracker {
+    pending: Option<Pending>,
+    waiting: BTreeSet<String>,
+    unreaped: BTreeSet<(String, u64)>,
+    /// Waiting because they reported the microphone open while paused.
+    reopened: BTreeSet<String>,
+    confirmed: Option<bool>,
+}
+
+#[derive(Debug)]
+struct Pending {
+    deadline: Instant,
+    /// May settle before the deadline once nothing is waiting (not at startup, before any plugin is up).
+    early: bool,
+    /// Sources already reported as unconfirmed in this pause.
+    reported: BTreeSet<String>,
+}
+
+impl PauseTracker {
+    pub fn pause(
+        &mut self,
+        deadline: Instant,
+        early: bool,
+        transcript: impl IntoIterator<Item = String>,
+    ) {
+        self.pending = Some(Pending {
+            deadline,
+            early,
+            reported: BTreeSet::new(),
+        });
+        self.waiting = transcript.into_iter().collect();
+        self.reopened.clear();
+        self.confirmed = None;
+    }
+
+    pub fn resume(&mut self) {
+        self.pending = None;
+        self.waiting.clear();
+        self.reopened.clear();
+        self.confirmed = None;
+    }
+
+    /// A transcript plugin connected; while paused it must confirm too, by `deadline` at the earliest.
+    pub fn up(&mut self, id: &str, deadline: Instant) {
+        if let Some(p) = &mut self.pending {
+            p.deadline = p.deadline.max(deadline);
+            self.waiting.insert(id.to_string());
+        }
+    }
+
+    /// `mic{open: false}` for the current pause.
+    pub fn closed(&mut self, id: &str) {
+        self.waiting.remove(id);
+        self.reopened.remove(id);
+    }
+
+    /// `mic{open: true}` during the pause: unconfirmed at once, and reported again.
+    pub fn opened(&mut self, id: &str, now: Instant) {
+        if let Some(p) = &mut self.pending {
+            p.deadline = p.deadline.min(now);
+            p.reported.remove(id);
+            self.waiting.insert(id.to_string());
+            self.reopened.insert(id.to_string());
+        }
+    }
+
+    /// A connection ended. Only a verified reap counts as closed; otherwise a group that may hold a microphone is
+    /// counted until `reaped`.
+    pub fn down(&mut self, id: &str, generation: u64, reaped: bool, may_record: bool) {
+        if reaped || may_record {
+            self.waiting.remove(id);
+            self.reopened.remove(id);
+        }
+        if !reaped && may_record {
+            self.unreaped.insert((id.to_string(), generation));
+        }
+    }
+
+    /// A group that failed to reap is gone after all.
+    pub fn reaped(&mut self, id: &str, generation: u64) {
+        self.unreaped.remove(&(id.to_string(), generation));
+    }
+
+    /// The confirmation to publish when it changed (None: waiting again), and the reasons to report (each source
+    /// once per pause).
+    pub fn evaluate(&mut self, now: Instant) -> Option<(Option<bool>, Vec<String>)> {
+        let p = self.pending.as_mut()?;
+        let open: Vec<(String, String)> = self
+            .waiting
+            .iter()
+            .map(|id| {
+                let reason = if self.reopened.contains(id) {
+                    format!("plugin {id} opened its microphone while paused")
+                } else {
+                    format!("plugin {id} did not confirm its microphone is off")
+                };
+                (id.clone(), reason)
+            })
+            .chain(self.unreaped.iter().map(|(id, g)| {
+                (
+                    format!("{id}#{g}"),
+                    format!("plugin {id} left processes running; its microphone may still be on"),
+                )
+            }))
+            .collect();
+        let due = now >= p.deadline;
+        let next = if open.is_empty() && (p.early || due) {
+            true
+        } else if due {
+            false
+        } else {
+            // A source joined a pause already decided: back to waiting.
+            if self.confirmed.take().is_some() {
+                return Some((None, vec![]));
+            }
+            return None;
+        };
+        let mut report = vec![];
+        if due {
+            for (key, reason) in open {
+                if p.reported.insert(key) {
+                    report.push(reason);
+                }
+            }
+        }
+        if self.confirmed == Some(next) && report.is_empty() {
+            return None;
+        }
+        self.confirmed = Some(next);
+        Some((Some(next), report))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn tracker_at(deadline: Instant) -> PauseTracker {
+        let mut t = PauseTracker::default();
+        t.pause(deadline, true, ["listen".to_string()]);
+        t
+    }
+
+    #[test]
+    fn a_group_that_failed_to_reap_keeps_later_pauses_unconfirmed_until_it_is_gone() {
+        let now = Instant::now();
+        let mut t = PauseTracker::default();
+        // While listening: the plugin's group couldn't be reaped; a replacement (generation 2) connects.
+        t.down("listen", 1, false, true);
+        t.pause(now + Duration::from_secs(5), true, ["listen".to_string()]);
+        t.closed("listen");
+        assert_eq!(t.evaluate(now), None, "the old group still counts");
+        let (confirmed, report) = t.evaluate(now + Duration::from_secs(5)).unwrap();
+        assert_eq!(confirmed, Some(false));
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("left processes running"), "{report:?}");
+        assert_eq!(
+            t.evaluate(now + Duration::from_secs(6)),
+            None,
+            "reported once"
+        );
+        t.reaped("listen", 1);
+        assert_eq!(
+            t.evaluate(now + Duration::from_secs(7)),
+            Some((Some(true), vec![]))
+        );
+    }
+
+    #[test]
+    fn a_microphone_reopened_while_paused_unconfirms_at_once_until_closed_again() {
+        let now = Instant::now();
+        let mut t = tracker_at(now + Duration::from_secs(5));
+        t.closed("macos");
+        t.closed("listen");
+        assert_eq!(t.evaluate(now), Some((Some(true), vec![])));
+        t.opened("listen", now);
+        let (confirmed, report) = t.evaluate(now).unwrap();
+        assert_eq!(confirmed, Some(false));
+        assert_eq!(report, ["plugin listen opened its microphone while paused"]);
+        t.closed("listen");
+        assert_eq!(t.evaluate(now), Some((Some(true), vec![])));
+        // A second reopen is reported again.
+        t.opened("listen", now);
+        assert_eq!(t.evaluate(now).unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn a_source_joining_a_confirmed_pause_withdraws_the_confirmation() {
+        let now = Instant::now();
+        let mut t = tracker_at(now + Duration::from_secs(5));
+        t.closed("listen");
+        assert_eq!(t.evaluate(now), Some((Some(true), vec![])));
+        // A transcript plugin connects (here after the first deadline): it gets its own 5 s.
+        t.up("other", now + Duration::from_secs(10));
+        let at = now + Duration::from_secs(6);
+        assert_eq!(t.evaluate(at), Some((None, vec![])), "pausing again");
+        assert_eq!(t.evaluate(at), None);
+        t.closed("other");
+        assert_eq!(t.evaluate(at), Some((Some(true), vec![])));
+    }
+
+    #[test]
+    fn a_late_confirmation_turns_an_unconfirmed_pause_confirmed() {
+        let now = Instant::now();
+        let mut t = tracker_at(now + Duration::from_secs(5));
+        let (confirmed, report) = t.evaluate(now + Duration::from_secs(5)).unwrap();
+        assert_eq!(confirmed, Some(false));
+        assert!(report[0].contains("did not confirm"), "{report:?}");
+        t.closed("listen");
+        assert_eq!(
+            t.evaluate(now + Duration::from_secs(6)),
+            Some((Some(true), vec![]))
+        );
+    }
+
+    #[test]
+    fn confirmations_settle_early_and_a_verified_reap_counts_as_closed() {
+        let now = Instant::now();
+        let mut t = tracker_at(now + Duration::from_secs(5));
+        t.up("other", now);
+        t.closed("listen");
+        assert_eq!(t.evaluate(now), None);
+        t.down("other", 7, true, true);
+        assert_eq!(t.evaluate(now), Some((Some(true), vec![])));
+        // A failed reap after the pause was confirmed un-confirms it.
+        t.down("listen", 3, false, true);
+        let (confirmed, report) = t.evaluate(now + Duration::from_secs(5)).unwrap();
+        assert!(confirmed == Some(false) && report.len() == 1, "{report:?}");
+        // Nothing that can't record (a notify-only plugin) counts.
+        t.reaped("listen", 3);
+        t.down("tray", 1, false, false);
+        assert_eq!(
+            t.evaluate(now + Duration::from_secs(6)),
+            Some((Some(true), vec![]))
+        );
+    }
 
     fn tmp() -> PathBuf {
         std::env::temp_dir()

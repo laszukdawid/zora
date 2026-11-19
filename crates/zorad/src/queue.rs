@@ -23,6 +23,10 @@ pub trait Classify {
     }
     fn loss_marker() -> Self;
     fn is_loss_marker(&self) -> bool;
+    /// Enqueued past every cap (`force`), even through `send`: losing it would fail open.
+    fn must_deliver(&self) -> bool {
+        false
+    }
 }
 
 struct Counts {
@@ -67,6 +71,10 @@ impl<T: Classify> InputQueue<T> {
     }
 
     pub fn send(&self, item: T) -> Result<(), ControlOverflow> {
+        if item.must_deliver() {
+            self.force(item);
+            return Ok(());
+        }
         // Yield under the lock so a loss marker lands exactly where the dropped item would have been.
         let mut c = self.counts.lock().unwrap_or_else(|e| e.into_inner());
         match item.class() {

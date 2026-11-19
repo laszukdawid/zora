@@ -62,6 +62,17 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
     private var notice: String?
     /// The newest core connection the menu has heard about.
     private var connection: UInt64 = 0
+    /// The menu's Pause was clicked and the core hasn't reported the pause yet.
+    private var localPause = false
+    /// Whether this app's microphone engine is open, as last reported by the mic chain.
+    private var micOpen = false
+    /// Why the microphone can't open while listening is wanted; nil when it works.
+    private var micFailure: String?
+    /// The core's listening epoch; nil for a core without epochs, which never confirms a pause.
+    private var epoch: UInt64?
+    /// The core's pause confirmation for `epoch` (docs/protocol.md "Confirmation").
+    private var confirmed: Bool?
+    private var confirmTimeout: Task<Void, Never>?
     /// Why the core won't start; nil while the config is valid.
     private var setupProblems: [String]?
     private var problemItems: [NSMenuItem] = []
@@ -107,10 +118,26 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
 
     /// The core's listening state (`start` and `listening` messages, docs/protocol.md).
     /// `connection` numbers core connections (Bridge); updates queued from an older connection are ignored.
-    func setListening(_ on: Bool, until: Date?, connection: UInt64? = nil) {
+    /// `epoch` and `confirmed` come from the core's message; a call without `connection` is local and keeps them.
+    func setListening(_ on: Bool, until: Date?, connection: UInt64? = nil, epoch: UInt64? = nil, confirmed: Bool? = nil) {
         if let connection {
             guard connection >= self.connection else { return }
+            if epoch != self.epoch || connection != self.connection { self.confirmed = nil }
             self.connection = connection
+            self.epoch = epoch
+            // The core sends its current decision every time; none (with epochs) means pending, e.g. withdrawn.
+            if confirmed != nil || epoch != nil { self.confirmed = confirmed }
+            if !on { localPause = false }
+            confirmTimeout?.cancel()
+            if !on, epoch != nil, self.confirmed == nil {
+                // The core answers within 5 s; a core that never does must not leave "Pausing…" up.
+                confirmTimeout = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(8))
+                    guard !Task.isCancelled, let self, self.epoch == epoch, self.confirmed == nil else { return }
+                    self.confirmed = false
+                    render()
+                }
+            }
         }
         listening = on
         pausedUntil = on ? nil : until
@@ -132,12 +159,24 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         self.connection = connection
         listening = nil
         pausedUntil = nil
+        epoch = nil
+        confirmed = nil
+        confirmTimeout?.cancel()
         pendingTask?.cancel()
         pendingTask = nil
         resetTask?.cancel()
         notice = nil
         state = .idle
         setEnabled()
+        render()
+    }
+
+    /// This app's microphone engine after the mic chain applied a change; `failure` says why it can't open
+    /// while listening is wanted.
+    func setMic(open: Bool, failure: String?, connection: UInt64) {
+        guard connection >= self.connection else { return }
+        micOpen = open
+        micFailure = failure
         render()
     }
 
@@ -228,7 +267,11 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
     /// is off while it is still on.
     private func change(_ args: [String]) {
         let wantListening = args.first == "resume"
-        if !wantListening { pauseMic() }
+        if !wantListening {
+            localPause = true
+            pauseMic()
+            render()
+        }
         pauseItem.isEnabled = false
         pauseHourItem.isEnabled = false
         requestInFlight = true
@@ -240,16 +283,21 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
                     // It may or may not have been saved. The mic stays closed and the menu shows a pause, so
                     // Resume is offered and undoes it either way.
                     setListening(false, until: nil)
+                    confirmed = false
                     notice = "Zora: paused here; the core didn't confirm it"
                     render()
                 } else if !wantListening {
+                    localPause = false
                     restoreMic() // surely not saved
                 }
                 setEnabled()
                 alert(wantListening ? "Zora couldn't resume listening" : "Zora couldn't pause listening", result.message)
                 return
             }
-            if wantListening { restoreMic() } // ends a pause held only here, if any
+            if wantListening { // ends a pause held only here, if any
+                localPause = false
+                restoreMic()
+            }
             if listening == wantListening { return setEnabled() } // the core already confirmed it
             // The core picks the change up within a second. If it doesn't answer (stopped or restarting), the
             // saved state still applies when it starts; say so instead of leaving the menu greyed out.
@@ -285,14 +333,31 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
 
     private func render() {
         let paused = listening == false
+        // Pausing until this app's engine is closed and, with a core that confirms, the core confirmed.
+        let pausing = (localPause && listening == true) || (paused && (micOpen || (epoch != nil && confirmed == nil)))
         let symbol: String
         let label: String
+        var detail: String?
         if setupProblems != nil {
             symbol = "gear.badge.xmark"
             label = "Zora needs setup: it isn't listening"
         } else if listening == nil && state == .idle {
             symbol = "ellipsis"
             label = "Zora: starting…"
+        } else if paused && confirmed == false {
+            // A timeout wins over Pausing…: the warning matters most while the microphone is still open.
+            symbol = "exclamationmark.triangle"
+            label = "Zora: pause not confirmed"
+            detail = micOpen
+                ? "Zora's microphone is still open."
+                : "A transcript plugin didn't confirm that it closed its microphone."
+        } else if pausing {
+            symbol = "mic.badge.xmark"
+            label = "Zora: pausing…"
+        } else if !paused && micFailure != nil && state == .idle {
+            symbol = "mic.slash.circle"
+            label = "Zora: microphone unavailable"
+            detail = micFailure
         } else if paused && state == .idle {
             symbol = "mic.slash"
             label = pausedUntil.map { "Zora: paused until \($0.formatted(date: .omitted, time: .shortened))" }
@@ -304,8 +369,9 @@ final class StatusIndicator: NSObject, NSMenuDelegate {
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
         image?.isTemplate = true
         item.button?.image = image
-        item.button?.toolTip = label
+        item.button?.toolTip = detail.map { "\(label)\n\($0)" } ?? label
         stateLine.title = setupProblems == nil ? (notice ?? label) : label
+        stateLine.toolTip = detail
         pauseItem.title = paused ? "Resume Listening" : "Pause Listening"
         pauseHourItem.isHidden = paused
     }

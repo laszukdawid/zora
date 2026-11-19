@@ -1,6 +1,6 @@
 //! Plugin host: implements docs/protocol.md for one plugin (a spawned child, or the attached app that started us).
 
-use crate::pause::Listen;
+use crate::pause::ListenState;
 use crate::queue::{Class, Classify, InputQueue};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,13 @@ use zora_core::suppression::DictationSignal;
 pub const PROTOCOL: u32 = 1;
 const MAX_LINE: usize = 64 * 1024;
 const HEARTBEAT_LEASE: Ns = 6 * SECOND;
+/// Ends a session whose plugin must stay off until listening resumes.
+const PAUSED_OUT: &str = "stopped while paused";
+/// A spawned transcript plugin that hasn't confirmed a pause by then is stopped, however its connection is doing.
+/// Longer than the service's 5 s, so the service reports it first.
+const PAUSE_STOP: Duration = Duration::from_secs(8);
+/// A plugin that doesn't take a message within this long isn't reading its input.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Messages from a plugin. Some fields are part of the protocol but unused by the core.
 #[allow(dead_code)]
@@ -50,6 +57,14 @@ pub enum FromPlugin {
         generation: u64,
         session: u64,
         text: String,
+        #[serde(default)]
+        epoch: Option<u64>,
+    },
+    Mic {
+        seq: u64,
+        generation: u64,
+        epoch: u64,
+        open: bool,
     },
     Status {
         seq: u64,
@@ -120,12 +135,16 @@ pub enum ToPlugin {
         listening: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         until: Option<f64>,
+        epoch: u64,
     },
     /// Listening was paused or resumed. Plugins with `transcript` release or reopen the microphone.
     Listening {
         listening: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         until: Option<f64>,
+        epoch: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        confirmed: Option<bool>,
     },
     Sync {
         id: u64,
@@ -166,12 +185,32 @@ pub enum Item {
     PluginDown {
         id: String,
         generation: u64,
+        /// Its processes are verifiably gone (a spawned plugin's group was reaped).
+        reaped: bool,
+        /// It may hold a microphone: it declared `transcript`, or never got as far as saying.
+        may_record: bool,
+    },
+    /// A plugin group that failed to reap at `PluginDown` is gone after all.
+    Reaped {
+        id: String,
+        generation: u64,
     },
     PluginStopped {
         id: String,
     },
     Ack {
         id: String,
+    },
+    /// Live text of the current epoch; `turn` is the listening turn it was heard in.
+    Partial {
+        text: String,
+        turn: u64,
+    },
+    /// A plugin's microphone state for the current epoch of `turn`.
+    Mic {
+        id: String,
+        turn: u64,
+        open: bool,
     },
     Notice(String),
     Job(crate::jobs::JobEvent),
@@ -185,14 +224,14 @@ impl Classify for Item {
     fn class(&self) -> Class {
         match self {
             Item::Core(Input::Segment(_)) | Item::Loss => Class::Transcript,
-            Item::Core(Input::Tick) | Item::Core(Input::Partial { .. }) => Class::Tick,
+            Item::Core(Input::Tick) | Item::Partial { .. } => Class::Tick,
             _ => Class::Control,
         }
     }
     fn cost(&self) -> usize {
         match self {
             Item::Core(Input::Segment(s)) => s.text.len() + 64,
-            Item::Notice(t) => t.len() + 64,
+            Item::Notice(t) | Item::Partial { text: t, .. } => t.len() + 64,
             _ => 64,
         }
     }
@@ -201,6 +240,10 @@ impl Classify for Item {
     }
     fn is_loss_marker(&self) -> bool {
         matches!(self, Item::Loss)
+    }
+    fn must_deliver(&self) -> bool {
+        // Teardown results: a lost unverified reap would let a pause count that group as closed.
+        matches!(self, Item::PluginDown { .. } | Item::Reaped { .. })
     }
 }
 
@@ -217,7 +260,7 @@ pub struct PluginSpec {
     pub connection: Connection,
     pub config: Value,
     /// Listening on/off, forwarded to the plugin as `start` and `listening` messages.
-    pub listen: tokio::sync::watch::Receiver<Listen>,
+    pub listen: tokio::sync::watch::Receiver<ListenState>,
     /// Capabilities this plugin may declare; `None` allows all. A plugin declaring others is rejected.
     pub allowed: Option<Vec<&'static str>>,
 }
@@ -234,14 +277,33 @@ pub async fn run_plugin(
 ) {
     let mut generation = generation_base;
     let mut backoff = Duration::from_secs(1);
+    let mut wait_for_resume = false;
     loop {
+        if std::mem::take(&mut wait_for_resume) {
+            let (mut listen, mut stop_wait) = (spec.listen.clone(), stop.clone());
+            tokio::select! {
+                r = listen.wait_for(|l| l.listen.listening) => if r.is_err() { return },
+                _ = stop_wait.wait_for(|s| *s) => return,
+            }
+            backoff = Duration::from_secs(1);
+        }
         generation += 1;
         let started = tokio::time::Instant::now();
+        let mut reaped = false;
+        let mut may_record = true;
         let result = match &spec.connection {
             Connection::Attached => match crate::os::attached_plugin() {
                 Ok((r, w)) => {
                     until_stop(
-                        session(&spec, generation, r, w, &queue, stop.clone()),
+                        session(
+                            &spec,
+                            generation,
+                            r,
+                            w,
+                            &queue,
+                            stop.clone(),
+                            &mut may_record,
+                        ),
                         stop.clone(),
                     )
                     .await
@@ -257,47 +319,61 @@ pub async fn run_plugin(
                     // Shutdown is observed in every phase (negotiation, clock probes, running); cancelling the
                     // session drops it and falls through to the group cleanup below.
                     let res = until_stop(
-                        session(&spec, generation, r, w, &queue, stop.clone()),
+                        session(
+                            &spec,
+                            generation,
+                            r,
+                            w,
+                            &queue,
+                            stop.clone(),
+                            &mut may_record,
+                        ),
                         stop.clone(),
                     )
                     .await;
                     // Reap the whole plugin group (TERM, grace, KILL, verify) before any restart.
-                    {
-                        let pgid = group.id();
-                        // Wait for the leader first: an unreaped (zombie) leader still counts as a group member.
-                        group.term();
-                        if tokio::time::timeout(Duration::from_secs(3), child.wait())
-                            .await
-                            .is_err()
-                        {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                        }
-                        let reaped = tokio::task::spawn_blocking(move || {
-                            group.reap_blocking(Duration::from_secs(3))
-                        })
-                        .await
-                        .unwrap_or(false);
-                        if !reaped {
-                            eprintln!("[zorad] plugin {} left processes in group {pgid}", spec.id);
-                        }
+                    reaped = crate::os::stop_plugin(&mut child, &group).await;
+                    if !reaped {
+                        eprintln!(
+                            "[zorad] plugin {} left processes in group {}",
+                            spec.id,
+                            group.id()
+                        );
+                        tokio::spawn(reap_later(
+                            group,
+                            spec.id.clone(),
+                            generation,
+                            queue.clone(),
+                            stop.clone(),
+                        ));
                     }
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    // Never awaited further: dropping the child kills and reaps it in the background, and
+                    // PluginDown (unverified if need be) goes out now.
+                    drop(child);
                     res
                 }
-                Err(e) => Err(ProtocolError(format!("cannot start: {e}"))),
+                Err(e) => {
+                    reaped = true; // nothing was started
+                    Err(ProtocolError(format!("cannot start: {e}")))
+                }
             },
         };
-        let _ = queue.send(Item::PluginDown {
+        // Forced past the caps: a lost teardown result could let a pause count an unreaped group as closed.
+        queue.force(Item::PluginDown {
             id: spec.id.clone(),
             generation,
+            reaped,
+            may_record,
         });
         if *stop.borrow() {
             return; // service shutdown: the group above is already reaped
         }
         match result {
             Ok(()) => return, // orderly stop
+            Err(ProtocolError(reason)) if reason == PAUSED_OUT => {
+                wait_for_resume = true;
+                continue;
+            }
             Err(ProtocolError(reason)) => {
                 eprintln!(
                     "[zorad] plugin {} generation {generation} failed: {reason}",
@@ -322,6 +398,38 @@ pub async fn run_plugin(
             _ = stop_wait.wait_for(|s| *s) => return,
         }
         backoff = (backoff * 2).min(Duration::from_secs(60));
+    }
+}
+
+/// Keeps checking a group that outlived its plugin; the pause counts it until it is gone.
+async fn reap_later(
+    group: crate::os::Group,
+    id: String,
+    generation: u64,
+    queue: Arc<InputQueue<Item>>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut group = Some(group);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = stop.wait_for(|s| *s) => return,
+        }
+        let Some(g) = group.take() else { return };
+        let Ok((g, ok)) = tokio::task::spawn_blocking(move || {
+            let ok = g.retry_reap();
+            (g, ok)
+        })
+        .await
+        else {
+            return;
+        };
+        if ok {
+            eprintln!("[zorad] plugin {id} group reaped late");
+            queue.force(Item::Reaped { id, generation });
+            return;
+        }
+        group = Some(g);
     }
 }
 
@@ -438,12 +546,27 @@ async fn read_message(
 struct Writer(mpsc::Sender<String>);
 
 impl Writer {
+    /// Bounded, so a plugin that stops reading can't stall the session (and with it pause enforcement).
     async fn send(&self, msg: &ToPlugin) -> Result<(), ProtocolError> {
-        self.0
-            .send(msg.line())
-            .await
-            .map_err(|_| ProtocolError("plugin input closed".into()))
+        match tokio::time::timeout(SEND_TIMEOUT, self.0.send(msg.line())).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(ProtocolError("plugin input closed".into())),
+            Err(_) => Err(ProtocolError("plugin is not reading its input".into())),
+        }
     }
+}
+
+/// The epoch and message for a new listening state. Transitions the plugin never saw are skipped, not replayed:
+/// the epoch jumps past them, which invalidates everything before, and only the latest state is sent.
+fn listening_update(sent: &ListenState, next: &ListenState, epoch: u64) -> (u64, ToPlugin) {
+    let epoch = epoch + next.turn.saturating_sub(sent.turn);
+    let msg = ToPlugin::Listening {
+        listening: next.listen.listening,
+        until: next.listen.until,
+        epoch,
+        confirmed: next.confirmed,
+    };
+    (epoch, msg)
 }
 
 async fn session(
@@ -453,6 +576,7 @@ async fn session(
     mut writer: impl AsyncWrite + Unpin + Send + 'static,
     queue: &InputQueue<Item>,
     stop: tokio::sync::watch::Receiver<bool>,
+    may_record: &mut bool,
 ) -> Result<(), ProtocolError> {
     let (tx, mut rx) = mpsc::channel::<String>(64);
     // A failed write is a broken connection: the reader side must not stay half-open.
@@ -531,6 +655,7 @@ async fn session(
 
     let has = |c: &str| capabilities.iter().any(|x| x == c);
     let (transcript, dictation) = (has("transcript"), has("dictation"));
+    *may_record = transcript;
     let mut state = Conn {
         healthy: false,
         capturing: false,
@@ -604,20 +729,50 @@ async fn connected(
     mut stop: tokio::sync::watch::Receiver<bool>,
     mut broken: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), ProtocolError> {
-    let mut listen = spec.listen.clone();
-    let initial = *listen.borrow_and_update();
-    out.send(&ToPlugin::Start {
-        listening: initial.listening,
-        until: initial.until,
-    })
-    .await?;
-    let mut listen_open = true;
-    let mut pending_listen: Option<Listen> = None;
+    let attached = matches!(spec.connection, Connection::Attached);
+    let listening_cap = capabilities.iter().any(|c| c == "listening");
+    // A transcript plugin that can't confirm a pause doesn't run while paused (an attached one is only reported).
+    let stop_when_paused = transcript && !listening_cap && !attached;
     let control = |item: Item| {
         queue
             .send(item)
             .map_err(|_| ProtocolError("control queue overflow".into()))
     };
+    let paused_out = || {
+        control(Item::Notice(format!(
+            "plugin {} can't confirm its microphone is off, so it is stopped while paused",
+            spec.id
+        )))?;
+        Err(ProtocolError(PAUSED_OUT.into()))
+    };
+    let mut listen = spec.listen.clone();
+    let mut sent = *listen.borrow_and_update();
+    if stop_when_paused && !sent.listen.listening {
+        return paused_out();
+    }
+    // The listening epoch of this connection (docs/protocol.md): 1 in `start`, +1 per on/off transition.
+    let mut epoch = 1u64;
+    out.send(&ToPlugin::Start {
+        listening: sent.listen.listening,
+        until: sent.listen.until,
+        epoch,
+    })
+    .await?;
+    if sent.confirmed.is_some() {
+        out.send(&ToPlugin::Listening {
+            listening: sent.listen.listening,
+            until: sent.listen.until,
+            epoch,
+            confirmed: sent.confirmed,
+        })
+        .await?;
+    }
+    let mut listen_open = true;
+    let mut pending_listen: Option<ListenState> = None;
+    // When a spawned transcript plugin is stopped unless it has confirmed the current pause.
+    let enforce = transcript && !attached;
+    let mut stop_at =
+        (enforce && !sent.listen.listening).then(|| tokio::time::Instant::now() + PAUSE_STOP);
     control(Item::PluginUp {
         id: spec.id.clone(),
         generation,
@@ -629,17 +784,36 @@ async fn connected(
     }
     let mut lease = tokio::time::Instant::now() + Duration::from_nanos(HEARTBEAT_LEASE as u64);
     loop {
-        if let Some(l) = pending_listen.take() {
-            out.send(&ToPlugin::Listening {
-                listening: l.listening,
-                until: l.until,
-            })
-            .await?;
+        if let Some(next) = pending_listen.take() {
+            let (new_epoch, msg) = listening_update(&sent, &next, epoch);
+            if new_epoch != epoch {
+                // The deadline runs from here, whether or not the plugin takes the message.
+                stop_at = (enforce && !next.listen.listening)
+                    .then(|| tokio::time::Instant::now() + PAUSE_STOP);
+            }
+            epoch = new_epoch;
+            sent = next;
+            // Stopped at once; it doesn't need the message (and can't confirm it).
+            if !sent.listen.listening && stop_when_paused {
+                return paused_out();
+            }
+            if let Some(at) = stop_at {
+                match tokio::time::timeout_at(at, out.send(&msg)).await {
+                    Ok(r) => r?,
+                    Err(_) => return Err(ProtocolError(PAUSED_OUT.into())),
+                }
+            } else {
+                out.send(&msg).await?;
+            }
         }
         let msg = tokio::select! {
             m = read_message(lines, Duration::from_secs(24 * 3600)) => m?,
             _ = stop.wait_for(|s| *s) => return Err(ProtocolError("service shutdown".into())),
             _ = &mut broken => return Err(ProtocolError("plugin input closed".into())),
+            _ = tokio::time::sleep_until(stop_at.unwrap_or_else(tokio::time::Instant::now)), if stop_at.is_some() => {
+                // Not confirmed in time; the service has reported it.
+                return Err(ProtocolError(PAUSED_OUT.into()));
+            }
             changed = listen.changed(), if listen_open => {
                 if changed.is_err() {
                     listen_open = false;
@@ -667,6 +841,9 @@ async fn connected(
                 seq, generation, ..
             }
             | FromPlugin::Partial {
+                seq, generation, ..
+            }
+            | FromPlugin::Mic {
                 seq, generation, ..
             }
             | FromPlugin::Status {
@@ -721,8 +898,12 @@ async fn connected(
                     text,
                 })));
             }
-            FromPlugin::Partial { text, .. } if transcript => {
-                // UI-only early wake hint; droppable under load, never part of command logic.
+            FromPlugin::Partial { text, epoch: e, .. } if transcript => {
+                // UI-only early wake hint; droppable under load, never part of command logic. Text heard in an
+                // earlier epoch (or not tagged with one) may be from before a pause.
+                if e != Some(epoch) || !sent.listen.listening {
+                    continue;
+                }
                 let tail: String = text
                     .chars()
                     .rev()
@@ -731,7 +912,31 @@ async fn connected(
                     .into_iter()
                     .rev()
                     .collect();
-                let _ = queue.send(Item::Core(Input::Partial { text: tail }));
+                let _ = queue.send(Item::Partial {
+                    text: tail,
+                    turn: sent.turn,
+                });
+            }
+            FromPlugin::Mic { epoch: e, open, .. } if listening_cap => {
+                if e == 0 || e > epoch {
+                    return Err(ProtocolError("mic epoch out of range".into()));
+                }
+                if e == epoch {
+                    control(Item::Mic {
+                        id: spec.id.clone(),
+                        turn: sent.turn,
+                        open,
+                    })?;
+                    if !sent.listen.listening {
+                        if !open {
+                            stop_at = None;
+                        }
+                        // The service reports it and un-confirms the pause.
+                        if open && !attached {
+                            return Err(ProtocolError(PAUSED_OUT.into()));
+                        }
+                    }
+                }
             }
             FromPlugin::Gap { at_ns, .. } if transcript => {
                 if !ts_ok(at_ns, now) {
@@ -854,6 +1059,83 @@ async fn connected(
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod listening_tests {
+    use super::*;
+
+    #[test]
+    fn teardown_results_get_through_a_full_control_queue() {
+        let (q, mut rx) = InputQueue::<Item>::new(1, 1);
+        q.send(Item::Notice("fills the control cap".into()))
+            .unwrap();
+        assert!(q.send(Item::Notice("over".into())).is_err());
+        let down = Item::PluginDown {
+            id: "listen".into(),
+            generation: 3,
+            reaped: false,
+            may_record: true,
+        };
+        assert!(q.send(down).is_ok());
+        assert!(
+            q.send(Item::Reaped {
+                id: "listen".into(),
+                generation: 3
+            })
+            .is_ok()
+        );
+        let mut got = vec![];
+        while let Ok(i) = rx.try_recv() {
+            got.push(i);
+        }
+        assert!(matches!(
+            got[1],
+            Item::PluginDown {
+                reaped: false,
+                generation: 3,
+                ..
+            }
+        ));
+        assert!(matches!(got[2], Item::Reaped { generation: 3, .. }));
+    }
+    use crate::pause::Listen;
+
+    fn state(listening: bool, turn: u64) -> ListenState {
+        ListenState {
+            listen: Listen {
+                listening,
+                until: None,
+            },
+            turn,
+            confirmed: None,
+        }
+    }
+
+    fn sent(msg: ToPlugin) -> (bool, u64) {
+        match msg {
+            ToPlugin::Listening {
+                listening, epoch, ..
+            } => (listening, epoch),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missed_resume_is_never_replayed() {
+        // Paused at turn 1 (epoch 2); the host missed the resume (turn 2) and sees the next pause (turn 3).
+        let (epoch, msg) = listening_update(&state(false, 1), &state(false, 3), 2);
+        assert_eq!(epoch, 4);
+        assert_eq!(sent(msg), (false, 4));
+        // Listening, missed a pause: the plugin gets a new epoch, which invalidates what it heard before.
+        let (_, msg) = listening_update(&state(true, 0), &state(true, 2), 1);
+        assert_eq!(sent(msg), (true, 3));
+        // A new `until` or a confirmation keeps the epoch.
+        let mut confirmed = state(false, 1);
+        confirmed.confirmed = Some(true);
+        let (epoch, _) = listening_update(&state(false, 1), &confirmed, 2);
+        assert_eq!(epoch, 2);
     }
 }
 
