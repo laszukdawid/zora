@@ -175,7 +175,7 @@ impl Group {
 
     /// Whether `zorad jobs cancel` left this job's cancel marker.
     pub fn cancel_requested(&self) -> bool {
-        self.1.as_ref().is_some_and(|m| m.exists())
+        self.1.as_deref().is_some_and(marker_present)
     }
 }
 
@@ -302,25 +302,68 @@ pub fn reap_job(_id: &str, pgid: i32, gate_start: i64, grace: Duration) -> bool 
     false
 }
 
-/// TERMs a job group, but only when it is provably the job's (leader pid == pgid with the recorded start time).
-/// First it leaves the job's cancel `marker`, so the guard records "cancelled" (and never releases a job still at
-/// its gate); the TERM does not depend on the guard noticing.
+/// Requests cancellation of a job: its guard sees the marker and does all the signalling. Only when the guard is
+/// verifiably gone (its pid no longer has the recorded start time) is the job's group TERMed from here, and only
+/// when that group is provably the job's (leader pid == pgid with the recorded start time).
 pub fn cancel_job(job: &zora_core::store::JobRecord, marker: &Path) -> Result<(), String> {
-    let pgid = match (job.job_pgid, job.gate_start) {
-        (Some(pgid), Some(start)) if pgid > 0 && start_time(pgid as i32) == Some(start) => {
-            pgid as i32
-        }
-        _ => return Err("has no verifiable running process group".into()),
+    let guard_alive = match (job.guard_pid, job.guard_start) {
+        (Some(pid), Some(start)) => pid > 0 && start_time(pid as i32) == Some(start),
+        _ => false,
     };
-    let marked = std::fs::write(marker, b"");
-    // SAFETY: negative pid targets the verified process group.
-    if unsafe { libc::kill(-pgid, libc::SIGTERM) } != 0 {
-        return Err(format!(
-            "cannot be signalled: {}",
-            std::io::Error::last_os_error()
-        ));
+    if guard_alive {
+        return request_cancel(marker);
     }
-    marked.map_err(|e| format!("was sent TERM, but its guard can't be told ({e})"))
+    match (job.job_pgid, job.gate_start) {
+        (Some(pgid), Some(start)) if pgid > 0 && start_time(pgid as i32) == Some(start) => {
+            // SAFETY: negative pid targets the verified process group.
+            if unsafe { libc::kill(-(pgid as i32), libc::SIGTERM) } != 0 {
+                return Err(format!(
+                    "cannot be signalled: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+        _ => Err("has no verifiable running process group".into()),
+    }
+}
+
+/// Creates the cancel marker: a regular file, made exclusively and without following links, in a folder only the
+/// user can enter. An existing marker means cancellation was already requested.
+pub fn request_cancel(marker: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = marker.parent().ok_or("no marker folder")?;
+    zora_core::config::create_private_dir(dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() && m.permissions().mode() & 0o077 == 0 => {}
+        _ => {
+            return Err(format!(
+                "refused: {} is not a private folder",
+                dir.display()
+            ));
+        }
+    }
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(marker);
+    match created {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && marker_present(marker) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "refused: {} is not a regular file",
+            marker.display()
+        )),
+        Err(e) => Err(format!("cannot create {}: {e}", marker.display())),
+    }
+}
+
+/// A cancel marker counts only as a regular file (never a link).
+fn marker_present(marker: &Path) -> bool {
+    std::fs::symlink_metadata(marker).is_ok_and(|m| m.file_type().is_file())
 }
 
 /// SIGTERM and SIGINT stop the service in order.
@@ -355,5 +398,83 @@ pub fn attached_plugin() -> Result<
     match (r, w) {
         (Ok(r), Ok(w)) => Ok((r, w)),
         _ => Err("fds 3/4 are not pipes".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use zora_core::store::JobRecord;
+
+    fn tmp() -> PathBuf {
+        std::env::temp_dir().join(format!("zora-os-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// A process group of its own: (child, pgid, start time).
+    fn group() -> (Child, i32, i64) {
+        let c = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = c.id() as i32;
+        (c, pid, start_time(pid).unwrap())
+    }
+
+    fn job(guard_start: Option<i64>, pgid: i32, gate_start: i64) -> JobRecord {
+        JobRecord {
+            id: "j".into(),
+            status: "running".into(),
+            boot_id: None,
+            guard_pid: Some(std::process::id() as i64),
+            guard_start,
+            job_pgid: Some(pgid as i64),
+            gate_start: Some(gate_start),
+        }
+    }
+
+    #[test]
+    fn cancel_marker_is_private_and_never_follows_a_link() {
+        let dir = tmp().join("cancel");
+        let marker = dir.join("a");
+        request_cancel(&marker).unwrap();
+        request_cancel(&marker).unwrap(); // already requested
+        assert!(marker_present(&marker));
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let target = dir.parent().unwrap().join("elsewhere");
+        let link = dir.join("b");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(request_cancel(&link).is_err());
+        assert!(!target.exists());
+        assert!(!marker_present(&link));
+    }
+
+    #[test]
+    fn a_live_guard_only_gets_the_request() {
+        let (mut c, pgid, start) = group();
+        let me = start_time(std::process::id() as i32);
+        let marker = tmp().join("cancel/j");
+        cancel_job(&job(me, pgid, start), &marker).unwrap();
+        assert!(marker_present(&marker));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(c.try_wait().unwrap().is_none(), "the group was signalled");
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    #[test]
+    fn without_its_guard_a_verified_group_is_terminated() {
+        let (mut c, pgid, start) = group();
+        let gone = start_time(std::process::id() as i32).map(|s| s + 1);
+        let marker = tmp().join("cancel/j");
+        cancel_job(&job(gone, pgid, start), &marker).unwrap();
+        let status = c.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(!marker_present(&marker));
+        // Nothing verifiable left: refused.
+        assert!(cancel_job(&job(gone, pgid, start), &marker).is_err());
     }
 }

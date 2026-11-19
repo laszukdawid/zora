@@ -523,8 +523,15 @@ fn cmd_jobs(rest: &[String]) -> i32 {
             eprintln!("no running job {id}");
             return 1;
         };
-        // Stop a verified job and tell its guard, which reaps it and records "cancelled". Nothing here confirms it.
-        return match os::cancel_job(job, &jobs::cancel_marker(&job.id)) {
+        // The guard does the signalling and records "cancelled"; nothing here confirms it.
+        let Some(marker) = jobs::cancel_marker(&job.id) else {
+            eprintln!(
+                "job {} has an id that cannot be cancelled from here",
+                job.id
+            );
+            return 1;
+        };
+        return match os::cancel_job(job, &marker) {
             Ok(()) => {
                 println!("cancellation requested for job {}", job.id);
                 0
@@ -544,6 +551,7 @@ fn cmd_jobs(rest: &[String]) -> i32 {
             return 1;
         };
         s.set_status(id, "interrupted");
+        jobs::remove_cancel_marker(id);
         println!("job {id} marked interrupted");
         return 0;
     }
