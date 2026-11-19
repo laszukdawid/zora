@@ -709,6 +709,21 @@ pub fn reap_job(id: &str, _pgid: i32, _gate_start: i64, grace: Duration) -> bool
     }
 }
 
+/// Whether job `id`'s cancel event is set (the core's own check, independent of the guard).
+pub fn cancel_requested(id: &str, _marker: &std::path::Path) -> bool {
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    let name = wide(&cancel_name(id));
+    // SAFETY: the name is NUL-terminated; the handle is owned below.
+    let Some(event) = owned(unsafe { OpenEventW(SYNCHRONIZE, 0, name.as_ptr()) }) else {
+        return false;
+    };
+    // SAFETY: valid event handle.
+    unsafe { WaitForSingleObject(event.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+}
+
+/// Windows keeps no marker files (the cancel event goes away with its guard).
+pub fn prune_cancel_markers(_dir: &std::path::Path, _live: &std::collections::HashSet<String>) {}
+
 /// Asks the job's guard to cancel it, so the outcome is recorded as cancelled.
 pub fn cancel_job(
     job: &zora_core::store::JobRecord,
