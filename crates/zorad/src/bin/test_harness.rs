@@ -5,6 +5,7 @@
 //!   stubborn <pidfile>   starts `hold` as a descendant, then waits, ignoring Ctrl+Break
 //!   hold <pidfile>       writes its pid, then waits, ignoring Ctrl+Break
 //!   graceful <marker>    waits; on Ctrl+Break writes `marker` and exits 0
+//!   touch <path>         creates `path`
 
 use std::io::Write;
 use std::time::Duration;
@@ -34,6 +35,9 @@ fn main() {
                 .stderr(std::process::Stdio::null())
                 .spawn();
             std::thread::sleep(Duration::from_secs(120));
+        }
+        "touch" => {
+            let _ = std::fs::write(arg(1), "started");
         }
         "graceful" => {
             on_break_write(arg(1));

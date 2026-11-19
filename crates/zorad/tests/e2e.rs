@@ -158,6 +158,11 @@ mod sys {
         use std::os::unix::process::ExitStatusExt;
         format!("code={:?} signal={:?}", s.code(), s.signal())
     }
+
+    /// What `zorad jobs cancel` does to a guard: creates its cancel marker.
+    pub fn request_cancel(_name: &str, marker: &std::path::Path) {
+        std::fs::write(marker, b"").unwrap();
+    }
 }
 
 #[cfg(windows)]
@@ -220,6 +225,22 @@ mod sys {
 
     pub fn describe(s: std::process::ExitStatus) -> String {
         format!("code={:?}", s.code())
+    }
+
+    /// What `zorad jobs cancel` does to a guard: sets its named cancel event.
+    pub fn request_cancel(name: &str, _marker: &std::path::Path) {
+        use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+        let wide: Vec<u16> = format!("Local\\zora-cancel-{name}")
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: NUL-terminated name; the handle is checked and closed.
+        unsafe {
+            let h = OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr());
+            assert!(!h.is_null(), "no cancel event for {name}");
+            SetEvent(h);
+            CloseHandle(h);
+        }
     }
 }
 
@@ -1003,4 +1024,72 @@ fn an_invalid_config_exits_with_ex_config_and_settings_lists_the_problem() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["problems"], json!([]), "{v}");
     assert_eq!(std::fs::read(&cfg).unwrap(), before);
+}
+
+#[test]
+fn a_job_cancelled_before_go_never_starts() {
+    use std::io::{BufRead, BufReader, Write};
+    let env = Env::new();
+    let started = env.home.join("started");
+    let marker = env.home.join("cancel-marker");
+    let name = uuid::Uuid::new_v4().to_string();
+    let argv: Vec<String> = if cfg!(windows) {
+        vec![
+            env!("CARGO_BIN_EXE_zora-test-harness").into(),
+            "touch".into(),
+            started.display().to_string(),
+        ]
+    } else {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("echo started > {}", started.display()),
+        ]
+    };
+    let mut guard = Command::new(ZORAD)
+        .arg("__guard")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut to_guard = guard.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    let from_guard = BufReader::new(guard.stdout.take().unwrap());
+    std::thread::spawn(move || {
+        for line in from_guard.lines().map_while(Result::ok) {
+            let _ = tx.send(serde_json::from_str(&line).unwrap_or(Value::Null));
+        }
+    });
+    let spec = json!({"t": "spec", "argv": argv, "cwd": env.home.join("ws"),
+                      "env": std::env::vars().collect::<Vec<_>>(), "capture_limit": 4096,
+                      "kill_grace_ms": 1000, "name": name, "cancel_marker": marker});
+    writeln!(to_guard, "{spec}").unwrap();
+    let registered = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(registered["t"], "registered", "{registered}");
+
+    sys::request_cancel(&name, &marker);
+    writeln!(to_guard, "{}", json!({"t": "go"})).unwrap();
+    let mut seen = vec![];
+    while let Ok(m) = rx.recv_timeout(Duration::from_secs(10)) {
+        let done = m["t"] == "cleaned";
+        seen.push(m);
+        if done {
+            break;
+        }
+    }
+    let _ = guard.wait();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !started.exists(),
+        "the harness ran after a cancel: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|m| m["t"] == "exited" && m["cancelled"] == true),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter().any(|m| m["t"] == "cleaned" && m["ok"] == true),
+        "{seen:?}"
+    );
 }
