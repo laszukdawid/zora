@@ -9,7 +9,9 @@ pub const MILLI: Ns = 1_000_000;
 pub const CLOCK_DOMAIN: &str = "darwin-uptime-raw-ns";
 #[cfg(target_os = "linux")]
 pub const CLOCK_DOMAIN: &str = "linux-monotonic-ns";
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+pub const CLOCK_DOMAIN: &str = "windows-qpc-ns";
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub const CLOCK_DOMAIN: &str = "unsupported";
 
 #[cfg(unix)]
@@ -27,7 +29,22 @@ pub fn now_ns() -> Ns {
     ts.tv_sec as Ns * SECOND + ts.tv_nsec as Ns
 }
 
-#[cfg(not(unix))]
+/// QueryPerformanceCounter in nanoseconds, the same clock as the core (zora-core clock.rs).
+#[cfg(windows)]
+pub fn now_ns() -> Ns {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    let (mut count, mut freq) = (0i64, 0i64);
+    // SAFETY: both point to valid i64s; these calls cannot fail on Windows XP and later.
+    unsafe {
+        QueryPerformanceCounter(&mut count);
+        QueryPerformanceFrequency(&mut freq);
+    }
+    (count as i128 * SECOND as i128 / freq.max(1) as i128) as Ns
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn now_ns() -> Ns {
     use std::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();
