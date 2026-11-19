@@ -321,8 +321,13 @@ impl JobManager {
                                 .store
                                 .call(move |s| s.set_job_owner(&id, &boot, guard_pid as i64, guard_start, pgid as i64, gate_start))
                                 .await;
-                            // Shutdown, cancellation or the deadline may have arrived during the durable write.
-                            let cancelled = self.lock().closed || cancel.try_recv().is_ok() || tokio::time::Instant::now() >= deadline;
+                            pause_after_owner_for_tests().await;
+                            // Shutdown, cancellation or the deadline may have arrived during the durable write. A
+                            // cancel taken here is recorded before the guard is told, so the outcome says so.
+                            if cancel.try_recv().is_ok() {
+                                cancel_asked = true;
+                            }
+                            let cancelled = cancel_asked || self.lock().closed || tokio::time::Instant::now() >= deadline;
                             if cancelled {
                                 // The gate never gets "go": EOF makes the guard kill it, and nothing executes.
                                 registration = Some((pgid, gate_start));
@@ -439,6 +444,16 @@ impl JobManager {
             _ => fail("job guard ended unexpectedly".into()),
         };
         (result, cleanup_ok)
+    }
+}
+
+/// Tests only: widens the window between the durable ownership write and Go.
+async fn pause_after_owner_for_tests() {
+    if let Some(ms) = std::env::var("ZORA_TEST_PAUSE_AFTER_OWNER_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 }
 
