@@ -280,6 +280,94 @@ impl Monitor {
     }
 }
 
+/// The audio nodes seen on one connection. A node whose kind or state is not known yet is a blind spot: it may
+/// be a dictation stream capturing right now, so a snapshot is incomplete until its first info arrives, and one
+/// that disappears before that leaves an unknown interval.
+#[derive(Debug)]
+pub struct Graph {
+    pub monitor: Monitor,
+    apps: Vec<String>,
+    streams: std::collections::HashMap<u32, StreamNode>,
+    /// Possibly relevant nodes without their first info, and since when.
+    awaiting: std::collections::HashMap<u32, Ns>,
+}
+
+impl Graph {
+    pub fn new(apps: Vec<String>) -> Graph {
+        Graph {
+            monitor: Monitor::new(!apps.is_empty()),
+            apps,
+            streams: Default::default(),
+            awaiting: Default::default(),
+        }
+    }
+
+    /// A node appeared. `media_class` is from its global properties, when they carry it.
+    pub fn discovered(&mut self, id: u32, media_class: Option<&str>, now: Ns) {
+        if media_class.is_none_or(|c| c == CAPTURE_CLASS) {
+            self.awaiting.insert(id, now);
+        }
+    }
+
+    /// Whether the node has delivered info before (its first info carries every property).
+    pub fn known(&self, id: u32) -> bool {
+        self.streams.contains_key(&id)
+    }
+
+    /// A node's info. `props` is the full property set when it changed (or on the first info), else None.
+    pub fn info<'a>(
+        &mut self,
+        id: u32,
+        props: Option<impl IntoIterator<Item = (&'a str, &'a str)>>,
+        running: bool,
+        now: Ns,
+    ) -> Vec<Msg> {
+        self.awaiting.remove(&id);
+        let entry = self.streams.entry(id).or_default();
+        if let Some(p) = props {
+            entry.set_props(p, &self.apps);
+        }
+        entry.running = running;
+        self.edges(now)
+    }
+
+    pub fn removed(&mut self, id: u32, now: Ns) -> Vec<Msg> {
+        let mut out = vec![];
+        if let Some(since) = self.awaiting.remove(&id) {
+            out.push(Msg::Unknown {
+                from_ns: since,
+                to_ns: now,
+            });
+        }
+        self.streams.remove(&id);
+        out.extend(self.edges(now));
+        out
+    }
+
+    pub fn complete(&self) -> bool {
+        self.awaiting.is_empty()
+    }
+
+    pub fn capturing(&self) -> bool {
+        self.streams.values().any(StreamNode::dictating)
+    }
+
+    pub fn node(&self, id: u32) -> Option<&StreamNode> {
+        self.streams.get(&id)
+    }
+
+    /// The connection is gone; everything learned on it is forgotten.
+    pub fn clear(&mut self) {
+        self.streams.clear();
+        self.awaiting.clear();
+    }
+
+    fn edges(&mut self, now: Ns) -> Vec<Msg> {
+        let capturing = self.capturing();
+        self.monitor.changed(capturing, now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +469,50 @@ mod tests {
                 healthy: true,
                 capturing: false
             }
+        );
+    }
+
+    #[test]
+    fn a_node_gone_before_its_first_info_leaves_an_unknown_interval() {
+        let t = 10 * SECOND;
+        let mut g = Graph::new(vec!["rec".into()]);
+        g.monitor.observe(false, t);
+        g.discovered(7, Some(CAPTURE_CLASS), t + SECOND);
+        g.discovered(8, None, t + SECOND);
+        g.discovered(9, Some("Audio/Sink"), t + SECOND);
+        assert!(!g.complete());
+        let out = g.removed(7, t + 2 * SECOND);
+        assert_eq!(
+            out,
+            [Msg::Unknown {
+                from_ns: t + SECOND,
+                to_ns: t + 2 * SECOND
+            }]
+        );
+        assert!(!g.complete(), "an unclassified node is still a blind spot");
+        assert_eq!(g.removed(8, t + 2 * SECOND).len(), 1);
+        assert!(g.complete(), "a sink never blocks a snapshot");
+        assert!(g.removed(9, t + 2 * SECOND).is_empty());
+    }
+
+    #[test]
+    fn graph_reports_edges_from_node_info() {
+        let t = 10 * SECOND;
+        let mut g = Graph::new(vec!["rec".into()]);
+        g.monitor.observe(false, t);
+        g.discovered(3, Some(CAPTURE_CLASS), t);
+        let props = [("media.class", CAPTURE_CLASS), ("application.name", "rec")];
+        assert!(g.info(3, Some(props), false, t).is_empty());
+        assert!(g.complete() && g.known(3));
+        let out = g.info(3, None::<[(&str, &str); 0]>, true, t + SECOND);
+        assert!(matches!(out[0], Msg::Dictation { began: true, .. }));
+        let out = g.removed(3, t + 1200 * MILLI);
+        assert_eq!(
+            out,
+            [Msg::Dictation {
+                began: false,
+                at_ns: t + 1200 * MILLI
+            }]
         );
     }
 
