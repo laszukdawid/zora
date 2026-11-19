@@ -270,6 +270,7 @@ impl JobManager {
             capture_limit: 64 * 1024,
             kill_grace_ms: self.kill_grace.as_millis() as u64,
             name: job.id.clone(),
+            cancel_marker: cancel_marker(&job.id).to_string_lossy().into_owned(),
         };
 
         let exe_self = std::env::current_exe().unwrap_or_else(|_| "zorad".into());
@@ -298,6 +299,9 @@ impl JobManager {
         let mut failed: Option<String> = None;
         let mut timed_out = false;
         let mut cancel_sent = false;
+        // Once the guard has been told to stop (Cancel or EOF), it gets a bounded time to report `cleaned`.
+        let stop_limit = self.kill_grace + Duration::from_secs(10);
+        let mut give_up: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 line = lines.next() => {
@@ -317,6 +321,7 @@ impl JobManager {
                                 registration = Some((pgid, gate_start));
                                 cancel_sent = true;
                                 stdin = None;
+                                give_up = Some(tokio::time::Instant::now() + stop_limit);
                             } else if matches!(stored, Some(Ok(()))) {
                                 registration = Some((pgid, gate_start));
                                 let id = job.id.clone();
@@ -325,6 +330,7 @@ impl JobManager {
                             } else {
                                 // Without durable ownership nothing may execute: EOF makes the guard kill the gate.
                                 stdin = None;
+                                give_up = Some(tokio::time::Instant::now() + stop_limit);
                             }
                         }
                         Ok(m @ GuardMsg::Exited { .. }) => exited = Some(m),
@@ -336,12 +342,16 @@ impl JobManager {
                 _ = tokio::time::sleep_until(deadline), if !cancel_sent => {
                     timed_out = true;
                     cancel_sent = true;
+                    give_up = Some(tokio::time::Instant::now() + stop_limit);
                     send_guard(&mut stdin, CoreMsg::Cancel).await;
                 }
                 Some(()) = cancel.recv(), if !cancel_sent => {
                     cancel_sent = true;
+                    give_up = Some(tokio::time::Instant::now() + stop_limit);
                     send_guard(&mut stdin, CoreMsg::Cancel).await;
                 }
+                // A guard that never reports is handled below: killed, and its job cleaned only with verified identity.
+                _ = tokio::time::sleep_until(give_up.unwrap_or(deadline)), if give_up.is_some() => break,
             }
         }
         // Close both pipes first: a guard blocked writing an oversized frame must not hang us. Then wait for it
@@ -386,6 +396,7 @@ impl JobManager {
             let _ = self.events.send(JobEvent::AdmissionClosed { reason });
         }
 
+        let _ = std::fs::remove_file(cancel_marker(&job.id));
         let result = match exited {
             _ if failed.is_some() => fail(failed.unwrap_or_default()),
             _ if timed_out => fail(format!("timed out after {}s", self.timeout.as_secs())),
@@ -405,6 +416,11 @@ impl JobManager {
         };
         (result, cleanup_ok)
     }
+}
+
+/// The file `zorad jobs cancel` creates to tell a Unix guard its job was cancelled.
+pub fn cancel_marker(id: &str) -> std::path::PathBuf {
+    crate::service::database_path().with_file_name(format!("cancel-{id}"))
 }
 
 async fn send_guard(stdin: &mut Option<ChildStdin>, msg: CoreMsg) {

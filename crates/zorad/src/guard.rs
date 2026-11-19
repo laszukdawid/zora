@@ -24,6 +24,9 @@ pub struct JobSpec {
     /// The job id; names the Job Object on Windows.
     #[serde(default)]
     pub name: String,
+    /// Unix: the file `zorad jobs cancel` creates to tell the guard (Windows uses a named event).
+    #[serde(default)]
+    pub cancel_marker: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -186,17 +189,35 @@ pub fn guard_main() -> i32 {
         },
     );
 
-    // Fence: nothing executes until the core has committed ownership and says go.
+    // Fence: nothing executes until the core has committed ownership and says go, and nobody has cancelled.
     let released = match rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Some(CoreMsg::Go)) => held.release(),
-        _ => Err(String::new()),
+        Ok(Some(CoreMsg::Go)) if group.cancel_requested() => Err(Unreleased::Cancelled),
+        Ok(Some(CoreMsg::Go)) => held.release().map_err(Unreleased::Failed),
+        _ => Err(Unreleased::NoGo),
     };
-    if let Err(error) = released {
+    if let Err(why) = released {
         group.kill();
-        let _ = held.wait();
+        // Bounded: a leader that survives the kill leaves the job unverified, not the guard stuck.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(held.wait());
+        });
+        let _ = rx.recv_timeout(Duration::from_secs(5));
         let ok = group.reap_blocking(Duration::ZERO);
-        if !error.is_empty() {
-            send(&out, &GuardMsg::Failed { error });
+        match why {
+            Unreleased::Failed(error) => send(&out, &GuardMsg::Failed { error }),
+            Unreleased::Cancelled => send(
+                &out,
+                &GuardMsg::Exited {
+                    code: None,
+                    signal: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    truncated: false,
+                    cancelled: true,
+                },
+            ),
+            Unreleased::NoGo => {}
         }
         send(&out, &GuardMsg::Cleaned { ok });
         return 1;
@@ -226,8 +247,9 @@ pub fn guard_main() -> i32 {
             });
         }
     };
-    // The job is over only when its whole group is gone.
+    // The job is over only when its whole group is gone. A cancel accepted at any point until then counts.
     let ok = group.reap_blocking(grace);
+    let cancelled = cancelled || group.cancel_requested();
     // Bounded: a detached process that inherited the pipes must not keep the guard (and workspace) busy.
     let (stdout, t1) = take_captured(&stdout_h.0, &stdout_h.1, Duration::from_secs(2));
     let (stderr, t2) = take_captured(&stderr_h.0, &stderr_h.1, Duration::from_secs(1));
@@ -252,6 +274,13 @@ pub fn guard_main() -> i32 {
     );
     send(&out, &GuardMsg::Cleaned { ok });
     if ok { 0 } else { 1 }
+}
+
+/// Why the guard never released its job.
+enum Unreleased {
+    NoGo,
+    Cancelled,
+    Failed(String),
 }
 
 /// Blocks until the guard says go (one byte on fd 3), then execs the harness in place (same pid and pgid).

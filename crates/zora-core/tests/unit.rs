@@ -73,6 +73,22 @@ fn config_rejects_permission_bypass_everywhere() {
 }
 
 #[test]
+fn config_rejects_harness_env_that_would_inject_variables() {
+    for (k, v) in [("A=B", "1"), ("", "1"), ("A\0B", "1"), ("A", "1\0B=2")] {
+        let mut c = Config {
+            dry_run: true,
+            ..Config::default()
+        };
+        c.harnesses
+            .get_mut("claude")
+            .unwrap()
+            .env
+            .insert(k.into(), v.into());
+        assert_eq!(c.validate().len(), 1, "{k:?}={v:?}");
+    }
+}
+
+#[test]
 fn config_requires_workspace_unless_dry_run() {
     let mut c = Config::default();
     assert!(!c.validate().is_empty());

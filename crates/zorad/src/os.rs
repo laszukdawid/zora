@@ -4,6 +4,7 @@ use crate::guard::JobSpec;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -125,21 +126,12 @@ pub fn reset_signals() {
     }
 }
 
-static CANCEL_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-extern "C" fn on_cancel(_sig: libc::c_int) {
-    CANCEL_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// The guard ignores TERM, INT and HUP, so it can always reap its job; SIGUSR1 (`zorad jobs cancel`) asks it to
-/// cancel the job.
 pub fn ignore_termination_signals() {
-    // SAFETY: setting dispositions for standard signals; the handler only stores to an atomic.
+    // SAFETY: setting dispositions for standard signals.
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_IGN);
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
-        libc::signal(libc::SIGUSR1, on_cancel as *const () as libc::sighandler_t);
     }
 }
 
@@ -162,7 +154,7 @@ pub fn owner(recorded: Option<&str>) -> Owner {
 
 /// A job's process group: the harness and everything it starts.
 #[derive(Debug, Clone)]
-pub struct Group(i32);
+pub struct Group(i32, Option<PathBuf>);
 
 impl Group {
     pub fn id(&self) -> i32 {
@@ -181,9 +173,9 @@ impl Group {
         reap_group_blocking(self.0, grace)
     }
 
-    /// Whether `zorad jobs cancel` sent this guard SIGUSR1.
+    /// Whether `zorad jobs cancel` left this job's cancel marker.
     pub fn cancel_requested(&self) -> bool {
-        CANCEL_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+        self.1.as_ref().is_some_and(|m| m.exists())
     }
 }
 
@@ -260,7 +252,8 @@ pub fn spawn_held(spec: &JobSpec) -> Result<Held, String> {
     }
     let child = cmd.spawn().map_err(|e| format!("cannot start gate: {e}"))?;
     drop(go_read);
-    let group = Group(child.id() as i32);
+    let marker = (!spec.cancel_marker.is_empty()).then(|| PathBuf::from(&spec.cancel_marker));
+    let group = Group(child.id() as i32, marker);
     Ok(Held {
         child,
         group,
@@ -291,7 +284,7 @@ pub fn spawn_plugin(exe: &str, args: &[String]) -> std::io::Result<(PluginChild,
         .kill_on_drop(true)
         .spawn()?;
     let pgid = child.id().unwrap_or(0) as i32;
-    Ok((child, Group(pgid)))
+    Ok((child, Group(pgid, None)))
 }
 
 pub fn job_gone(_id: &str, pgid: i32) -> bool {
@@ -309,31 +302,25 @@ pub fn reap_job(_id: &str, pgid: i32, gate_start: i64, grace: Duration) -> bool 
     false
 }
 
-/// Asks the job's guard (SIGUSR1) to cancel it, so the outcome is recorded as cancelled. Without a live guard,
-/// TERMs the job group, but only when it is provably the job's (leader pid == pgid with the recorded start time).
-pub fn cancel_job(job: &zora_core::store::JobRecord) -> Result<(), String> {
-    let signal = |pid: i32, sig: i32| {
-        // SAFETY: plain signal to a verified pid or process group.
-        if unsafe { libc::kill(pid, sig) } != 0 {
-            return Err(format!(
-                "cannot be signalled: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
-    };
-    if let (Some(pid), Some(start)) = (job.guard_pid, job.guard_start)
-        && pid > 0
-        && start_time(pid as i32) == Some(start)
-    {
-        return signal(pid as i32, libc::SIGUSR1);
-    }
-    match (job.job_pgid, job.gate_start) {
+/// TERMs a job group, but only when it is provably the job's (leader pid == pgid with the recorded start time).
+/// First it leaves the job's cancel `marker`, so the guard records "cancelled" (and never releases a job still at
+/// its gate); the TERM does not depend on the guard noticing.
+pub fn cancel_job(job: &zora_core::store::JobRecord, marker: &Path) -> Result<(), String> {
+    let pgid = match (job.job_pgid, job.gate_start) {
         (Some(pgid), Some(start)) if pgid > 0 && start_time(pgid as i32) == Some(start) => {
-            signal(-(pgid as i32), libc::SIGTERM)
+            pgid as i32
         }
-        _ => Err("has no verifiable running process group".into()),
+        _ => return Err("has no verifiable running process group".into()),
+    };
+    let marked = std::fs::write(marker, b"");
+    // SAFETY: negative pid targets the verified process group.
+    if unsafe { libc::kill(-pgid, libc::SIGTERM) } != 0 {
+        return Err(format!(
+            "cannot be signalled: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+    marked.map_err(|e| format!("was sent TERM, but its guard can't be told ({e})"))
 }
 
 /// SIGTERM and SIGINT stop the service in order.

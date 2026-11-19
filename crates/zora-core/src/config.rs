@@ -426,6 +426,14 @@ pub fn policy_problems(name: &str, h: &Harness) -> Vec<String> {
             "harnesses.{name}.allowedTools entries must be tool names, not options"
         ));
     }
+    if h.env
+        .iter()
+        .any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0'))
+    {
+        problems.push(format!(
+            "harnesses.{name}.env names must be non-empty without '=', and no name or value may contain NUL"
+        ));
+    }
     match h.kind.as_str() {
         "claude" => {
             if let Some(mode) = &h.permission_mode
