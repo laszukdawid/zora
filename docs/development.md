@@ -58,11 +58,43 @@ Secrets of the `release` environment:
 | `NOTARY_KEY` | Contents of an App Store Connect API key (`AuthKey_<id>.p8`) with the Developer role |
 | `NOTARY_KEY_ID`, `NOTARY_ISSUER` | That key's ID and the issuer ID shown on App Store Connect → Users and Access → Integrations |
 
-Anyone who can push a `v*` tag can run the signing job, and it runs scripts from the tagged commit. So keep the
-secrets behind two repository settings: the `release` environment requires your approval (Settings →
-Environments → release → Required reviewers), and a tag ruleset lets only maintainers create `v*` tags and nobody
-move or delete them. Approve the signing job only for a tag you pushed
-yourself.
+Anyone who can push a `v*` tag can run the signing job, and it runs scripts from the tagged commit. So two
+repository settings keep the secrets safe: the `release` environment is limited to `v*` tags and waits for the
+maintainer's approval (Settings → Environments → release), and the "Protect release tags" ruleset lets only admins
+create, move or delete `v*` tags. Approve the signing job only for a tag you pushed yourself.
+
+### Making a release
+
+An agent can do the whole release by following these steps; the two approvals stay with the maintainer.
+
+1. **Check `main`.** Work on a clean `main`, updated with `git pull --ff-only && git fetch --tags`. The latest CI run on `main` must have passed
+   (`gh run list --branch main --workflow CI --limit 1`). If it failed, stop and report it.
+2. **Pick the version.** List the changes with `git log $(git describe --tags --abbrev=0)..main --oneline`. Before
+   1.0, any `feat` raises the minor version (0.2.0 → 0.3.0); only fixes raise the patch version (0.2.0 → 0.2.1).
+   Confirm the version with the maintainer unless they named it.
+3. **Bump it in a PR.** On a branch `release-v<version>`, set `version` under `[workspace.package]` in `Cargo.toml`,
+   run `cargo update --workspace` so `Cargo.lock` follows, and check that `packaging/macos/version.sh` prints the
+   new version. Commit `chore: release v<version>`, open a PR, wait for CI to pass, and ask the maintainer to merge.
+4. **Tag the merge.** On the updated `main`, run `git tag v<version> && git push origin v<version>`. Never move,
+   delete or re-push a tag that is already on GitHub; if a release goes wrong, fix it and release the next patch
+   version.
+5. **Wait for the approval.** Watch the Release run (`gh run watch`). When the `sign` job waits on the `release`
+   environment, send the maintainer the run link and ask them to approve it. Never approve it yourself, for
+   example through the `pending_deployments` API.
+6. **Check the draft.** Once the run passes, download the assets into an empty temporary folder
+   (`gh release download v<version>`) and check them: `shasum -a 256 -c Zora-<version>.dmg.sha256`,
+   `xcrun stapler validate Zora-<version>.dmg`, and `spctl --assess --type open --context
+   context:primary-signature -v Zora-<version>.dmg` must report "Notarized Developer ID".
+7. **Write the notes.** Replace the generated notes with a short list of what users get, in the style of the
+   v0.2.0 release: one line per user-visible change, nothing internal (`gh release edit v<version> --notes-file
+   <file>`).
+8. **Hand over.** Send the maintainer the draft's link. Publish only when they say so:
+   `gh release edit v<version> --draft=false --latest`.
+
+If a step fails, stop and report the failing step with its log (`gh run view <id> --log-failed`). In `sign`,
+"No Developer ID identity in MACOS_CERT_P12" means the .p12 lacks its private key; a notarytool authentication
+error means `NOTARY_KEY`, `NOTARY_KEY_ID` and `NOTARY_ISSUER` don't belong together, or the key lacks the
+Developer role.
 
 To build a release locally instead, store the notarization credentials once with
 `xcrun notarytool store-credentials zora-notary --key <path.p8> --key-id <id> --issuer <issuer>`, then run
